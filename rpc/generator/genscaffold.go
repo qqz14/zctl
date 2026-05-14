@@ -1,0 +1,2407 @@
+package generator
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/qqz14/zctl/util/ctx"
+	"github.com/qqz14/zctl/util/pathx"
+)
+
+// GenScaffold generates the best-practice scaffold: pkg/, middleware/, dao/ skeleton
+func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx *ZRpcContext) error {
+	modulePath := projectCtx.Path // e.g. "github.com/xxx/passport"
+	serviceName := filepath.Base(abs)
+
+	// pkg/errcode (unified: error type + codes + grpc transport)
+	if err := g.genPkgErrcode(abs, modulePath); err != nil {
+		return err
+	}
+	// pkg/ctxutil
+	if err := g.genPkgCtxutil(abs, modulePath); err != nil {
+		return err
+	}
+	// pkg/i18n
+	if err := g.genPkgI18n(abs); err != nil {
+		return err
+	}
+	// pkg/model
+	if err := g.genPkgModel(abs); err != nil {
+		return err
+	}
+	// pkg/metrics (Prometheus counters for RPC success/fail/status/biz errors)
+	if err := g.genPkgMetrics(abs, modulePath); err != nil {
+		return err
+	}
+	// internal/middleware
+	if err := g.genMiddleware(abs, modulePath); err != nil {
+		return err
+	}
+	// internal/dao skeleton
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "internal", "dao")); err != nil {
+		return err
+	}
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "internal", "dao", "impl")); err != nil {
+		return err
+	}
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "internal", "dao", "mock")); err != nil {
+		return err
+	}
+	// internal/service skeleton
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "internal", "service")); err != nil {
+		return err
+	}
+	// pkg/consts skeleton
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "pkg", "consts")); err != nil {
+		return err
+	}
+	// Makefile
+	if err := g.genMakefile(abs, serviceName, zctx); err != nil {
+		return err
+	}
+	// Dockerfile
+	if err := g.genDockerfile(abs, serviceName); err != nil {
+		return err
+	}
+	// entrypoint.sh
+	if err := g.genEntrypoint(abs); err != nil {
+		return err
+	}
+	// etc/xxx.yaml.template
+	if err := g.genEtcTemplate(abs, serviceName, zctx); err != nil {
+		return err
+	}
+	// .gitignore
+	if err := g.genGitignore(abs); err != nil {
+		return err
+	}
+	// README.md
+	if err := g.genProjectReadme(abs, serviceName, zctx); err != nil {
+		return err
+	}
+	// zctl-commands.md
+	if err := g.genCommandsDoc(abs, serviceName); err != nil {
+		return err
+	}
+	// desc/ directory
+	if err := g.genDescDir(abs, serviceName); err != nil {
+		return err
+	}
+	// merge_proto.sh
+	if err := g.genMergeProtoScript(abs, serviceName); err != nil {
+		return err
+	}
+	// proto.yaml (remote proto config, optional)
+	if err := g.genProtoYaml(abs); err != nil {
+		return err
+	}
+	// types/ directory
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "types")); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ==================== pkg/errcode ====================
+
+func (g *Generator) genPkgErrcode(abs, modulePath string) error {
+	dir := filepath.Join(abs, "pkg", "errcode")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	// errcode.go — unified error type with grpcCode for HTTP status control
+	if err := writeIfNotExist(filepath.Join(dir, "errcode.go"), `package errcode
+
+import (
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// Err is the business error, implements error interface.
+// By default, gRPC status code is OK (→ HTTP 200), business code carried in message.
+// Use WithGRPC() to override for 401/403 etc.
+type Err struct {
+	code     int        // business error code (e.g. 95001)
+	msg      string     // error message
+	grpcCode codes.Code // gRPC status code, default 0 = OK → HTTP 200
+}
+
+func (e *Err) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("[%d] %s", e.code, e.msg)
+}
+
+// Code returns the business error code.
+func (e *Err) Code() int {
+	if e == nil {
+		return 0
+	}
+	return e.code
+}
+
+// Msg returns the error message.
+func (e *Err) Msg() string {
+	if e == nil {
+		return ""
+	}
+	return e.msg
+}
+
+// GRPCCode returns the gRPC status code (0 means OK).
+func (e *Err) GRPCCode() codes.Code {
+	if e == nil {
+		return codes.OK
+	}
+	return e.grpcCode
+}
+
+// WithGRPC sets the gRPC status code for HTTP status override.
+// Usage: errcode.Newf(95003, "token expired").WithGRPC(codes.Unauthenticated) → HTTP 401
+func (e *Err) WithGRPC(c codes.Code) *Err {
+	e.grpcCode = c
+	return e
+}
+
+// ──── Constructors ────
+
+// Newf creates a business error (gRPC OK → HTTP 200 by default).
+func Newf(code int, format string, args ...interface{}) *Err {
+	return &Err{code: code, msg: fmt.Sprintf(format, args...)}
+}
+
+// Wrapf creates a business error wrapping an internal cause.
+func Wrapf(code int, format string, args ...interface{}) *Err {
+	return &Err{code: code, msg: fmt.Sprintf(format, args...)}
+}
+
+// ──── Helpers ────
+
+// ExtractErr tries to extract *Err from any error.
+func ExtractErr(err error) (*Err, bool) {
+	if err == nil {
+		return nil, false
+	}
+	if e, ok := err.(*Err); ok {
+		return e, true
+	}
+	return nil, false
+}
+
+// ExtractCode extracts business code from any error.
+func ExtractCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if e, ok := err.(*Err); ok {
+		return e.code
+	}
+	if s, ok := status.FromError(err); ok {
+		return int(s.Code())
+	}
+	return InternalError
+}
+
+// Is checks whether err matches the given business code.
+func Is(err error, code int) bool { return ExtractCode(err) == code }
+`); err != nil {
+		return err
+	}
+
+	// grpc.go — encode/decode for gRPC transport (JSON in status message)
+	if err := writeIfNotExist(filepath.Join(dir, "grpc.go"), `package errcode
+
+import (
+	"encoding/json"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// grpcPayload is the JSON structure encoded in gRPC status message.
+// Gateway (e.g. APISIX) reads this to build the final HTTP response body.
+type grpcPayload struct {
+	Code int    `+"`"+`json:"code"`+"`"+`
+	Msg  string `+"`"+`json:"msg"`+"`"+`
+}
+
+// ToGRPCStatus converts *Err to gRPC status for transport.
+//   - gRPC code: e.grpcCode (default OK → HTTP 200)
+//   - message:   JSON {"code":95001,"msg":"用户不存在"}
+//
+// Called by the framework interceptor, NOT by business code.
+func ToGRPCStatus(e *Err) *status.Status {
+	payload, _ := json.Marshal(grpcPayload{Code: e.code, Msg: e.msg})
+	return status.New(e.grpcCode, string(payload))
+}
+
+// StatusError converts *Err to a gRPC error (for returning from interceptor).
+func StatusError(e *Err) error {
+	return ToGRPCStatus(e).Err()
+}
+
+// FromGRPCStatus decodes *Err from a gRPC status (for client-side or testing).
+func FromGRPCStatus(st *status.Status) (*Err, bool) {
+	if st == nil {
+		return nil, false
+	}
+	var p grpcPayload
+	if err := json.Unmarshal([]byte(st.Message()), &p); err != nil {
+		return nil, false
+	}
+	return &Err{code: p.Code, msg: p.Msg, grpcCode: st.Code()}, true
+}
+
+// FromGRPCError decodes *Err from a gRPC error.
+func FromGRPCError(err error) (*Err, bool) {
+	if err == nil {
+		return nil, false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return nil, false
+	}
+	return FromGRPCStatus(st)
+}
+
+// IsOKCode returns true if grpcCode is OK (business error, HTTP 200).
+func IsOKCode(c codes.Code) bool {
+	return c == codes.OK
+}
+`); err != nil {
+		return err
+	}
+
+	// common.go — only int constants, no *Err variables
+	content := `package errcode
+
+// ──── Common error codes ────
+// Codes only. Messages come from i18n (pkg/i18n/locale/{lang}.json → key "errcode.{code}").
+const (
+	OK             = 0
+	InternalError  = 95000
+	InvalidParam   = 95001
+	NotFound       = 95002
+	Unauthorized   = 95003
+	Forbidden      = 95004
+
+	// DB error codes (used by DAO layer via errcode.Wrapf)
+	DBQueryFailed  = 10006
+	DBInsertFailed = 10007
+	DBUpdateFailed = 10008
+	DBDeleteFailed = 10009
+)
+`
+	return writeIfNotExist(filepath.Join(dir, "common.go"), content)
+}
+
+// ==================== pkg/ctxutil ====================
+
+func (g *Generator) genPkgCtxutil(abs, modulePath string) error {
+	dir := filepath.Join(abs, "pkg", "ctxutil")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	// ctxutil.go
+	if err := writeIfNotExist(filepath.Join(dir, "ctxutil.go"), `package ctxutil
+
+import (
+	"context"
+	"strings"
+
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+)
+
+type contextKey string
+
+const moduleKey contextKey = "module"
+
+func WithModule(ctx context.Context, module string) context.Context {
+	return context.WithValue(ctx, moduleKey, module)
+}
+
+func GetModule(ctx context.Context) string {
+	if v, ok := ctx.Value(moduleKey).(string); ok {
+		return v
+	}
+	return "unknown"
+}
+
+// ClientIP gets the real client IP from gRPC context.
+// Priority: x-real-ip > x-forwarded-for[0] > peer address.
+func ClientIP(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		if vals := md.Get("x-real-ip"); len(vals) > 0 {
+			if ip := strings.TrimSpace(vals[0]); ip != "" {
+				return ip
+			}
+		}
+		if vals := md.Get("x-forwarded-for"); len(vals) > 0 {
+			parts := strings.Split(vals[0], ",")
+			if len(parts) > 0 {
+				if ip := strings.TrimSpace(parts[0]); ip != "" {
+					return ip
+				}
+			}
+		}
+	}
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		addr := p.Addr.String()
+		if idx := strings.LastIndex(addr, ":"); idx > 0 {
+			return addr[:idx]
+		}
+		return addr
+	}
+	return "unknown"
+}
+
+// MetaValue gets the first non-empty value from gRPC metadata keys.
+func MetaValue(ctx context.Context, keys ...string) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	for _, key := range keys {
+		if vals := md.Get(key); len(vals) > 0 && vals[0] != "" {
+			return vals[0]
+		}
+	}
+	return ""
+}
+`); err != nil {
+		return err
+	}
+
+	// log.go
+	return writeIfNotExist(filepath.Join(dir, "log.go"), `package ctxutil
+
+import (
+	"context"
+
+	"github.com/zeromicro/go-zero/core/logx"
+)
+
+// L returns a logger with module field from ctx.
+func L(ctx context.Context) logx.Logger {
+	return logx.WithContext(ctx).WithFields(logx.Field("module", GetModule(ctx)))
+}
+
+// ErrField creates a logx field for error.
+func ErrField(err error) logx.LogField {
+	return logx.Field("error", err.Error())
+}
+
+// IDField creates a logx field for id (any type).
+func IDField(id interface{}) logx.LogField {
+	return logx.Field("id", id)
+}
+
+// CountField creates a logx field for count.
+func CountField(count int) logx.LogField {
+	return logx.Field("count", count)
+}
+`)
+}
+
+// ==================== pkg/i18n ====================
+
+func (g *Generator) genPkgI18n(abs string) error {
+	dir := filepath.Join(abs, "pkg", "i18n", "locale")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	en := `{
+  "errcode": {
+    "95000": "Internal server error",
+    "95001": "Invalid parameter",
+    "95002": "Resource not found",
+    "95003": "Unauthorized",
+    "95004": "Forbidden",
+    "10006": "Database query failed",
+    "10007": "Database insert failed",
+    "10008": "Database update failed",
+    "10009": "Database delete failed"
+  }
+}
+`
+	zh := `{
+  "errcode": {
+    "95000": "内部服务器错误",
+    "95001": "参数校验失败",
+    "95002": "资源不存在",
+    "95003": "未授权",
+    "95004": "禁止访问",
+    "10006": "数据库查询失败",
+    "10007": "数据库插入失败",
+    "10008": "数据库更新失败",
+    "10009": "数据库删除失败"
+  }
+}
+`
+	if err := writeIfNotExist(filepath.Join(dir, "en.json"), en); err != nil {
+		return err
+	}
+	if err := writeIfNotExist(filepath.Join(dir, "zh.json"), zh); err != nil {
+		return err
+	}
+
+	// pkg/i18n/i18n.go — loader + translator (no lock, template vars, fallback chain)
+	i18nDir := filepath.Join(abs, "pkg", "i18n")
+	return writeIfNotExist(filepath.Join(i18nDir, "i18n.go"), `package i18n
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// Bundle holds loaded locale data.
+// Designed for load-once-read-many: no lock needed after Load() completes.
+// JSON format: {"errcode": {"95001": "参数校验失败"}, "ui": {"welcome": "欢迎 {{.Name}}"}}
+type Bundle struct {
+	locales map[string]map[string]map[string]string // lang → section → key → message
+}
+
+var defaultBundle = &Bundle{
+	locales: make(map[string]map[string]map[string]string),
+}
+
+// Load reads all JSON files from localeDir.
+// Each file named {lang}.json (e.g. en.json, zh.json, zh-CN.json).
+// MUST be called at startup before serving requests.
+func Load(localeDir string) error {
+	return defaultBundle.Load(localeDir)
+}
+
+func (b *Bundle) Load(localeDir string) error {
+	entries, err := os.ReadDir(localeDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		lang := entry.Name()[:len(entry.Name())-5]
+		data, err := os.ReadFile(filepath.Join(localeDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var m map[string]map[string]string
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		b.locales[lang] = m
+	}
+	return nil
+}
+
+// Translate looks up a message. Supports fallback chain: zh-CN → zh → en.
+// Supports template variables: "hello {{.Name}}" + Args{"Name": "张三"} → "hello 张三"
+func Translate(lang, section, key string, args ...map[string]string) string {
+	return defaultBundle.Translate(lang, section, key, args...)
+}
+
+func (b *Bundle) Translate(lang, section, key string, args ...map[string]string) string {
+	msg := b.lookup(lang, section, key)
+	if msg == "" {
+		return ""
+	}
+	if len(args) > 0 && args[0] != nil {
+		for k, v := range args[0] {
+			msg = strings.ReplaceAll(msg, "{{."+k+"}}", v)
+		}
+	}
+	return msg
+}
+
+func (b *Bundle) lookup(lang, section, key string) string {
+	// 1. Exact match
+	if msg := b.get(lang, section, key); msg != "" {
+		return msg
+	}
+	// 2. Base language (zh-CN → zh)
+	if idx := strings.IndexAny(lang, "-_"); idx > 0 {
+		if msg := b.get(lang[:idx], section, key); msg != "" {
+			return msg
+		}
+	}
+	// 3. Fallback to en
+	if lang != "en" {
+		return b.get("en", section, key)
+	}
+	return ""
+}
+
+func (b *Bundle) get(lang, section, key string) string {
+	if s, ok := b.locales[lang]; ok {
+		if k, ok := s[section]; ok {
+			return k[key]
+		}
+	}
+	return ""
+}
+
+// TranslateErrcode translates an error code.
+func TranslateErrcode(lang string, code int, args ...map[string]string) string {
+	return Translate(lang, "errcode", fmt.Sprintf("%d", code), args...)
+}
+
+// MustLoad panics if loading fails.
+func MustLoad(localeDir string) {
+	if err := Load(localeDir); err != nil {
+		panic("failed to load i18n locales: " + err.Error())
+	}
+}
+`)
+}
+
+// ==================== pkg/metrics ====================
+
+func (g *Generator) genPkgMetrics(abs, modulePath string) error {
+	dir := filepath.Join(abs, "pkg", "metrics")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	return writeIfNotExist(filepath.Join(dir, "metrics.go"), `package metrics
+
+import "github.com/zeromicro/go-zero/core/metric"
+
+// ──── RPC Metrics ────
+//
+// Design rationale — memory impact analysis:
+//
+// ┌────────────────────────────┬──────────────────┬────────────┬────────────────────────────────┐
+// │ Library                    │ Inc latency      │ Alloc/op   │ Notes                          │
+// ├────────────────────────────┼──────────────────┼────────────┼────────────────────────────────┤
+// │ go-zero core/metric        │ ~3.3 ns          │ 0 B        │ Thin wrapper over prom client  │
+// │ prometheus/client_golang    │ ~3.3 ns          │ 0 B        │ Pre-resolve WithLabelValues    │
+// │ VictoriaMetrics/metrics     │ ~3.5 ns          │ 0 B        │ Simpler API, fewer deps        │
+// └────────────────────────────┴──────────────────┴────────────┴────────────────────────────────┘
+//
+// Conclusion: all three have identical hot-path perf (~3 ns, 0 alloc).
+// We choose go-zero core/metric because:
+//   1. Already a transitive dependency — zero extra deps or binary bloat
+//   2. Labels are pre-registered → no map lookup / fmt.Sprintf in hot path
+//   3. Fully compatible with go-zero's built-in Prometheus endpoint
+//   4. CounterVec uses prometheus.MustRegister under the hood → auto-exposed
+//
+// Memory considerations:
+//   - Each unique label combination creates ONE Counter (~200 bytes).
+//   - We bound cardinality: method × {success/fail} is O(N) where N = API count.
+//   - grpc_code has ≤15 possible values; biz_code is bounded by errcode constants.
+//   - Total memory: ~200 bytes × (N×2 + N×15 + N×K) — typically < 100 KB for
+//     a service with 50 APIs and 20 error codes.
+
+var (
+	// RPCTotal counts every RPC call, partitioned by method and success/fail.
+	// Use for overall success rate dashboards.
+	RPCTotal = metric.NewCounterVec(&metric.CounterVecOpts{
+		Namespace: "rpc",
+		Subsystem: "server",
+		Name:      "requests_total",
+		Help:      "Total RPC requests by method and result (success/fail)",
+		Labels:    []string{"method", "result"},
+	})
+
+	// RPCStatusTotal counts RPC errors by gRPC status code.
+	// Use for HTTP-level error monitoring (4xx/5xx mapping).
+	// Only incremented on error (grpc_code != OK for status errors).
+	RPCStatusTotal = metric.NewCounterVec(&metric.CounterVecOpts{
+		Namespace: "rpc",
+		Subsystem: "server",
+		Name:      "status_errors_total",
+		Help:      "Total RPC errors by method and gRPC status code (maps to HTTP status)",
+		Labels:    []string{"method", "grpc_code"},
+	})
+
+	// RPCBizErrorTotal counts business-layer errors by errcode.
+	// Use for business error monitoring and alerting.
+	// Only incremented when grpc_code is OK (HTTP 200) but biz code != 0.
+	RPCBizErrorTotal = metric.NewCounterVec(&metric.CounterVecOpts{
+		Namespace: "rpc",
+		Subsystem: "server",
+		Name:      "biz_errors_total",
+		Help:      "Total business errors by method and business error code (grpc_code=OK, HTTP 200)",
+		Labels:    []string{"method", "biz_code"},
+	})
+)
+`)
+}
+
+// ==================== pkg/model ====================
+
+func (g *Generator) genPkgModel(abs string) error {
+	dir := filepath.Join(abs, "pkg", "model")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	return writeIfNotExist(filepath.Join(dir, "common.go"), `package model
+
+// PageInfo is a common pagination request.
+type PageInfo struct {
+	Page     int `+"`"+`json:"page"`+"`"+`
+	PageSize int `+"`"+`json:"pageSize"`+"`"+`
+}
+`)
+}
+
+// ==================== internal/middleware ====================
+
+func (g *Generator) genMiddleware(abs, modulePath string) error {
+	dir := filepath.Join(abs, "internal", "middleware")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
+	// log_module.go
+	logModule := fmt.Sprintf(`package middleware
+
+import (
+	"context"
+	"strings"
+
+	"google.golang.org/grpc"
+
+	"%s/pkg/ctxutil"
+)
+
+// ModuleInterceptor injects the module name (from gRPC FullMethod) into ctx.
+func ModuleInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		module := extractModule(info.FullMethod)
+		ctx = ctxutil.WithModule(ctx, module)
+		return handler(ctx, req)
+	}
+}
+
+// extractModule extracts the gRPC method name from FullMethod.
+// Example: "/demo.Demo/CreateUser" → "CreateUser"
+func extractModule(fullMethod string) string {
+	// FullMethod format: /{package}.{Service}/{Method}
+	if idx := strings.LastIndex(fullMethod, "/"); idx >= 0 && idx+1 < len(fullMethod) {
+		return fullMethod[idx+1:]
+	}
+	return "unknown"
+}
+`, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "log_module.go"), logModule); err != nil {
+		return err
+	}
+
+	// i18n_interceptor.go — final interceptor: converts *errcode.Err → gRPC status with JSON payload
+	i18nInterceptor := fmt.Sprintf(`package middleware
+
+import (
+	"context"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+
+	"%s/pkg/errcode"
+	"%s/pkg/i18n"
+)
+
+// I18nInterceptor is the final interceptor in the chain.
+// It converts all errors into structured gRPC status:
+//
+//  1. *errcode.Err → i18n translate msg → JSON {"code":95001,"msg":"xxx"} in gRPC message
+//     grpcCode defaults to OK (→ HTTP 200), unless WithGRPC() was called (e.g. 401/403)
+//
+//  2. Non-errcode errors (system/unexpected) → {"code":95000,"msg":"internal error"}
+//     grpcCode = Internal (→ HTTP 500)
+//
+// Gateway (e.g. APISIX grpc-transcode) reads the gRPC status message as HTTP response body.
+func I18nInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+
+		lang := extractLang(ctx)
+
+		// Case 1: business error (*errcode.Err)
+		if e, ok := errcode.ExtractErr(err); ok {
+			origGRPCCode := e.GRPCCode()
+			if msg := i18n.TranslateErrcode(lang, e.Code()); msg != "" {
+				e = errcode.Newf(e.Code(), msg).WithGRPC(origGRPCCode)
+			}
+			return nil, errcode.StatusError(e)
+		}
+
+		// Case 2: unexpected error → wrap as internal
+		msg := "internal error"
+		if translated := i18n.TranslateErrcode(lang, errcode.InternalError); translated != "" {
+			msg = translated
+		}
+		e := errcode.Newf(errcode.InternalError, msg).WithGRPC(codes.Internal)
+		return nil, errcode.StatusError(e)
+	}
+}
+
+func extractLang(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if langs := md.Get("x-lang"); len(langs) > 0 {
+			return langs[0]
+		}
+		if langs := md.Get("accept-language"); len(langs) > 0 {
+			return langs[0]
+		}
+	}
+	return "en"
+}
+`, modulePath, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "i18n_interceptor.go"), i18nInterceptor); err != nil {
+		return err
+	}
+
+	// error_log_interceptor.go — unified error logging + enforcement (placed before I18nInterceptor)
+	errorLogInterceptor := fmt.Sprintf(`package middleware
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/zeromicro/go-zero/core/logx"
+
+	"%s/pkg/ctxutil"
+	"%s/pkg/errcode"
+	"%s/pkg/i18n"
+)
+
+const maxLogBodyLen = 1024 // truncate request body in log if too long
+
+// ErrorLogInterceptor logs all errors with full context for debugging.
+// Placed BEFORE I18nInterceptor so it sees the original *errcode.Err.
+//
+// Enforcement rules (fail-fast in dev):
+//  1. Every error returned from handler MUST be *errcode.Err.
+//     Non-errcode errors indicate a missing Wrapf in business logic → panic.
+//  2. For business errors (grpcCode == OK, i.e. HTTP 200), the error code
+//     MUST have a corresponding i18n translation (checked against "en").
+//     Missing translation means the developer forgot to add it → panic.
+func ErrorLogInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+
+		// ── Rule 1: error MUST be *errcode.Err ──
+		e, ok := errcode.ExtractErr(err)
+		if !ok {
+			logx.Severef(
+				"[FATAL] %%s returned non-errcode error: %%v — "+
+					"wrap it with errcode.Newf/Wrapf in your logic",
+				info.FullMethod, err,
+			)
+			panic(fmt.Sprintf(
+				"[errcode enforcement] %%s returned a raw error instead of *errcode.Err: %%v\n"+
+					"Fix: use errcode.Newf(code, msg) or errcode.Wrapf(code, msg) in your logic layer.",
+				info.FullMethod, err,
+			))
+		}
+
+		// ── Rule 2: business error (HTTP 200) MUST have i18n msg ──
+		grpcCode := e.GRPCCode()
+		bizCode := e.Code()
+		if errcode.IsOKCode(grpcCode) && bizCode != errcode.OK {
+			if msg := i18n.TranslateErrcode("en", bizCode); msg == "" {
+				logx.Severef(
+					"[FATAL] %%s returned errcode %%d with no i18n translation — "+
+						"add key \"errcode.%%d\" to pkg/i18n/locale/*.json",
+					info.FullMethod, bizCode, bizCode,
+				)
+				panic(fmt.Sprintf(
+					"[i18n enforcement] %%s: errcode %%d has no i18n translation.\n"+
+						"Fix: add \"errcode\".\""+fmt.Sprintf("%%d", bizCode)+"\" to all locale JSON files.",
+					info.FullMethod, bizCode,
+				))
+			}
+		}
+
+		// ── Log error with full context ──
+		duration := time.Since(start)
+		clientIP := ctxutil.ClientIP(ctx)
+		traceID := ctxutil.MetaValue(ctx, "x-request-id", "x-trace-id")
+		lang := ctxutil.MetaValue(ctx, "x-lang", "accept-language")
+
+		reqStr := fmt.Sprintf("%%+v", req)
+		if m, ok := req.(proto.Message); ok {
+			if b, err := protojson.Marshal(m); err == nil {
+				reqStr = string(b)
+			}
+		}
+		if len(reqStr) > maxLogBodyLen {
+			reqStr = reqStr[:maxLogBodyLen] + "...(truncated)"
+		}
+
+		logx.WithContext(ctx).Errorw("rpc error",
+			logx.Field("method", info.FullMethod),
+			logx.Field("code", bizCode),
+			logx.Field("grpc_code", int(grpcCode)),
+			logx.Field("error", err.Error()),
+			logx.Field("cost(ms)", duration.Milliseconds()),
+			logx.Field("client_ip", clientIP),
+			logx.Field("trace_id", traceID),
+			logx.Field("lang", lang),
+			logx.Field("request", reqStr),
+		)
+
+		return nil, err
+	}
+}
+`, modulePath, modulePath, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "error_log_interceptor.go"), errorLogInterceptor); err != nil {
+		return err
+	}
+
+	// metrics_interceptor.go — auto-report success/fail + status errors + biz errors
+	metricsInterceptor := fmt.Sprintf(`package middleware
+
+import (
+	"context"
+	"strconv"
+
+	"google.golang.org/grpc"
+
+	"%s/pkg/errcode"
+	"%s/pkg/metrics"
+)
+
+// MetricsInterceptor records per-RPC success/failure counters.
+//
+// Placement: AFTER ErrorLogInterceptor, BEFORE I18nInterceptor.
+// At this point err is still the original *errcode.Err (not yet wrapped
+// into gRPC status), so we can distinguish status errors vs biz errors.
+//
+// Metrics reported:
+//
+//  1. rpc_server_requests_total{method, result}
+//     - result="success" on nil error
+//     - result="fail"    on any error
+//
+//  2. rpc_server_status_errors_total{method, grpc_code}
+//     - Only for status errors: grpcCode != OK (maps to HTTP 4xx/5xx)
+//
+//  3. rpc_server_biz_errors_total{method, biz_code}
+//     - Only for business errors: grpcCode == OK (HTTP 200) but code != 0
+func MetricsInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
+
+		method := info.FullMethod
+
+		if err == nil {
+			metrics.RPCTotal.Inc(method, "success")
+			return resp, nil
+		}
+
+		metrics.RPCTotal.Inc(method, "fail")
+
+		e, ok := errcode.ExtractErr(err)
+		if !ok {
+			metrics.RPCStatusTotal.Inc(method, "Internal")
+			return nil, err
+		}
+
+		grpcCode := e.GRPCCode()
+		bizCode := e.Code()
+
+		if errcode.IsOKCode(grpcCode) {
+			metrics.RPCBizErrorTotal.Inc(method, strconv.Itoa(bizCode))
+		} else {
+			metrics.RPCStatusTotal.Inc(method, grpcCode.String())
+		}
+
+		return nil, err
+	}
+}
+`, modulePath, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "metrics_interceptor.go"), metricsInterceptor); err != nil {
+		return err
+	}
+
+	// validate_interceptor.go — no external dependencies, works with protoc-gen-validate or protovalidate
+	validateInterceptor := `package middleware
+
+import (
+	"context"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// Validator is the interface that validate-capable messages implement.
+// Works with protoc-gen-validate (method Validate() error) or custom validators.
+type Validator interface {
+	Validate() error
+}
+
+// ValidateInterceptor validates incoming requests if they implement Validator interface.
+// To enable: use protoc-gen-validate to generate Validate() methods on your proto messages.
+// If no Validate() method exists, the request passes through without validation.
+func ValidateInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if v, ok := req.(Validator); ok {
+			if err := v.Validate(); err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+		}
+		return handler(ctx, req)
+	}
+}
+`
+	return writeIfNotExist(filepath.Join(dir, "validate_interceptor.go"), validateInterceptor)
+}
+
+// ==================== Makefile ====================
+
+func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) error {
+	port := 8080
+	if zctx != nil && zctx.Port > 0 {
+		port = zctx.Port
+	}
+	svcLower := strings.ToLower(serviceName)
+	svcCamel := strings.ToUpper(serviceName[:1]) + serviceName[1:]
+
+	content := fmt.Sprintf(`# Custom configuration | 独立配置
+# Service name | 项目名称
+SERVICE=%s
+# Service name in specific style | 项目经过style格式化的名称
+SERVICE_STYLE=%s
+# Service name in lowercase | 项目名称全小写格式
+SERVICE_LOWER=%s
+# Service name in dash format | 项目名称短杠格式
+SERVICE_DASH=%s
+
+# The project version, if you don't use git, you should set it manually | 项目版本
+VERSION=$(shell git describe --tags --always 2>/dev/null || echo "dev")
+
+# The project file name style | 项目文件命名风格
+PROJECT_STYLE=go_zero
+
+# Whether to use i18n | 是否启用 i18n
+PROJECT_I18N=true
+
+# Ent enabled features | Ent 启用的官方特性
+ENT_FEATURE=sql/execquery,intercept
+
+# The service port | 服务端口
+PORT=%d
+
+# The arch of the build | 构建的架构
+GOARCH=amd64
+
+# The docker image repo | Docker 仓库地址
+DOCKER_REPO=docker.io/xxx
+
+# ---- You may not need to modify the codes below | 下面的代码大概率不需要更改 ----
+
+GO ?= go
+GOFMT ?= gofmt "-s"
+GOFILES := $(shell find . -name "*.go")
+LDFLAGS := -s -w
+
+# Default model (for single module generation)
+model ?= all
+
+# ==================== Proto ====================
+
+.PHONY: pull-proto
+pull-proto: # Pull proto from remote repo | 从远程仓库拉取 proto (需配置 proto.yaml)
+	@if [ ! -f proto.yaml ]; then echo "proto.yaml not found, using local desc/ directly"; exit 0; fi
+	@REPO=$$(grep 'repo:' proto.yaml | head -1 | awk '{print $$2}'); \
+	REF=$$(grep 'ref:' proto.yaml | head -1 | awk '{print $$2}'); \
+	REMOTE_PATH=$$(grep 'path:' proto.yaml | head -1 | awk '{print $$2}'); \
+	TARGET=$$(grep 'target:' proto.yaml | head -1 | awk '{print $$2}'); \
+	TARGET=$${TARGET:-desc/}; \
+	if [ -z "$$REPO" ]; then echo "ERROR: repo not configured in proto.yaml"; exit 1; fi; \
+	TMPDIR=$$(mktemp -d); \
+	echo "[pull-proto] Cloning $$REPO @ $$REF ..."; \
+	git clone --depth 1 --branch "$$REF" "$$REPO" "$$TMPDIR" 2>/dev/null || \
+		(echo "ERROR: failed to clone $$REPO @ $$REF"; rm -rf "$$TMPDIR"; exit 1); \
+	mkdir -p "$$TARGET"; \
+	echo "[pull-proto] Copying $$TMPDIR/$$REMOTE_PATH → $$TARGET"; \
+	cp -r "$$TMPDIR/$$REMOTE_PATH"* "$$TARGET/"; \
+	rm -rf "$$TMPDIR"; \
+	echo "[pull-proto] Done. Proto version: $$REF"
+
+.PHONY: gen-rpc
+gen-rpc: # Generate RPC files from proto | 合并 desc/ → 根 proto → protoc → types/
+	@zctl rpc merge-proto
+	zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE)
+	@echo "Generate RPC files successfully"
+
+# ==================== Ent ====================
+
+.PHONY: gen-ent
+gen-ent: # Generate Ent codes | 生成 Ent 的代码
+	@go get entgo.io/ent@latest 2>/dev/null; true
+	@test -d ent/schema || (echo "ERROR: ent/schema not found, run 'make gen-ent-new name=XXX' first"; exit 1)
+	go run -mod=mod entgo.io/ent/cmd/ent generate ./ent/schema --feature $(ENT_FEATURE)
+	@echo "Generate Ent files successfully"
+
+.PHONY: gen-ent-new
+gen-ent-new: # Create new ent schema | 新建 ent schema (usage: make gen-ent-new name=User)
+	$(eval _ENT_NAME := $(if $(name),$(name),$(word 2,$(MAKECMDGOALS))))
+	@if [ -z "$(_ENT_NAME)" ]; then echo "Usage: make gen-ent-new name=User (or: make gen-ent-new User)"; exit 1; fi
+	@go get entgo.io/ent@latest 2>/dev/null; true
+	@mkdir -p ent/schema
+	go run -mod=mod entgo.io/ent/cmd/ent new $(_ENT_NAME)
+	@echo "Created ent schema: $(_ENT_NAME)"
+
+# Allow positional args like "make gen-ent-new User" without error
+%%:
+	@:
+
+# ==================== Code Generation ====================
+
+.PHONY: gen-rpc-ent-logic
+gen-rpc-ent-logic: # Generate CRUD+DAO+proto+logic from Ent | 一键生成全套 (usage: make gen-rpc-ent-logic model=User)
+	zctl rpc ent --schema=./ent/schema --style=$(PROJECT_STYLE) --service_name=$(SERVICE) --model=$(model)
+	@echo "Generate successfully (includes merge-proto + protoc + logic/server)"
+
+.PHONY: gen-dao-sql
+gen-dao-sql: # Generate DAO method from SQL | 根据SQL生成DAO方法 (usage: make gen-dao-sql sql="SELECT ...")
+	@if [ -z "$(sql)" ]; then echo "ERROR: please specify sql, e.g.: make gen-dao-sql sql=\"SELECT * FROM user WHERE status=1\""; exit 1; fi
+	zctl rpc dao --schema=./ent/schema --sql="$(sql)" --style=$(PROJECT_STYLE) --overwrite
+	@echo "Generate DAO method from SQL successfully"
+
+# ==================== Test ====================
+
+.PHONY: test
+test: # Run all tests | 运行全部单测
+	go test -v --cover ./internal/...
+
+.PHONY: test-module
+test-module: # Run tests for a module | 运行某模块的单测 (usage: make test-module module=userinfo)
+	go test -v --cover ./internal/logic/$(module)/... ./internal/dao/...
+
+.PHONY: test-func
+test-func: # Run a single test function | 运行单个测试函数 (usage: make test-func func=TestXxx pkg=./internal/...)
+	@if [ -z "$(func)" ] || [ -z "$(pkg)" ]; then echo "Usage: make test-func func=TestXxx pkg=./internal/logic/xxx/..."; exit 1; fi
+	go test -v -run $(func) $(pkg)
+
+.PHONY: grpc-test
+grpc-test: # Call a gRPC method via grpcurl | 单接口测试 (usage: make grpc-test method=xxx.Xxx/Xxx req='{}')
+	@if [ -z "$(method)" ]; then echo "Usage: make grpc-test method=demo.Demo/Ping req='{}'"; exit 1; fi
+	grpcurl -plaintext -d '$(req)' localhost:$(PORT) $(method)
+
+# ==================== Run & Build ====================
+
+.PHONY: run
+run: # Run the service locally | 本地运行
+	go run $(SERVICE_STYLE).go -f etc/$(SERVICE_STYLE).yaml
+
+.PHONY: build
+build: # Build for current platform | 构建当前平台可执行文件
+	go build -ldflags "$(LDFLAGS)" -trimpath -o $(SERVICE_STYLE) $(SERVICE_STYLE).go
+	@echo "Build successfully"
+
+.PHONY: build-linux
+build-linux: # Build project for Linux | 构建Linux下的可执行文件
+	env CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -trimpath -o $(SERVICE_STYLE) $(SERVICE_STYLE).go
+	@echo "Build project for Linux successfully"
+
+.PHONY: build-mac
+build-mac: # Build project for MacOS | 构建MacOS下的可执行文件
+	env CGO_ENABLED=0 GOOS=darwin GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -trimpath -o $(SERVICE_STYLE) $(SERVICE_STYLE).go
+	@echo "Build project for MacOS successfully"
+
+.PHONY: build-win
+build-win: # Build project for Windows | 构建Windows下的可执行文件
+	env CGO_ENABLED=0 GOOS=windows GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -trimpath -o $(SERVICE_STYLE).exe $(SERVICE_STYLE).go
+	@echo "Build project for Windows successfully"
+
+# ==================== Docker ====================
+
+.PHONY: docker
+docker: # Build the docker image | 构建 docker 镜像
+	docker build -t $(DOCKER_REPO)/$(SERVICE_DASH):$(VERSION) .
+	@echo "Build docker successfully"
+
+.PHONY: publish-docker
+publish-docker: # Publish docker image | 发布 docker 镜像
+	docker push $(DOCKER_REPO)/$(SERVICE_DASH):$(VERSION)
+	@echo "Publish docker successfully"
+
+# ==================== Doc & Debug ====================
+
+.PHONY: swagger
+swagger: # Launch gRPC Web UI for debugging | 启动可调试的 gRPC Web UI（需服务运行中）
+	@echo "Launching gRPC Web UI (browser will open automatically)"
+	@echo "Requires service running at localhost:$(PORT) with reflection enabled (non-prod)."
+	grpcui -plaintext localhost:$(PORT)
+
+.PHONY: proto-doc
+proto-doc: # Generate API doc with field table + JSON examples | 生成表格式 API 文档
+	@mkdir -p doc
+	protoc -I=. --doc_out=./doc --doc_opt=json,$(SERVICE_STYLE).json $(SERVICE_STYLE).proto
+	zctl rpc proto-doc --input=doc/$(SERVICE_STYLE).json
+	@echo "Generated doc/$(SERVICE_STYLE)_api.md"
+
+# ==================== Misc ====================
+
+.PHONY: tidy
+tidy: # Go mod tidy | 整理依赖
+	go mod tidy
+
+.PHONY: fmt
+fmt: # Format the codes | 格式化代码
+	$(GOFMT) -w $(GOFILES)
+
+.PHONY: lint
+lint: # Run go linter | 运行代码错误分析
+	golangci-lint run -D staticcheck
+
+.PHONY: tools
+tools: # Install the necessary tools | 安装必要的工具
+	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	$(GO) install github.com/qqz14/zctl@latest
+	$(GO) install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
+	$(GO) install github.com/fullstorydev/grpcui/cmd/grpcui@latest
+	$(GO) install github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc@latest
+
+.PHONY: health
+health: # Check gRPC health status | 检查 gRPC 健康状态
+	grpcurl -plaintext localhost:$(PORT) grpc.health.v1.Health/Check
+
+.PHONY: grpc-list
+grpc-list: # List all gRPC services | 列出所有 gRPC 服务
+	grpcurl -plaintext localhost:$(PORT) list
+
+.PHONY: help
+help: # Show help | 显示帮助
+	@grep -E '^[a-zA-Z0-9 -]+:.*#'  Makefile | sort | while read -r l; do printf "\033[1;32m$$(echo $$l | cut -f 1 -d':')\\033[00m:$$(echo $$l | cut -f 2- -d'#')\\n"; done
+`, svcCamel, svcLower, svcLower, svcLower, port)
+
+	return writeIfNotExist(filepath.Join(abs, "Makefile"), content)
+}
+
+// ==================== Dockerfile ====================
+
+func (g *Generator) genDockerfile(abs, serviceName string) error {
+	svcLower := strings.ToLower(serviceName)
+	content := fmt.Sprintf(`# ==========================================
+# Stage 1: Build
+# ==========================================
+FROM golang:1.25-alpine AS builder
+
+ENV GO111MODULE=on \
+    GOPROXY=https://goproxy.cn,direct \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+WORKDIR /build
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -ldflags="-s -w" -o %s ./%s.go
+
+# ==========================================
+# Stage 2: Run
+# ==========================================
+FROM alpine:3.22
+
+WORKDIR /app
+
+ENV TZ=UTC
+
+RUN apk update --no-cache && \
+    apk add --no-cache tzdata bash gettext ca-certificates jq && \
+    update-ca-certificates
+
+COPY --from=builder /build/%s ./
+COPY ./entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
+COPY ./etc/%s.yaml.template ./etc/%s.yaml.template
+
+ENTRYPOINT ["./entrypoint.sh"]
+`, svcLower, svcLower, svcLower, svcLower, svcLower)
+
+	return writeIfNotExist(filepath.Join(abs, "Dockerfile"), content)
+}
+
+// ==================== entrypoint.sh ====================
+
+func (g *Generator) genEntrypoint(abs string) error {
+	content := `#!/bin/bash
+set -e
+
+# Load secrets from JSON file (e.g. AWS Secrets Manager mount)
+json_file_path="${PATH_TO_SECRET_FILE:-}"
+if [ -n "$json_file_path" ] && [ -f "$json_file_path" ]; then
+    if command -v jq >/dev/null 2>&1; then
+        eval "$(jq -r 'to_entries | .[] | "export \(.key)=\"\(.value)\""' "$json_file_path")"
+        echo "[entrypoint] Loaded secrets from $json_file_path"
+    fi
+fi
+
+# Find config template and render with envsubst
+CONFIG_TEMPLATE=$(find ./etc -name "*.yaml.template" | head -1)
+if [ -z "$CONFIG_TEMPLATE" ]; then
+    echo "[entrypoint] ERROR: no .yaml.template found in ./etc/"
+    exit 1
+fi
+
+CONFIG_FILE="${CONFIG_TEMPLATE%.template}"
+echo "[entrypoint] Rendering: $CONFIG_TEMPLATE -> $CONFIG_FILE"
+envsubst < "$CONFIG_TEMPLATE" > "$CONFIG_FILE"
+
+# Find and run the binary
+BINARY=$(find . -maxdepth 1 -type f -executable ! -name "*.sh" | head -1)
+if [ -z "$BINARY" ]; then
+    echo "[entrypoint] ERROR: no executable binary found"
+    exit 1
+fi
+
+echo "[entrypoint] Starting $BINARY ..."
+exec "$BINARY" -f "$CONFIG_FILE" "$@"
+`
+	return writeIfNotExist(filepath.Join(abs, "entrypoint.sh"), content)
+}
+
+// ==================== etc/xxx.yaml.template ====================
+
+func (g *Generator) genEtcTemplate(abs, serviceName string, zctx *ZRpcContext) error {
+	svcLower := strings.ToLower(serviceName)
+	port := 8080
+	if zctx != nil && zctx.Port > 0 {
+		port = zctx.Port
+	}
+	portStr := fmt.Sprintf("%d", port)
+	upperSvc := strings.ToUpper(serviceName)
+
+	content := fmt.Sprintf(`Name: %s.rpc
+ListenOn: 0.0.0.0:${%s_RPC_PORT:-%s}
+
+# Environment: dev | stage | uat | prod
+# Only dev/stage allow auto-migrate (create tables automatically)
+Env: ${ENV:-dev}
+
+DatabaseConf:
+  Type: mysql
+  Host: ${DB_HOST:-127.0.0.1}
+  Port: ${DB_PORT:-3306}
+  DBName: ${DB_NAME:-%s}
+  Username: ${DB_USER:-root}
+  Password: "${DB_PASSWORD:-password}"
+  MaxOpenConn: 50
+  SSLMode: disable
+  CacheTime: 5
+
+Log:
+  ServiceName: %sLogger
+  Mode: console
+  Level: ${LOG_LEVEL:-info}
+  Encoding: plain
+  StackCoolDownMillis: 100
+
+RedisConf:
+  Host: ${REDIS_HOST:-127.0.0.1:6379}
+  Db: 0
+
+Prometheus:
+  Host: 0.0.0.0
+  Port: ${PROMETHEUS_PORT:-4000}
+  Path: /metrics
+
+#Telemetry:
+#  Name: %s-rpc
+#  Endpoint: localhost:4317
+#  Sampler: 1.0
+#  Batcher: otlpgrpc
+`, svcLower, upperSvc, portStr, svcLower, svcLower, svcLower)
+
+	dir := filepath.Join(abs, "etc")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+	return writeIfNotExist(filepath.Join(dir, svcLower+".yaml.template"), content)
+}
+
+// ==================== .gitignore ====================
+
+func (g *Generator) genGitignore(abs string) error {
+	content := `# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+/bin/
+/dist/
+
+# Env / Secrets
+*.env
+secret_manager*.json
+
+# Generated etc config (keep .template only)
+etc/*.yaml
+!etc/*.yaml.template
+`
+	return writeIfNotExist(filepath.Join(abs, ".gitignore"), content)
+}
+
+// ==================== README.md ====================
+
+func (g *Generator) genProjectReadme(abs, serviceName string, zctx *ZRpcContext) error {
+	svcLower := strings.ToLower(serviceName)
+	port := 8080
+	if zctx != nil && zctx.Port > 0 {
+		port = zctx.Port
+	}
+
+	content := fmt.Sprintf(`# %s
+
+基于 go-zero + entgo 的 gRPC 微服务。
+
+## 快速开始
+
+`+"```"+`bash
+make run
+`+"```"+`
+
+## 开发流程
+
+`+"```"+`bash
+# 1. 新建 ent schema，编辑字段
+make gen-ent-new name=User
+# → 编辑 ent/schema/user.go 定义 Fields / Edges / Indexes
+
+# 2. 生成 ent ORM 代码
+make gen-ent
+
+# 3. 一键生成模块全套代码（DAO + logic + errcode + test + desc proto + pb + server）
+make gen-rpc-ent-logic model=User
+
+# 4. 整理依赖 & 运行
+make tidy
+make run
+`+"```"+`
+
+## 常用命令
+
+详见 [zctl-commands.md](./zctl-commands.md)
+
+## Proto 协议管理
+
+### 最佳实践
+
+所有微服务的 proto 协议由**统一的 proto 仓库**集中管理（包括本服务），各微服务通过 `+"`"+`proto.yaml`+"`"+` 配置同步协议。
+
+统一仓库结构示例：
+
+`+"```"+`
+proto-definitions/             # 统一 proto 仓库
+├── base/
+│   └── base.proto             # 公共 message（Empty / PageInfo 等）
+├── %s/                        # 本服务的协议
+│   ├── ping/ping.proto
+│   └── userinfo/user_info.proto
+├── other-service/             # 其他服务的协议
+│   └── ...
+└── ...
+`+"```"+`
+
+### 配置
+
+项目根目录 `+"`"+`proto.yaml`+"`"+`（初始化时已创建，填入实际值即可）：
+
+`+"```"+`yaml
+remote:
+  repo: git@github.com:your-org/proto-definitions.git
+  ref: main              # 开发阶段跟 main 分支；发版用 tag 如 v1.2.0
+  path: %s/              # 本服务在远程仓库中的子目录
+  target: desc/          # 同步到本地 desc/
+`+"```"+`
+
+### 协议开发流程
+
+`+"```"+`bash
+# 1. 拉取远程最新协议到本地 desc/
+make pull-proto
+
+# 2. 修改 desc/ 中的 proto 文件（新增接口、修改 message 等）
+
+# 3. 本地重新生成代码
+make gen-rpc
+
+# 4. 调整 logic 代码适配新签名，本地验证
+make tidy
+go build ./...
+make test
+
+# 5. 提交协议变更到统一 proto 仓库
+cd /path/to/proto-definitions
+cp -r /path/to/%s/desc/* %s/
+git add .
+git commit -m "feat(%s): add getUserList pagination"
+git tag v1.3.0
+git push origin main --tags
+
+# 6. 回到服务仓库，更新 proto.yaml 的 ref（如果用 tag 锁版本）
+#    ref: v1.3.0
+# 7. 提交服务仓库
+git add .
+git commit -m "feat: update proto to v1.3.0"
+git push
+`+"```"+`
+
+### CI/CD 协议一致性保证
+
+CI pipeline 中加入校验步骤，确保部署时使用的协议与 proto 仓库一致：
+
+`+"```"+`yaml
+# .github/workflows/ci.yaml (示例)
+steps:
+  - name: Pull proto
+    run: make pull-proto
+
+  - name: Verify proto consistency
+    run: |
+      make gen-rpc
+      if [ -n "$(git status --porcelain types/ %s.proto internal/server/ %s_client/)" ]; then
+        echo "ERROR: proto out of sync with proto repo"
+        git diff --stat
+        exit 1
+      fi
+
+  - name: Test
+    run: make test
+
+  - name: Build
+    run: make build-linux
+`+"```"+`
+
+**核心原则**：
+
+- **proto 仓库是 single source of truth**，所有服务从同一个仓库拉取
+- **`+"`"+`proto.yaml`+"`"+` 中的 `+"`"+`ref`+"`"+` 锁定版本**，CI 用 tag（如 `+"`"+`v1.3.0`+"`"+`），开发可用 `+"`"+`main`+"`"+`
+- **CI 验证无 diff** = 部署代码与协议版本一致
+- **先改 proto 仓库，再改业务仓库**，确保协议变更有独立的版本历史和 review
+
+### 协议文档生成
+
+proto 协议可一键转换为表格式 API 文档（含字段说明、类型、必填标记、JSON 示例）：
+
+`+"```"+`bash
+make proto-doc      # 生成 doc/{service}_api.md
+`+"```"+`
+
+文档中每个接口包含请求/响应参数表格和 JSON 示例，嵌套字段用 `+"`"+`info.username`+"`"+` 格式展示，方便协作和 review。
+
+proto 字段的注释（ent schema 的 `+"`"+`.Comment("xxx")`+"`"+`）会自动成为文档中的"说明"列。
+
+## 测试与调试
+
+### 浏览器调试（Swagger）
+
+启动服务后，一行命令打开 gRPC Web UI，浏览器中可查看所有接口、填写参数、直接调试：
+
+`+"```"+`bash
+make run             # 先启动服务
+make swagger         # 自动打开浏览器 gRPC 调试 UI
+`+"```"+`
+
+> 仅非 prod 环境可用（prod 环境 gRPC 反射已关闭）。
+
+### 单接口测试（命令行）
+
+用 grpcurl 快速调用指定接口：
+
+`+"```"+`bash
+make grpc-test method=%s.%s/Ping req='{}'
+`+"```"+`
+
+### 单元测试（Mock）
+
+zctl 自动为每个 DAO 生成 testify mock（`+"`"+`internal/dao/mock/`+"`"+`），同时为每个模块生成测试骨架。
+
+`+"```"+`bash
+# 运行全部单测
+make test
+
+# 运行指定模块的单测
+make test-module module=userinfo
+
+# 运行单个测试函数
+make test-func func=TestCreateUserInfo pkg=./internal/logic/userinfo/user_info/...
+`+"```"+`
+
+测试骨架位于 `+"`"+`internal/logic/{group}/{model}/{model}_test.go`+"`"+`，含 `+"`"+`t.Skip()`+"`"+` 占位，填充断言后即可使用。
+
+## 服务发现
+
+默认不依赖 Etcd。K8s 用 headless service + DNS：
+
+`+"```"+`yaml
+%sRpc:
+  Target: dns:///%s-rpc-svc:%d
+`+"```"+`
+
+本地开发直连：
+
+`+"```"+`yaml
+%sRpc:
+  Target: direct://127.0.0.1:%d
+`+"```"+`
+
+`+"```"+`bash
+make help   # 查看所有可用命令
+`+"```"+`
+
+## 项目结构
+
+`+"```"+`
+%s/
+├── %s.go                # 主入口
+├── %s.proto             # 合并后的 proto（自动生成，勿编辑）
+├── proto.yaml             # 远程 proto 配置（可选）
+├── Makefile
+├── Dockerfile
+├── desc/                  # proto 源文件（按业务域分子目录）
+│   ├── base.proto
+│   └── {group}/
+├── types/                 # protoc 生成的 pb 文件
+├── ent/schema/            # entgo 表结构定义
+├── internal/
+│   ├── config/
+│   ├── svc/               # ServiceContext（DAO 实例注入）
+│   ├── server/            # gRPC server 实现
+│   ├── logic/             # 业务逻辑（层级对齐 desc/）
+│   ├── middleware/         # 拦截器
+│   ├── dao/               # DAO 接口
+│   ├── dao/impl/          # DAO 实现（OceanBase）
+│   └── dao/mock/          # DAO Mock（自动生成）
+├── pkg/
+│   ├── errcode/           # 错误码 + 错误类型
+│   ├── ctxutil/           # ctx 工具 + 日志
+│   ├── model/             # 公共模型（PageInfo 等）
+│   ├── consts/            # 常量
+│   ├── i18n/              # 国际化
+│   └── metrics/           # Prometheus 指标
+└── %s_client/             # RPC 客户端 SDK
+`+"```"+`
+`, serviceName,
+		svcLower, svcLower,
+		svcLower, svcLower, svcLower,
+		svcLower, svcLower,
+		svcLower, serviceName,
+		svcLower, svcLower, port,
+		svcLower, port,
+		svcLower, svcLower, svcLower,
+		svcLower)
+
+	return writeIfNotExist(filepath.Join(abs, "README.md"), content)
+}
+
+// ==================== zctl-commands.md ====================
+
+func (g *Generator) genCommandsDoc(abs, serviceName string) error {
+	return GenCommandsDoc(abs, serviceName)
+}
+
+// GenCommandsDoc generates/overwrites zctl-commands.md documentation.
+// Exported so that every subcommand (ent, dao, merge-proto, enum) can refresh it.
+func GenCommandsDoc(abs, serviceName string) error {
+	svcLower := strings.ToLower(serviceName)
+
+	content := strings.ReplaceAll(`# zctl 桩命令使用说明
+
+> 本文档由 zctl 自动生成（每次运行 zctl 桩命令时自动覆盖更新），详细介绍每个桩命令的功能、参数、生成的文件、注意事项及使用示例。
+
+---
+
+## 目录
+
+1. [make gen-rpc](#1-make-gen-rpc) — 合并 proto + 生成 pb + 自动扫描 enum
+2. [make gen-ent-new](#2-make-gen-ent-new) — 创建 Ent Schema
+3. [make gen-ent](#3-make-gen-ent) — 生成 Ent ORM 代码
+4. [make gen-rpc-ent-logic](#4-make-gen-rpc-ent-logic) — 根据 Ent 生成全套模块代码
+5. [make gen-dao-sql](#5-make-gen-dao-sql) — 根据 SQL 生成自定义 DAO 方法
+6. [zctl rpc enum](#6-zctl-rpc-enum) — 手动生成枚举常量
+7. [zctl rpc merge-proto](#7-zctl-rpc-merge-proto) — 合并 desc 下所有 proto
+
+---
+
+## 1. ~make gen-rpc~
+
+**做什么**：将 ~desc/~ 目录下所有 .proto 合并成根 proto，调用 protoc 生成 pb 文件到 ~types/~，同时自动完成以下工作：
+
+1. 合并 ~desc/**/*.proto~ → 根 proto
+2. 自动扫描 proto 中的 ~enum~ 定义 → 生成 Go 枚举助手
+3. protoc 生成 pb 文件 → ~types/{package}/~
+4. 自动为 ~desc/~ 下每个子目录（模块）生成对应的 **pkg/model/{module}.go**、**pkg/consts/{module}.go**、**pkg/errcode/{module}.go** 占位文件
+5. 日志自动注入 ~module~ 字段：通过 ~ModuleInterceptor~ 从 gRPC FullMethod 提取模块名注入到 ctx，后续所有 ~ctxutil.L(ctx)~ 打出的日志都自动携带 ~module~ 字段，方便按模块过滤日志
+
+**执行命令**：
+~~~bash
+make gen-rpc
+~~~
+
+**内部调用链**：
+1. ~zctl rpc merge-proto~ → 扫描 ~desc/**/*.proto~ → 合并到 ~{{SERVICE}}.proto~
+2. 自动扫描 ~desc/~ 中的 ~enum~ → 生成 ~pkg/enums/{snake_name}.go~
+3. ~zctl rpc protoc {{SERVICE}}.proto~ → protoc → ~types/{package}/~
+4. 扫描 ~desc/~ 子目录 → 生成 ~pkg/model/~、~pkg/consts/~、~pkg/errcode/~ 模块占位文件
+
+**生成/修改的文件**：
+
+| 文件路径 | 操作 | 说明 |
+|----------|------|------|
+| ~{{SERVICE}}.proto~ | 覆盖 | 合并后的根 proto（只读，不要手动编辑） |
+| ~types/{{SERVICE}}/*.pb.go~ | 覆盖 | protoc 生成的 Go pb 文件 |
+| ~types/{{SERVICE}}/*_grpc.pb.go~ | 覆盖 | protoc 生成的 gRPC 桩代码 |
+| ~internal/server/*_server.go~ | 新建/跳过已有 | gRPC server 实现（按 service 分包） |
+| ~internal/logic/**/*_logic.go~ | 新建/跳过已有 | Logic 层（层级对齐 desc/ 目录） |
+| ~pkg/enums/{snake_name}.go~ | 覆盖 | proto enum → Go 枚举助手 |
+| ~pkg/model/{module}.go~ | 新建/跳过已有 | 模块 VO/DTO 占位（按 desc 子目录名） |
+| ~pkg/consts/{module}.go~ | 新建/跳过已有 | 模块常量占位 |
+| ~pkg/errcode/{module}.go~ | 新建/跳过已有 | 模块错误码占位 |
+
+**日志 module 自动注入**：
+
+拦截器链中的 ~ModuleInterceptor~ 会自动从 gRPC FullMethod（如 ~/demo.User/CreateUser~）提取模块名（~User~）并注入 ctx。后续代码只需用 ~ctxutil.L(ctx).Infow(...)~ 打日志，输出自动包含：
+
+~~~json
+{"module": "User", "msg": "dao.User.Create ok", "id": 123}
+~~~
+
+无需手动传递 module 参数，按 ~module=User~ 即可过滤某模块的所有日志。
+
+**注意事项**：
+- ~{{SERVICE}}.proto~ 是合并生成的，**设为只读（0444）权限**，所有 proto 修改都应在 ~desc/~ 子目录下进行。
+- ~internal/logic/~ 和 ~internal/server/~ 下已有文件不会被覆盖，只新增缺失的。
+- proto 中的 ~enum~ 命名需遵循 ~ENUM_NAME_VALUE~ 格式（如 ~USER_STATUS_NORMAL~），才能被自动扫描。
+
+**示例**：假设 ~desc/user/user.proto~ 中定义了：
+~~~protobuf
+enum UserStatus {
+  USER_STATUS_NORMAL = 0;
+  USER_STATUS_DISABLED = 1;
+  USER_STATUS_LOCKED = 2;
+}
+~~~
+
+运行 ~make gen-rpc~ 后自动生成 ~pkg/enums/user_status.go~：
+~~~go
+type UserStatus int32
+const (
+    UserStatusNormal   UserStatus = 0
+    UserStatusDisabled UserStatus = 1
+    UserStatusLocked   UserStatus = 2
+)
+func (e UserStatus) String() string { ... }
+func (e UserStatus) IsValid() bool { ... }
+func ParseUserStatus(s string) (UserStatus, error) { ... }
+~~~
+
+---
+
+## 2. ~make gen-ent-new~
+
+**做什么**：在 ~ent/schema/~ 下创建新的 ent schema 文件。
+
+**执行命令**：
+~~~bash
+make gen-ent-new name=User
+# 或位置参数写法
+make gen-ent-new User
+~~~
+
+参数：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| ~name~ | 是 | Schema 名称，大驼峰（如 ~User~, ~UserToken~） |
+
+生成的文件：
+
+| 文件路径 | 操作 | 说明 |
+|----------|------|------|
+| ~ent/schema/{snake_name}.go~ | 新建 | Ent schema 模板 |
+
+**注意事项**：
+- 名称必须用 **大驼峰** 格式（~User~ 而非 ~user~），ent 要求首字母大写。
+- 生成后需 **手动编辑** schema 文件，添加 Fields() 和 Edges()。
+- 如果 ~ent/schema/~ 目录不存在会自动创建。
+
+**下一步**：编辑 schema → ~make gen-ent~ → ~make gen-rpc-ent-logic model=User~
+
+---
+
+## 3. ~make gen-ent~
+
+**做什么**：根据 ~ent/schema/~ 下的所有 schema 定义，运行 ~go run entgo.io/ent/cmd/ent generate~ 生成 ent ORM 代码。
+
+**执行命令**：
+~~~bash
+make gen-ent
+~~~
+
+**生成/修改的文件**：
+
+| 目录/文件 | 操作 | 说明 |
+|----------|------|------|
+| ~ent/client.go~ | 覆盖 | ent Client（CRUD 入口） |
+| ~ent/{model}.go~ | 覆盖 | 实体结构体 |
+| ~ent/{model}_create.go~ | 覆盖 | Create 构建器 |
+| ~ent/{model}_update.go~ | 覆盖 | Update 构建器 |
+| ~ent/{model}_query.go~ | 覆盖 | Query 构建器 |
+| ~ent/{model}_delete.go~ | 覆盖 | Delete 构建器 |
+| ~ent/{model}/where.go~ | 覆盖 | Where predicate（查询条件） |
+| ~ent/migrate/schema.go~ | 覆盖 | 数据库迁移 schema |
+| ~ent/hook/~ | 覆盖 | Hook 工具 |
+| ~ent/intercept/~ | 覆盖 | 查询拦截器 |
+
+**注意事项**：
+- ~ent/~ 目录下除 ~ent/schema/~ 以外的所有文件 **每次都会被覆盖**，不要手动修改。
+- 修改 schema 后必须重新运行此命令。
+- 启用的 ent features 在 Makefile 的 ~ENT_FEATURE~ 变量中配置（默认 ~sql/execquery,intercept~）。
+
+**前置条件**：至少有一个 schema（先运行 ~make gen-ent-new name=XXX~）。
+
+---
+
+## 4. ~make gen-rpc-ent-logic~
+
+**做什么**：根据 ent schema 自动生成一个模块的全套代码：DAO 接口 + DAO 实现 + CRUD Logic + 错误码 + 测试骨架 + desc proto。
+
+**执行命令**：
+~~~bash
+# 生成指定模块
+make gen-rpc-ent-logic model=User
+
+# 生成所有模块
+make gen-rpc-ent-logic model=all
+~~~
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| ~model~ | 是 | ent schema 名称（大驼峰）或 ~all~ |
+
+**生成/修改的文件**（以 ~model=User~ 为例）：
+
+| 文件路径 | 操作 | 说明 | 你需要做什么 |
+|----------|------|------|------------|
+| ~internal/dao/user_dao.go~ | 新建/跳过 | DAO 接口（5 个方法） | 可追加自定义方法 |
+| ~internal/dao/impl/user_oceanbase.go~ | 新建/跳过 | DAO 实现（ent ORM） | 可追加自定义方法 |
+| ~internal/dao/mock/user_dao_mock.go~ | 覆盖 | DAO Mock（testify/mock） | 自动同步，无需手动 |
+| ~internal/logic/user/user/user_test.go~ | 新建/跳过 | 测试骨架（含 Skip） | 填充断言 |
+| ~pkg/errcode/user.go~ | 新建/跳过 | 模块错误码 | 按需添加错误码 |
+| ~pkg/model/user.go~ | 新建/跳过 | VO/DTO 占位 | 定义业务模型 |
+| ~pkg/consts/user.go~ | 新建/跳过 | 常量占位 | 定义业务常量 |
+| ~desc/user/user.proto~ | 新建/跳过 | CRUD proto（含 5 个 rpc + 全套 message） | 按需添加自定义 rpc |
+
+> **注意：Logic 文件不由此命令生成**。运行 ~make gen-rpc~ 后，protoc 会根据 proto 中的 rpc 定义自动生成 logic 骨架（~internal/logic/user/user/create_user_logic.go~ 等），签名自动对齐 pb 类型（如 ~*demo.CreateUserReq~），无需手动处理类型转换。
+
+**生成的 desc proto 详细说明**（~desc/user/user.proto~）：
+
+| 内容 | 说明 |
+|------|------|
+| ~UserInfo~ message | 核心详情结构，字段从 ent schema 自动推导（含 id/created_at/updated_at + 所有业务字段） |
+| ~Create{Model}Req~ / ~Create{Model}Resp~ | 创建请求（内嵌 UserInfo）和返回（id） |
+| ~Update{Model}Req~ | 更新请求（内嵌 UserInfo） |
+| ~Get{Model}ByIdReq~ | 按 ID 查询请求 |
+| ~Delete{Model}Req~ | 删除请求（支持批量 ids） |
+| ~Get{Model}ListReq~ / ~Get{Model}ListResp~ | 分页列表请求和返回 |
+| ~service~ 块 | 5 个 rpc 方法：create/update/getList/getById/delete |
+
+注意：proto 文件**不会被覆盖**（即使加 ~--overwrite~），因为开发者可能已在其中添加自定义 rpc 方法。如需重新生成，请先手动删除该文件。
+
+**生成的 proto 命名规范**（以 ~User~ 为例）：
+
+~~~protobuf
+// 复用 UserInfo 作为详情载体
+message UserInfo { ... }
+
+// 每个 rpc 方法有独立的 Req/Resp，命名 = 方法名 + Req/Resp
+rpc createUser  (CreateUserReq)   returns (CreateUserResp);
+rpc updateUser  (UpdateUserReq)   returns (Empty);
+rpc getUserList (GetUserListReq)  returns (GetUserListResp);
+rpc getUserById (GetUserByIdReq)  returns (UserInfo);
+rpc deleteUser  (DeleteUserReq)   returns (Empty);
+~~~
+
+规则：不使用 ~IDReq~、~IDsReq~、~BaseIDResp~ 等通用命名。空返回复用 ~Empty~，详情复用 ~UserInfo~。
+~~~go
+type UserDao interface {
+    Create(ctx context.Context, data *ent.User) (*ent.User, error)
+    GetByID(ctx context.Context, id int) (*ent.User, error)
+    Update(ctx context.Context, data *ent.User) (*ent.User, error)
+    Delete(ctx context.Context, id int) error
+    List(ctx context.Context, page, pageSize int) ([]*ent.User, int, error)
+}
+~~~
+
+**注意事项**：
+- 文件已存在时**不会覆盖**（除非加 ~--overwrite~），只创建缺失文件。
+- ~group~ 名称默认取 schema 小写名（~user~），决定 ~desc/{group}/~ 和 ~logic/{group}/~ 路径。
+- 生成后务必运行 ~make gen-rpc~ 来合并新的 proto 并重新生成 pb 文件。
+- DAO impl 使用 ~ctxutil.L(ctx)~ 打日志，~errcode.Wrapf~ 包装错误。
+
+**完整流程示例**：
+~~~bash
+# 1. 创建 schema
+make gen-ent-new name=UserToken
+
+# 2. 编辑 ent/schema/user_token.go 定义字段
+
+# 3. 生成 ent ORM
+make gen-ent
+
+# 4. 生成模块全套
+make gen-rpc-ent-logic model=UserToken
+
+# 5. 合并 proto + 生成 pb
+make gen-rpc
+
+# 6. 编译验证
+go build ./...
+~~~
+
+---
+
+## 5. ~make gen-dao-sql~
+
+**做什么**：当 CRUD 五件套不够用时，根据 SQL 语句自动生成自定义 DAO 方法。支持完整的 SQL 解析，自动推导方法名、参数类型、返回值，并生成完整的 ent predicate 调用。
+
+**执行命令**：
+~~~bash
+make gen-dao-sql sql="你的SQL语句"
+~~~
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| ~sql~ | 是 | SQL 语句，用 ~?~ 作占位符 |
+
+**生成/修改的文件**：
+
+| 文件路径 | 操作 | 说明 |
+|----------|------|------|
+| ~internal/dao/{model}_dao.go~ | 追加 | 在接口定义末尾追加方法签名 |
+| ~internal/dao/impl/{model}_oceanbase.go~ | 追加 | 在文件末尾追加完整方法实现 |
+
+### 支持的 SQL 语法
+
+| 类型 | SQL 示例 | 生成方法名 |
+|------|----------|-----------|
+| 查询列表 | ~SELECT * FROM user WHERE status = ?~ | ~FindByStatus~ |
+| 查询单条 | ~SELECT * FROM user WHERE email = ? LIMIT 1~ | ~GetByEmail~ |
+| 计数 | ~SELECT COUNT(*) FROM user WHERE status = ?~ | ~CountByStatus~ |
+| 分页 | ~SELECT * FROM user WHERE status = ? LIMIT ? OFFSET ?~ | ~FindByStatus~ + page/pageSize |
+| 分组 | ~SELECT status, COUNT(*) FROM user GROUP BY status~ | ~GroupByAll~ |
+| JOIN | ~SELECT u.* FROM user u LEFT JOIN order o ON u.id = o.user_id WHERE u.status = ?~ | ~FindByStatus~ + TODO 注释 |
+| NULL 判断 | ~SELECT * FROM user WHERE deleted_at IS NULL AND status = ?~ | ~FindByDeletedAtIsNilAndStatus~ |
+| 更新 | ~UPDATE user SET status = ? WHERE id = ?~ | ~UpdateStatusById~ |
+| 删除 | ~DELETE FROM user WHERE user_id = ?~ | ~DeleteByUserId~ |
+| 插入 | ~INSERT INTO user (name, email) VALUES (?, ?)~ | ~InsertUser~ |
+
+### 支持的 WHERE 操作符
+
+| 操作符 | SQL 示例 | 方法名后缀 | 生成的 ent predicate |
+|--------|----------|-----------|---------------------|
+| ~=~ | ~status = ?~ | 无后缀 | ~user.StatusEQ(status)~ |
+| ~!=~ / ~<>~ | ~status != ?~ | ~Neq~ | ~user.StatusNEQ(status)~ |
+| ~>~ | ~age > ?~ | ~Gt~ | ~user.AgeGT(age)~ |
+| ~>=~ | ~created_at >= ?~ | ~Gte~ | ~user.CreatedAtGTE(created_at)~ |
+| ~<~ | ~score < ?~ | ~Lt~ | ~user.ScoreLT(score)~ |
+| ~<=~ | ~score <= ?~ | ~Lte~ | ~user.ScoreLTE(score)~ |
+| ~IN~ | ~id IN (?, ?)~ | ~In~ | ~user.IdIn(idList...)~ |
+| ~LIKE~ | ~name LIKE ?~ | ~Like~ | ~user.NameContains(name)~ |
+| ~IS NULL~ | ~deleted_at IS NULL~ | ~IsNil~ | ~user.DeletedAtIsNil()~（无参数） |
+| ~IS NOT NULL~ | ~email IS NOT NULL~ | ~NotNil~ | ~user.EmailNotNil()~（无参数） |
+| ~BETWEEN~ | ~age BETWEEN ? AND ?~ | ~Between~ | ~user.AgeGTE(ageMin), user.AgeLTE(ageMax)~ |
+
+### 支持的高级特性
+
+| 特性 | 说明 |
+|------|------|
+| JOIN | 解析 INNER/LEFT/RIGHT JOIN，生成 TODO 注释提示用 ent edge query |
+| GROUP BY | 解析 GROUP BY 子句，方法名前缀为 ~GroupBy~ |
+| HAVING | 解析 HAVING 子句，作为注释保留 |
+| ORDER BY | 解析 ORDER BY 子句，作为注释保留 |
+| Ent Schema 类型推导 | 自动读取 ~ent/schema~ 推导参数的 Go 类型（替代 ~interface{}~） |
+| 重复检测 | 方法已存在则跳过，不会重复追加 |
+
+> **⚠️ 不支持 JSON 字段查询/修改**
+>
+> Ent ORM 对 JSON 类型字段（如 ~field.JSON~）的查询和修改需要使用 ~ValueScannerField~ 或原生 SQL，**gen-dao-sql 目前无法自动生成 JSON 字段的 predicate**。如果你的 SQL 包含 JSON 字段操作（如 ~JSON_EXTRACT~、~->~、~->>~），请手动编写 DAO 方法，使用 ~client.User.Query().Where(func(s *sql.Selector){ ... })~ 方式实现。
+
+### 示例
+
+**例 1：按条件查询列表**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE status = ? AND created_at > ?"
+~~~
+生成方法：~FindByStatusAndCreatedAtGt(ctx context.Context, status int, created_at time.Time) ([]*ent.User, error)~
+
+**例 2：单条查询**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE email = ? LIMIT 1"
+~~~
+生成方法：~GetByEmail(ctx context.Context, email string) (*ent.User, error)~
+
+**例 3：计数**
+~~~bash
+make gen-dao-sql sql="SELECT COUNT(*) FROM user WHERE status = ?"
+~~~
+生成方法：~CountByStatus(ctx context.Context, status int) (int, error)~
+
+**例 4：分页查询**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?"
+~~~
+生成方法：~FindByStatus(ctx context.Context, status int, page int, pageSize int) ([]*ent.User, error)~
+
+**例 5：IN 查询**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE id IN (?, ?, ?)"
+~~~
+生成方法：~FindByIdIn(ctx context.Context, idList []int) ([]*ent.User, error)~
+
+**例 6：BETWEEN 查询**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE created_at BETWEEN ? AND ?"
+~~~
+生成方法：~FindByCreatedAtBetween(ctx context.Context, created_atMin time.Time, created_atMax time.Time) ([]*ent.User, error)~
+
+**例 7：UPDATE 指定字段**
+~~~bash
+make gen-dao-sql sql="UPDATE user SET status = ?, updated_at = ? WHERE id = ?"
+~~~
+生成方法：~UpdateStatusAndUpdatedAtById(ctx context.Context, id int) (int, error)~
+
+**例 8：LEFT JOIN 查询**
+~~~bash
+make gen-dao-sql sql="SELECT u.* FROM user u LEFT JOIN order o ON u.id = o.user_id WHERE u.status = ?"
+~~~
+生成方法：~FindByStatus(ctx context.Context, status int) ([]*ent.User, error)~
+生成实现中包含 TODO 注释提示将 JOIN 替换为 ent edge query（如 ~.QueryOrders()~）。
+
+**例 9：NULL 判断**
+~~~bash
+make gen-dao-sql sql="SELECT * FROM user WHERE deleted_at IS NULL AND status = ?"
+~~~
+生成方法：~FindByDeletedAtIsNilAndStatus(ctx context.Context, status int) ([]*ent.User, error)~
+~IS NULL~ 条件不生成参数，直接映射为 ~user.DeletedAtIsNil()~。
+
+### 注意事项
+
+- **前置条件**：必须先运行 ~make gen-rpc-ent-logic~ 生成初始 DAO 文件，否则无文件可追加。
+- SQL 中用 ~?~ 作为参数占位符（不支持命名参数 ~:name~）。
+- 表名从 SQL 中提取后转换为 ent 模型名（~user~ → ~User~, ~user_token~ → ~UserToken~）。
+- 如果 ~ent/schema~ 目录存在，会自动加载 schema 推导参数类型；加载失败时 fallback 为 ~interface{}~。
+- 支持 backtick 引用的表名和列名（如 ~'user'~ 和 ~'status'~ 写成反引号形式）。
+- 同一方法名不会重复追加，再次运行会显示 ~⊘ Method xxx already exists~。
+- JOIN 查询会生成基于主表的查询，**需要手动替换为 ent edge query**。
+
+---
+
+## 6. ~zctl rpc enum~
+
+**做什么**：手动生成纯 Go 枚举类型（适用于不在 proto 中定义的业务常量），含 String/IsValid/Parse/Values/Int32 等方法。
+
+**执行命令**：
+~~~bash
+zctl rpc enum --name=OrderStatus --values=pending,paid,shipped,done
+~~~
+
+**参数**：
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| ~--name~ | 是 | 枚举类型名（大驼峰，如 ~OrderStatus~） |
+| ~--values~ | 是 | 逗号分隔的值名（小写，如 ~pending,paid,shipped,done~） |
+
+**生成的文件**：
+
+| 文件路径 | 操作 | 说明 |
+|----------|------|------|
+| ~pkg/enums/{snake_name}.go~ | 新建/覆盖 | 枚举类型 + 常量 + 辅助方法 |
+
+**生成内容预览**（~--name=OrderStatus --values=pending,paid,shipped,done~）：
+~~~go
+type OrderStatus int32
+
+const (
+    OrderStatusPending  OrderStatus = 0
+    OrderStatusPaid     OrderStatus = 1
+    OrderStatusShipped  OrderStatus = 2
+    OrderStatusDone     OrderStatus = 3
+)
+
+func (e OrderStatus) String() string { ... }
+func (e OrderStatus) IsValid() bool { ... }
+func OrderStatusValues() []OrderStatus { ... }
+func ParseOrderStatus(s string) (OrderStatus, error) { ... }
+func (e OrderStatus) Int32() int32 { ... }
+~~~
+
+**注意事项**：
+- ~--name~ 必须大驼峰，~--values~ 用小写逗号分隔。
+- proto 中的 ~enum~ 由 ~make gen-rpc~ **自动**生成，不需要手动用此命令。
+- 此命令用于**不在 proto 中定义**的业务枚举（如内部状态机、配置项等）。
+- 两种枚举输出到同一目录 ~pkg/enums/~，注意不要命名冲突。
+
+---
+
+## 7. ~zctl rpc merge-proto~
+
+**做什么**：扫描 ~desc/**/*.proto~ 所有子文件，合并 message/enum/service 定义到根 ~{{SERVICE}}.proto~。通常不需要单独调用，~make gen-rpc~ 会自动调用。
+
+**执行命令**：
+~~~bash
+zctl rpc merge-proto
+# 或通过 make
+make gen-rpc  # 内部会先调用 merge-proto
+~~~
+
+**生成/修改的文件**：
+
+| 文件路径 | 操作 | 说明 |
+|----------|------|------|
+| ~{{SERVICE}}.proto~ | 覆盖 | 合并后的根 proto 文件 |
+
+**合并规则**：
+1. ~desc/base.proto~ 中读取 ~package~ 和 ~go_package~ 作为根 proto 头部。
+2. 按字母序扫描 ~desc/~ 下所有 ~.proto~ 文件（含子目录）。
+3. 去掉每个文件的 ~syntax~, ~package~, ~option~, ~import~ 行。
+4. 其余内容（message/enum/service）按文件追加到根 proto 中。
+
+**注意事项**：
+- ~desc/base.proto~ 必须存在，它定义了 ~package~ 和 ~go_package~。
+- 每个 ~desc/{group}/{model}.proto~ 文件中不要写 ~syntax~, ~option go_package~ 等头部（合并时会自动去除，但建议保持简洁）。
+- 根 proto 文件（~{{SERVICE}}.proto~）是自动生成的，**不要手动编辑**。
+
+---
+
+## 项目目录结构
+
+~~~
+{{SERVICE}}/
+├── {{SERVICE}}.go              # 主入口
+├── {{SERVICE}}.proto           # 合并后的 proto（自动生成，勿编辑）
+├── merge_proto.sh              # desc/ → 根 proto 合并脚本
+├── Makefile
+├── Dockerfile
+├── entrypoint.sh
+├── desc/                       # proto 源文件（按业务域分子目录）
+│   ├── base.proto              # 基础 message（Empty/IDReq/BaseResp 等）
+│   └── {group}/                # 业务模块 proto
+│       └── {model}.proto
+├── types/                      # protoc 生成的 pb 文件（自动生成，勿编辑）
+│   └── {package}/
+├── ent/
+│   └── schema/                 # entgo 表结构定义（手动编辑）
+├── etc/                        # 配置
+│   ├── {{SERVICE}}.yaml        # 运行时配置（.gitignore 忽略）
+│   └── {{SERVICE}}.yaml.template  # 配置模板（提交到 git）
+├── internal/
+│   ├── config/                 # 配置结构体
+│   ├── svc/                    # ServiceContext（DAO 实例注入）
+│   ├── server/                 # gRPC server 实现
+│   ├── logic/                  # 业务逻辑（层级对齐 desc/）
+│   │   └── {group}/
+│   │   └── {group}/            # 如 user/
+│   │       └── {model}/        # 如 user/create_user_logic.go
+│   ├── middleware/              # 拦截器
+│   ├── dao/                    # DAO 接口（手动 + gen-dao-sql 追加）
+│   │   └── {model}_dao.go
+│   ├── dao/impl/               # DAO 实现
+│   │   └── {model}_oceanbase.go
+│   └── dao/mock/               # DAO Mock（自动生成，与接口同步）
+│       └── {model}_dao_mock.go
+├── pkg/
+│   ├── errcode/                # 错误码 + 错误类型
+│   ├── ctxutil/                # ctx 工具 + 日志
+│   ├── consts/                 # 常量（按模块）
+│   ├── model/                  # VO/DTO 模型（按模块）
+│   ├── enums/                  # 枚举（proto enum + 手动 enum）
+│   ├── i18n/                   # 国际化
+│   └── entlog/                 # ent SQL 日志
+├── zctl-commands.md            # 桩命令使用说明（自动生成）
+└── {{SERVICE}}client/          # RPC 客户端 SDK
+~~~
+
+---
+
+## 完整开发流程
+
+~~~bash
+# 1. 创建项目（含 ent 集成）
+zctl rpc new myservice --ent
+
+# 2. 新建 ent schema
+make gen-ent-new name=User
+
+# 3. 编辑 ent/schema/user.go 定义字段和 Edge
+
+# 4. 生成 ent ORM 代码
+make gen-ent
+
+# 5. 生成模块全套代码（DAO + logic + errcode + test + desc proto）
+make gen-rpc-ent-logic model=User
+
+# 6. 合并 proto + 生成 pb + 自动生成 enum
+make gen-rpc
+
+# 7. 编译验证
+go build ./...
+
+# 8. 需要自定义查询？用 gen-dao-sql 追加 DAO 方法
+make gen-dao-sql sql="SELECT * FROM user WHERE status = ? AND created_at > ?"
+
+# 9. 需要业务枚举？
+zctl rpc enum --name=OrderStatus --values=pending,paid,shipped,done
+
+# 10. 运行
+make run
+~~~
+
+### 常用命令速查
+
+| 命令 | 说明 |
+|------|------|
+| ~make gen-rpc~ | 合并 proto + 生成 pb + enum |
+| ~make gen-ent~ | 生成 Ent ORM 代码 |
+| ~make gen-ent-new name=X~ | 新建 ent schema |
+| ~make gen-rpc-ent-logic model=X~ | 生成指定模块全套代码 |
+| ~make gen-rpc-ent-logic model=all~ | 生成所有模块 |
+| ~make gen-dao-sql sql="..."~ | 根据 SQL 追加 DAO 方法 |
+| ~make test~ | 运行全量测试 |
+| ~make test-module module=user~ | 运行指定模块测试 |
+| ~make run~ | 本地运行 |
+| ~make build-linux~ | 交叉编译 Linux |
+| ~make docker~ | 构建 Docker 镜像 |
+| ~make health~ | gRPC 健康检查 |
+| ~make help~ | 显示所有命令 |
+`, "~", "`")
+
+	content = strings.ReplaceAll(content, "{{SERVICE}}", svcLower)
+	content = strings.ReplaceAll(content, "~~~", "```")
+
+	// Always overwrite: this is auto-generated documentation that should stay in sync with the tool version.
+	return os.WriteFile(filepath.Join(abs, "zctl-commands.md"), []byte(strings.TrimLeft(content, "\n")), 0644)
+}
+
+// RefreshCommandsDoc auto-detects the service name from the working directory
+// and regenerates zctl-commands.md. Called by subcommands (ent, dao, merge-proto, enum)
+// that don't know the service name upfront.
+func RefreshCommandsDoc(abs string) {
+	serviceName := filepath.Base(abs)
+	// Try to read SERVICE_STYLE from Makefile for more accurate name
+	if data, err := os.ReadFile(filepath.Join(abs, "Makefile")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "SERVICE_STYLE=") {
+				if v := strings.TrimSpace(strings.TrimPrefix(line, "SERVICE_STYLE=")); v != "" {
+					serviceName = v
+					break
+				}
+			}
+		}
+	}
+	_ = GenCommandsDoc(abs, serviceName)
+}
+
+// ==================== Module placeholder files from desc/ ====================
+
+// GenModuleFiles scans desc/ subdirectories and creates module placeholder files
+// (pkg/model/{module}.go, pkg/consts/{module}.go, pkg/errcode/{module}.go)
+func (g *Generator) GenModuleFiles(abs string) error {
+	descDir := filepath.Join(abs, "desc")
+	if _, err := os.Stat(descDir); os.IsNotExist(err) {
+		return nil
+	}
+
+	entries, err := os.ReadDir(descDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		module := entry.Name()
+
+		// pkg/model/{module}.go
+		modelDir := filepath.Join(abs, "pkg", "model")
+		pathx.MkdirIfNotExist(modelDir)
+		modelFile := filepath.Join(modelDir, module+".go")
+		if !pathx.FileExists(modelFile) {
+			os.WriteFile(modelFile, []byte(fmt.Sprintf("package model\n\n// ──── %s module models ────\n", module)), 0644)
+		}
+
+		// pkg/consts/{module}.go
+		constsDir := filepath.Join(abs, "pkg", "consts")
+		pathx.MkdirIfNotExist(constsDir)
+		constsFile := filepath.Join(constsDir, module+".go")
+		if !pathx.FileExists(constsFile) {
+			os.WriteFile(constsFile, []byte(fmt.Sprintf("package consts\n\n// ──── %s module constants ────\n", module)), 0644)
+		}
+
+		// pkg/errcode/{module}.go
+		errcodeDir := filepath.Join(abs, "pkg", "errcode")
+		pathx.MkdirIfNotExist(errcodeDir)
+		errcodeFile := filepath.Join(errcodeDir, module+".go")
+		if !pathx.FileExists(errcodeFile) {
+			os.WriteFile(errcodeFile, []byte(fmt.Sprintf("package errcode\n\n// ──── %s module error codes ────\n// Add constants here. Messages come from i18n.\n", module)), 0644)
+		}
+	}
+
+	return nil
+}
+
+// ==================== desc/ directory + proto merge script ====================
+
+func (g *Generator) genDescDir(abs, serviceName string) error {
+	descDir := filepath.Join(abs, "desc")
+	if err := pathx.MkdirIfNotExist(descDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
+	svcLower := strings.ToLower(serviceName)
+
+	content := fmt.Sprintf(`#!/bin/bash
+# merge_proto.sh — Merge all desc/**/*.proto into root %s.proto
+# Usage: ./merge_proto.sh
+# Called by: make gen-rpc (before protoc)
+set -e
+
+SERVICE="%s"
+ROOT_PROTO="./${SERVICE}.proto"
+DESC_DIR="./desc"
+
+# Extract package and go_package from base.proto
+PKG=$(grep '^package ' "${DESC_DIR}/base.proto" 2>/dev/null | head -1 | sed 's/package //;s/;//')
+GO_PKG=$(grep 'go_package' "${DESC_DIR}/base.proto" 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+if [ -z "$PKG" ]; then
+  PKG="${SERVICE}"
+fi
+if [ -z "$GO_PKG" ]; then
+  GO_PKG="./${SERVICE}"
+fi
+
+# Header
+cat > "$ROOT_PROTO" <<EOF
+syntax = "proto3";
+
+package ${PKG};
+option go_package = "${GO_PKG}";
+
+EOF
+
+# Collect all .proto files under desc/ (base.proto first, then others sorted)
+FILES=$(find "$DESC_DIR" -name "*.proto" | sort)
+
+# Extract enum + message + service blocks from all files
+for f in $FILES; do
+  echo "// ---- from ${f} ----" >> "$ROOT_PROTO"
+  echo "" >> "$ROOT_PROTO"
+  # Skip syntax/package/option/import lines, keep everything else
+  grep -v '^syntax\s' "$f" | grep -v '^package\s' | grep -v '^option\s' | grep -v '^import\s' >> "$ROOT_PROTO"
+  echo "" >> "$ROOT_PROTO"
+done
+
+echo "[merge_proto] Generated ${ROOT_PROTO} from $(echo $FILES | wc -w | tr -d ' ') proto files"
+`, svcLower, svcLower)
+
+	scriptPath := filepath.Join(abs, "merge_proto.sh")
+	if err := writeIfNotExist(scriptPath, content); err != nil {
+		return err
+	}
+	// Make executable
+	return os.Chmod(scriptPath, 0755)
+}
+
+// ==================== helpers ====================
+
+// ==================== proto.yaml ====================
+
+func (g *Generator) genProtoYaml(abs string) error {
+	content := `# proto.yaml — 远程 proto 仓库配置
+# 所有微服务的 proto 协议由统一仓库管理，本地 desc/ 通过此配置同步远程最新协议。
+# 不配置此文件时 make pull-proto 会跳过，直接使用本地 desc/。
+
+remote:
+  # 统一 proto 仓库地址
+  repo: ""
+  # 协议版本（git tag 或 branch），CI/CD 用 tag 锁版本，开发用 branch 跟踪最新
+  ref: ""
+  # 本服务 proto 在远程仓库中的子目录路径
+  path: ""
+  # 拉取到本地的目标目录（一般不改）
+  target: desc/
+`
+	return writeIfNotExist(filepath.Join(abs, "proto.yaml"), content)
+}
+
+// ==================== helpers ====================
+
+func writeIfNotExist(filename, content string) error {
+	if pathx.FileExists(filename) {
+		return nil
+	}
+	dir := filepath.Dir(filename)
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+	return os.WriteFile(filename, []byte(strings.TrimLeft(content, "\n")), 0644)
+}
