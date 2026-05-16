@@ -298,6 +298,11 @@ const (
 	NotFound       = 95002
 	Unauthorized   = 95003
 	Forbidden      = 95004
+	// ContractViolation indicates the caller did not honor the declared proto constraints
+	// (buf.validate.field rules). This is a CALLER BUG — distinct from InvalidParam which
+	// represents legitimate business-level parameter validation failures.
+	// gRPC code: InvalidArgument (HTTP 400).
+	ContractViolation = 95005
 
 	// DB error codes (used by DAO layer via errcode.Wrapf)
 	DBQueryFailed  = 10006
@@ -430,11 +435,12 @@ func (g *Generator) genPkgI18n(abs string) error {
 
 	en := `{
   "errcode": {
-    "95000": "Internal server error",
+	"95000": "Internal server error",
     "95001": "Invalid parameter",
     "95002": "Resource not found",
     "95003": "Unauthorized",
     "95004": "Forbidden",
+    "95005": "Caller violated the API contract: request parameters do not satisfy the declared proto constraints",
     "10006": "Database query failed",
     "10007": "Database insert failed",
     "10008": "Database update failed",
@@ -444,11 +450,12 @@ func (g *Generator) genPkgI18n(abs string) error {
 `
 	zh := `{
   "errcode": {
-    "95000": "内部服务器错误",
+	"95000": "内部服务器错误",
     "95001": "参数校验失败",
     "95002": "资源不存在",
     "95003": "未授权",
     "95004": "禁止访问",
+    "95005": "调用方未按接口约定传参，请检查请求字段是否符合 proto 定义的约束",
     "10006": "数据库查询失败",
     "10007": "数据库插入失败",
     "10008": "数据库更新失败",
@@ -1018,37 +1025,73 @@ func MetricsInterceptor() grpc.UnaryServerInterceptor {
 		return err
 	}
 
-	// validate_interceptor.go — no external dependencies, works with protoc-gen-validate or protovalidate
-	validateInterceptor := `package middleware
+	// validate_interceptor.go — uses buf.build/go/protovalidate to enforce
+	// (buf.validate.field) constraints declared in *.proto files at runtime via
+	// protoreflect, without any codegen step. Modules `go mod tidy` will pull
+	// `buf.build/go/protovalidate` automatically on first build.
+	validateInterceptor := fmt.Sprintf(`package middleware
 
 import (
 	"context"
 
+	"buf.build/go/protovalidate"
+	"github.com/zeromicro/go-zero/core/logx"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+
+	"%s/pkg/errcode"
 )
 
-// Validator is the interface that validate-capable messages implement.
-// Works with protoc-gen-validate (method Validate() error) or custom validators.
-type Validator interface {
-	Validate() error
+// validator is the singleton protovalidate validator.
+// Initialized once at process start; reuse across requests is safe and recommended.
+var validator protovalidate.Validator
+
+func init() {
+	v, err := protovalidate.New()
+	if err != nil {
+		// Only happens if proto registry is broken / CEL rule fails to compile;
+		// surface immediately at startup, unrecoverable.
+		panic("protovalidate: failed to init validator: " + err.Error())
+	}
+	validator = v
 }
 
-// ValidateInterceptor validates incoming requests if they implement Validator interface.
-// To enable: use protoc-gen-validate to generate Validate() methods on your proto messages.
-// If no Validate() method exists, the request passes through without validation.
+// ValidateInterceptor validates incoming requests using buf.build/go/protovalidate.
+// Reads (buf.validate.field) constraints declared in *.proto files at runtime via
+// protoreflect, no codegen required.
+//
+// On validation failure, returns *errcode.Err with:
+//   - code     = errcode.ContractViolation (95005), a dedicated code for
+//     "caller did not honor the proto-declared constraints" — semantically
+//     distinct from InvalidParam (95001) which is for legitimate business
+//     parameter validation. This is treated as a CALLER BUG.
+//   - grpcCode = codes.InvalidArgument (HTTP 400), so the gateway / client
+//     can clearly tell apart "caller violated contract" (4xx) from
+//     "business rejected the request" (200 + biz code).
+//
+// The detailed protovalidate field-level error is logged here for engineers
+// to locate which field violated which rule. The msg returned to the client
+// will be replaced by I18nInterceptor with the localized text declared at
+// i18n key "errcode.95005".
 func ValidateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		if v, ok := req.(Validator); ok {
-			if err := v.Validate(); err != nil {
-				return nil, status.Error(codes.InvalidArgument, err.Error())
+		if msg, ok := req.(proto.Message); ok {
+			if err := validator.Validate(msg); err != nil {
+				// Detailed field-level violation goes to log only — clients receive
+				// the unified i18n text, not internal field details.
+				logx.WithContext(ctx).Errorw("rpc contract_violation",
+					logx.Field("method", info.FullMethod),
+					logx.Field("detail", err.Error()),
+				)
+				return nil, errcode.Newf(errcode.ContractViolation, err.Error()).
+					WithGRPC(codes.InvalidArgument)
 			}
 		}
 		return handler(ctx, req)
 	}
 }
-`
+`, modulePath)
 	return writeIfNotExist(filepath.Join(dir, "validate_interceptor.go"), validateInterceptor)
 }
 

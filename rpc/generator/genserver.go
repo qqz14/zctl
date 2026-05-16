@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/zeromicro/go-zero/core/collection"
 	conf "github.com/qqz14/zctl/config"
@@ -121,20 +122,46 @@ func (g *Generator) genServerInCompatibility(ctx DirContext, proto parser.Proto,
 	descDir := filepath.Join(ctx.GetMain().Filename, "desc")
 	rpcGroupMap := BuildRpcGroupMap(descDir)
 
-	// Collect logic imports: one per group/model combination
+	// Collect logic imports: one per group/model combination.
+	// When different groups share the same model name (e.g. cid/register and user/register),
+	// disambiguate the import alias by prefixing with the group name: cidRegister, userRegister.
 	logicBasePkg := ctx.GetLogic().Package
+
+	// Step 1: count how many distinct groups use each model name
+	modelGroupCount := make(map[string]int) // model → number of distinct group/model combos
 	modelsUsed := collection.NewSet[string]()
 	for _, rpc := range proto.Service[0].RPC {
 		gm := rpcGroupMap[rpc.Name]
 		if gm.Group == "" {
-			// fallback: import root logic
+			continue
+		}
+		key := gm.Group + "/" + gm.Model
+		if !modelsUsed.Contains(key) {
+			modelsUsed.Add(key)
+			modelGroupCount[gm.Model]++
+		}
+	}
+
+	// Step 2: build aliasMap (group/model → alias) and imports
+	// aliasMap is also used by genFunctionsWithGroup to reference the correct package alias.
+	aliasMap := make(map[string]string) // "group/model" → alias
+	modelsUsed2 := collection.NewSet[string]()
+	for _, rpc := range proto.Service[0].RPC {
+		gm := rpcGroupMap[rpc.Name]
+		if gm.Group == "" {
 			imports.Add(fmt.Sprintf(`"%v"`, logicBasePkg))
-		} else {
-			key := gm.Group + "/" + gm.Model
-			if !modelsUsed.Contains(key) {
-				modelsUsed.Add(key)
-				imports.Add(fmt.Sprintf(`%s "%v/%v/%v"`, gm.Model, logicBasePkg, gm.Group, gm.Model))
+			continue
+		}
+		key := gm.Group + "/" + gm.Model
+		if !modelsUsed2.Contains(key) {
+			modelsUsed2.Add(key)
+			alias := gm.Model
+			if modelGroupCount[gm.Model] > 1 {
+				// Disambiguate: cidRegister, userRegister
+				alias = gm.Group + upperFirst(gm.Model)
 			}
+			aliasMap[key] = alias
+			imports.Add(fmt.Sprintf(`%s "%v/%v/%v"`, alias, logicBasePkg, gm.Group, gm.Model))
 		}
 	}
 
@@ -147,7 +174,7 @@ func (g *Generator) genServerInCompatibility(ctx DirContext, proto parser.Proto,
 	}
 
 	serverFile := filepath.Join(dir.Filename, serverFilename+".go")
-	funcList, extraImportPaths, err := g.genFunctionsWithGroup(proto.PbPackage, proto.GoPackage, service, pkgMap, rpcGroupMap)
+	funcList, extraImportPaths, err := g.genFunctionsWithGroup(proto.PbPackage, proto.GoPackage, service, pkgMap, rpcGroupMap, aliasMap)
 	if err != nil {
 		return err
 	}
@@ -239,8 +266,9 @@ func (g *Generator) genFunctions(goPackage, mainGoPackage string, service parser
 }
 
 // genFunctionsWithGroup generates server functions using group/model-based logic package names.
+// aliasMap maps "group/model" keys to their import aliases (may be disambiguated).
 func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, service parser.Service,
-	pkgMap map[string]parser.ImportedProto, rpcGroupMap map[string]GroupModel) ([]string, []string, error) {
+	pkgMap map[string]parser.ImportedProto, rpcGroupMap map[string]GroupModel, aliasMap map[string]string) ([]string, []string, error) {
 	var (
 		functionList []string
 		extraImports []string
@@ -252,11 +280,14 @@ func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, servi
 		}
 
 		logicName := fmt.Sprintf("%sLogic", stringx.From(rpc.Name).ToCamel())
-		// Determine logicPkg from group/model
+		// Determine logicPkg from aliasMap (which handles disambiguation)
 		gm := rpcGroupMap[rpc.Name]
 		logicPkg := "logic"
-		if gm.Model != "" {
-			logicPkg = gm.Model
+		if gm.Group != "" && gm.Model != "" {
+			key := gm.Group + "/" + gm.Model
+			if alias, ok := aliasMap[key]; ok {
+				logicPkg = alias
+			}
 		}
 
 		comment := parser.GetComment(rpc.Doc())
@@ -293,4 +324,14 @@ func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, servi
 		functionList = append(functionList, buffer.String())
 	}
 	return functionList, extraImports, nil
+}
+
+// upperFirst returns s with its first rune converted to uppercase.
+func upperFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }
