@@ -241,13 +241,15 @@ type grpcPayload struct {
 //   - gRPC code: e.grpcCode (default OK → HTTP 200)
 //   - message:   JSON {"code":95001,"msg":"用户不存在"}
 //
-// Called by the framework interceptor, NOT by business code.
+// Called by GRPCStatusInterceptor, NOT by business code.
 func ToGRPCStatus(e *Err) *status.Status {
 	payload, _ := json.Marshal(grpcPayload{Code: e.code, Msg: e.msg})
 	return status.New(e.grpcCode, string(payload))
 }
 
-// StatusError converts *Err to a gRPC error (for returning from interceptor).
+// StatusError converts *Err to a gRPC error for transport.
+// NOTE: when grpcCode is OK, gRPC returns nil (by design). This is expected —
+// GRPCStatusInterceptor handles this case via grpc.SetTrailer.
 func StatusError(e *Err) error {
 	return ToGRPCStatus(e).Err()
 }
@@ -709,7 +711,7 @@ func extractModule(fullMethod string) string {
 		return err
 	}
 
-	// i18n_interceptor.go — final interceptor: converts *errcode.Err → gRPC status with JSON payload
+	// i18n_interceptor.go — translates error messages, returns *errcode.Err (no status conversion)
 	i18nInterceptor := fmt.Sprintf(`package middleware
 
 import (
@@ -723,16 +725,11 @@ import (
 	"%s/pkg/i18n"
 )
 
-// I18nInterceptor is the final interceptor in the chain.
-// It converts all errors into structured gRPC status:
+// I18nInterceptor translates business error messages to the client's language.
+// Input and output are both *errcode.Err — it only replaces the msg field.
 //
-//  1. *errcode.Err → i18n translate msg → JSON {"code":95001,"msg":"xxx"} in gRPC message
-//     grpcCode defaults to OK (→ HTTP 200), unless WithGRPC() was called (e.g. 401/403)
-//
-//  2. Non-errcode errors (system/unexpected) → {"code":95000,"msg":"internal error"}
-//     grpcCode = Internal (→ HTTP 500)
-//
-// Gateway (e.g. APISIX grpc-transcode) reads the gRPC status message as HTTP response body.
+// For non-errcode errors (should not happen if LogInterceptor enforces),
+// wraps as InternalError with translated message.
 func I18nInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
@@ -742,22 +739,20 @@ func I18nInterceptor() grpc.UnaryServerInterceptor {
 
 		lang := extractLang(ctx)
 
-		// Case 1: business error (*errcode.Err)
+		// *errcode.Err → translate msg, return *errcode.Err
 		if e, ok := errcode.ExtractErr(err); ok {
-			origGRPCCode := e.GRPCCode()
 			if msg := i18n.TranslateErrcode(lang, e.Code()); msg != "" {
-				e = errcode.Newf(e.Code(), msg).WithGRPC(origGRPCCode)
+				return nil, errcode.Newf(e.Code(), msg).WithGRPC(e.GRPCCode())
 			}
-			return nil, errcode.StatusError(e)
+			return nil, err
 		}
 
-		// Case 2: unexpected error → wrap as internal
+		// Non-errcode error → wrap as InternalError
 		msg := "internal error"
 		if translated := i18n.TranslateErrcode(lang, errcode.InternalError); translated != "" {
 			msg = translated
 		}
-		e := errcode.Newf(errcode.InternalError, msg).WithGRPC(codes.Internal)
-		return nil, errcode.StatusError(e)
+		return nil, errcode.Newf(errcode.InternalError, msg).WithGRPC(codes.Internal)
 	}
 }
 
@@ -777,11 +772,12 @@ func extractLang(ctx context.Context) string {
 		return err
 	}
 
-	// error_log_interceptor.go — unified error logging + enforcement (placed before I18nInterceptor)
-	errorLogInterceptor := fmt.Sprintf(`package middleware
+	// log_interceptor.go — logs all RPC calls (success + biz error + status error) with enforcement
+	logInterceptor := fmt.Sprintf(`package middleware
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -798,20 +794,32 @@ import (
 
 const maxLogBodyLen = 1024 // truncate request body in log if too long
 
-// ErrorLogInterceptor logs all errors with full context for debugging.
-// Placed BEFORE I18nInterceptor so it sees the original *errcode.Err.
+// LogInterceptor logs all RPC calls: success (Info) and errors (Error/Info).
+// At this point the error msg is already translated by I18nInterceptor,
+// and ctx already contains module name from ModuleInterceptor.
 //
 // Enforcement rules (fail-fast in dev):
-//  1. Every error returned from handler MUST be *errcode.Err.
-//     Non-errcode errors indicate a missing Wrapf in business logic → panic.
-//  2. For business errors (grpcCode == OK, i.e. HTTP 200), the error code
-//     MUST have a corresponding i18n translation (checked against "en").
-//     Missing translation means the developer forgot to add it → panic.
-func ErrorLogInterceptor() grpc.UnaryServerInterceptor {
+//  1. Every error MUST be *errcode.Err — non-errcode errors → panic.
+//  2. Business errors (grpcCode == OK) MUST have i18n translation → panic if missing.
+func LogInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		start := time.Now()
 		resp, err := handler(ctx, req)
+
+		duration := time.Since(start)
+		clientIP := ctxutil.ClientIP(ctx)
+		lang := ctxutil.MetaValue(ctx, "x-lang", "accept-language")
+
+		reqStr := marshalRequest(req)
+
 		if err == nil {
+			logx.WithContext(ctx).Infow("rpc ok",
+				logx.Field("method", info.FullMethod),
+				logx.Field("cost(ms)", duration.Milliseconds()),
+				logx.Field("client_ip", clientIP),
+				logx.Field("lang", lang),
+				logx.Field("request", reqStr),
+			)
 			return resp, nil
 		}
 
@@ -848,39 +856,100 @@ func ErrorLogInterceptor() grpc.UnaryServerInterceptor {
 			}
 		}
 
-		// ── Log error with full context ──
-		duration := time.Since(start)
-		clientIP := ctxutil.ClientIP(ctx)
-		traceID := ctxutil.MetaValue(ctx, "x-request-id", "x-trace-id")
-		lang := ctxutil.MetaValue(ctx, "x-lang", "accept-language")
-
-		reqStr := fmt.Sprintf("%%+v", req)
-		if m, ok := req.(proto.Message); ok {
-			if b, err := protojson.Marshal(m); err == nil {
-				reqStr = string(b)
-			}
+		// ── Log: business error vs status error ──
+		if errcode.IsOKCode(grpcCode) {
+			payload, _ := json.Marshal(struct {
+				Code int    `+"`"+`json:"code"`+"`"+`
+				Msg  string `+"`"+`json:"msg"`+"`"+`
+			}{Code: bizCode, Msg: e.Msg()})
+			logx.WithContext(ctx).Infow("rpc biz_error",
+				logx.Field("method", info.FullMethod),
+				logx.Field("error", string(payload)),
+				logx.Field("cost(ms)", duration.Milliseconds()),
+				logx.Field("client_ip", clientIP),
+				logx.Field("request", reqStr),
+			)
+		} else {
+			logx.WithContext(ctx).Errorw("rpc status_error",
+				logx.Field("method", info.FullMethod),
+				logx.Field("code", bizCode),
+				logx.Field("grpc_code", grpcCode.String()),
+				logx.Field("error", e.Msg()),
+				logx.Field("cost(ms)", duration.Milliseconds()),
+				logx.Field("client_ip", clientIP),
+				logx.Field("lang", lang),
+				logx.Field("request", reqStr),
+			)
 		}
-		if len(reqStr) > maxLogBodyLen {
-			reqStr = reqStr[:maxLogBodyLen] + "...(truncated)"
-		}
-
-		logx.WithContext(ctx).Errorw("rpc error",
-			logx.Field("method", info.FullMethod),
-			logx.Field("code", bizCode),
-			logx.Field("grpc_code", int(grpcCode)),
-			logx.Field("error", err.Error()),
-			logx.Field("cost(ms)", duration.Milliseconds()),
-			logx.Field("client_ip", clientIP),
-			logx.Field("trace_id", traceID),
-			logx.Field("lang", lang),
-			logx.Field("request", reqStr),
-		)
 
 		return nil, err
 	}
 }
+
+func marshalRequest(req interface{}) string {
+	reqStr := fmt.Sprintf("%%+v", req)
+	if m, ok := req.(proto.Message); ok {
+		if b, err := protojson.Marshal(m); err == nil {
+			reqStr = string(b)
+		}
+	}
+	if len(reqStr) > maxLogBodyLen {
+		reqStr = reqStr[:maxLogBodyLen] + "...(truncated)"
+	}
+	return reqStr
+}
 `, modulePath, modulePath, modulePath)
-	if err := writeIfNotExist(filepath.Join(dir, "error_log_interceptor.go"), errorLogInterceptor); err != nil {
+	if err := writeIfNotExist(filepath.Join(dir, "log_interceptor.go"), logInterceptor); err != nil {
+		return err
+	}
+
+	// grpc_status_interceptor.go — converts *errcode.Err into gRPC transport format (outermost)
+	grpcStatusInterceptor := fmt.Sprintf(`package middleware
+
+import (
+	"context"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
+
+	"%s/pkg/errcode"
+)
+
+// GRPCStatusInterceptor converts *errcode.Err into gRPC transport format.
+// This is the last interceptor to touch the response before gRPC framework sends it.
+//
+// For status errors (grpcCode != OK, e.g. 401/403/500):
+//   Returns standard gRPC error → gateway maps to corresponding HTTP status.
+//
+// For business errors (grpcCode == OK, HTTP 200):
+//   gRPC status.New(OK, msg).Err() returns nil by design.
+//   We encode the JSON payload into grpc trailer "x-biz-error" so gateway
+//   can read it, and return (resp, nil) as a successful gRPC response.
+func GRPCStatusInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+
+		e, ok := errcode.ExtractErr(err)
+		if !ok {
+			return nil, err
+		}
+
+		// Status error (401/403/500): standard gRPC error
+		if !errcode.IsOKCode(e.GRPCCode()) {
+			return nil, errcode.StatusError(e)
+		}
+
+		// Business error (HTTP 200): encode JSON into trailer, return success
+		st := errcode.ToGRPCStatus(e)
+		grpc.SetTrailer(ctx, metadata.Pairs("x-biz-error", st.Message()))
+		return resp, nil
+	}
+}
+`, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "grpc_status_interceptor.go"), grpcStatusInterceptor); err != nil {
 		return err
 	}
 
@@ -899,9 +968,8 @@ import (
 
 // MetricsInterceptor records per-RPC success/failure counters.
 //
-// Placement: AFTER ErrorLogInterceptor, BEFORE I18nInterceptor.
-// At this point err is still the original *errcode.Err (not yet wrapped
-// into gRPC status), so we can distinguish status errors vs biz errors.
+// At this point err is still the original *errcode.Err (already translated),
+// so we can distinguish status errors vs biz errors.
 //
 // Metrics reported:
 //

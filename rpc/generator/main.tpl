@@ -37,12 +37,15 @@ func main() {
 	})
 	defer s.Stop()
 
-{{if .hasMiddleware}}	s.AddUnaryInterceptors(
-		middleware.ValidateInterceptor(),
-		middleware.ModuleInterceptor(),
-		middleware.ErrorLogInterceptor(),
-		middleware.MetricsInterceptor(),
-		middleware.I18nInterceptor(),
+{{if .hasMiddleware}}	// Interceptor chain (response flows bottom → top):
+	// handler → Validate → I18n → Module → Metrics → Log → GRPCStatus → gRPC framework
+	s.AddUnaryInterceptors(
+		middleware.GRPCStatusInterceptor(), // 6. *errcode.Err → gRPC transport format
+		middleware.LogInterceptor(),        // 5. log success/error (msg already translated, ctx has module)
+		middleware.MetricsInterceptor(),    // 4. report metrics
+		middleware.ModuleInterceptor(),     // 3. extract module name into ctx
+		middleware.I18nInterceptor(),       // 2. translate error msg
+		middleware.ValidateInterceptor(),   // 1. validate request params
 	)
 {{end}}
 	fmt.Printf("Starting rpc server at %s...\n", c.ListenOn)
