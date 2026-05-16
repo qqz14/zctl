@@ -72,14 +72,45 @@ func (s String) ToCamel() string {
 	return strings.Join(target, "")
 }
 
-// ToSnake converts the input text into snake case
+// ToSnake converts the input text into snake case.
+// Consecutive uppercase letters (acronyms) are kept together:
+//
+//	"GoZero"     → "go_zero"
+//	"CIDApp"     → "cid_app"
+//	"GetCIDList" → "get_cid_list"
+//	"HTTPSProxy" → "https_proxy"
 func (s String) ToSnake() string {
-	list := s.splitBy(unicode.IsUpper, false)
-	var target []string
-	for _, item := range list {
-		target = append(target, From(item).Lower())
+	if s.IsEmptyOrSpace() {
+		return s.source
 	}
-	return strings.Join(target, "_")
+	runes := []rune(s.source)
+	var parts []string
+	buffer := new(bytes.Buffer)
+	for i, r := range runes {
+		if i > 0 && r >= 'A' && r <= 'Z' {
+			prev := runes[i-1]
+			if prev >= 'a' && prev <= 'z' || prev == '_' {
+				// lowercase→uppercase or _→uppercase boundary
+				if buffer.Len() > 0 {
+					parts = append(parts, strings.ToLower(buffer.String()))
+					buffer.Reset()
+				}
+			} else if prev >= 'A' && prev <= 'Z' {
+				// uppercase→uppercase: split only if next is lowercase (acronym end)
+				if i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z' {
+					if buffer.Len() > 0 {
+						parts = append(parts, strings.ToLower(buffer.String()))
+						buffer.Reset()
+					}
+				}
+			}
+		}
+		buffer.WriteRune(r)
+	}
+	if buffer.Len() > 0 {
+		parts = append(parts, strings.ToLower(buffer.String()))
+	}
+	return strings.Join(parts, "_")
 }
 
 // Untitle return the original string if rune is not letter at index 0

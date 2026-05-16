@@ -147,18 +147,20 @@ service %s {
 		return err
 	}
 
+	protoDepDir := filepath.Join(projectDirAbs, "proto")
+
 	var ctx generator.ZRpcContext
 	ctx.Src = rootProtoAbs
 	ctx.GoOutput = typesAbs
 	ctx.GrpcOutput = typesAbs
 	ctx.IsGooglePlugin = true
 	ctx.Output = projectDirAbs
-	ctx.ProtocCmd = fmt.Sprintf("protoc -I=%s %s --go_out=%s --go-grpc_out=%s",
-		projectDirAbs, filepath.Base(rootProtoAbs), typesAbs, typesAbs)
+	ctx.ProtocCmd = fmt.Sprintf("protoc -I=%s -I=%s %s --go_out=%s --go-grpc_out=%s",
+		projectDirAbs, protoDepDir, filepath.Base(rootProtoAbs), typesAbs, typesAbs)
 	ctx.IsGenClient = VarBoolClient
 	ctx.Module = VarStringModule
 	ctx.NameFromFilename = VarBoolNameFromFilename
-	ctx.ProtoPaths = []string{projectDirAbs}
+	ctx.ProtoPaths = []string{projectDirAbs, protoDepDir}
 	ctx.Port = VarIntPort
 
 	grpcOptList := VarStringSliceGoGRPCOpt

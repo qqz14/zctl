@@ -3,6 +3,8 @@ syntax = "proto3";
 package {{.package}};
 option go_package="./{{.package}}";
 
+import "buf/validate/validate.proto";
+
 // ──── Common messages (shared across all modules) ────
 
 message Empty {}

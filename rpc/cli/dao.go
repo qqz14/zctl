@@ -1229,24 +1229,11 @@ func appendToImpl(filePath, methodName, body string) {
 // ────────────────────── Helpers ──────────────────────
 
 func toCamelCase(s string) string {
-	parts := strings.Split(s, "_")
-	for i, p := range parts {
-		if len(p) > 0 {
-			parts[i] = strings.ToUpper(p[:1]) + p[1:]
-		}
-	}
-	return strings.Join(parts, "")
+	return generator.GoPascal(s)
 }
 
 func toSnakeCase(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteByte('_')
-		}
-		result.WriteRune(r)
-	}
-	return strings.ToLower(result.String())
+	return generator.FileSnake(s)
 }
 
 func isBaseField(name string) bool {
@@ -1389,6 +1376,10 @@ func parseMockMethodLine(line string) (mockMethodInfo, bool) {
 
 	params := line[parenOpen+1 : paramEnd]
 	returns := strings.TrimSpace(line[paramEnd+1:])
+
+	// Qualify dao-local types for mock package (e.g. *IamCIDListFilter → *dao.IamCIDListFilter)
+	params = entgen.QualifyDaoTypes(params)
+	returns = entgen.QualifyDaoTypes(returns)
 
 	callArgs := mockExtractParamNames(params)
 	returnStmt := mockBuildReturn(returns)

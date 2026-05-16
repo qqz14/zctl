@@ -211,12 +211,14 @@ func detectModulePath(abs string) string {
 }
 
 // detectPbImportPath finds the pb package import path by scanning types/ directory.
+// It skips directories that contain '.' (e.g. "buf.build") since those are
+// external module artifacts, not the project's own generated pb package.
 func detectPbImportPath(abs string) string {
 	modulePath := detectModulePath(abs)
 	typesDir := filepath.Join(abs, "types")
 	entries, _ := os.ReadDir(typesDir)
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !strings.Contains(e.Name(), ".") {
 			return modulePath + "/types/" + e.Name()
 		}
 	}

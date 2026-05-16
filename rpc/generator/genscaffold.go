@@ -1,6 +1,7 @@
 package generator
 
 import (
+	_ "embed"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -95,6 +96,10 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 	}
 	// proto.yaml (remote proto config, optional)
 	if err := g.genProtoYaml(abs); err != nil {
+		return err
+	}
+	// proto/buf/validate/validate.proto (protovalidate dependency)
+	if err := g.genValidateProto(abs); err != nil {
 		return err
 	}
 	// types/ directory
@@ -1054,7 +1059,7 @@ pull-proto: # Pull proto from remote repo | 从远程仓库拉取 proto (需配�
 .PHONY: gen-rpc
 gen-rpc: # Generate RPC files from proto | 合并 desc/ → 根 proto → protoc → types/
 	@zctl rpc merge-proto
-	zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE)
+	zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE) -I=./proto -I=.
 	@echo "Generate RPC files successfully"
 
 # ==================== Ent ====================
@@ -1073,6 +1078,13 @@ gen-ent-new: # Create new ent schema | 新建 ent schema (usage: make gen-ent-ne
 	@go get entgo.io/ent@latest 2>/dev/null; true
 	@mkdir -p ent/schema
 	go run -mod=mod entgo.io/ent/cmd/ent new $(_ENT_NAME)
+	@# Rename ent-generated lowercase filename to snake_case (e.g. iamapp.go → iam_app.go)
+	@_LOWER=$$(echo "$(_ENT_NAME)" | tr '[:upper:]' '[:lower:]'); \
+	_SNAKE=$$(echo "$(_ENT_NAME)" | sed 's/\([A-Z]\)/_\1/g' | sed 's/^_//' | tr '[:upper:]' '[:lower:]'); \
+	if [ "$$_LOWER" != "$$_SNAKE" ] && [ -f "ent/schema/$$_LOWER.go" ]; then \
+		mv "ent/schema/$$_LOWER.go" "ent/schema/$$_SNAKE.go"; \
+		echo "Renamed ent/schema/$$_LOWER.go → ent/schema/$$_SNAKE.go"; \
+	fi
 	@echo "Created ent schema: $(_ENT_NAME)"
 
 # Allow positional args like "make gen-ent-new User" without error
@@ -1161,7 +1173,7 @@ swagger: # Launch gRPC Web UI for debugging | 启动可调试的 gRPC Web UI（�
 .PHONY: proto-doc
 proto-doc: # Generate API doc with field table + JSON examples | 生成表格式 API 文档
 	@mkdir -p doc
-	protoc -I=. --doc_out=./doc --doc_opt=json,$(SERVICE_STYLE).json $(SERVICE_STYLE).proto
+	protoc -I=. -I=./proto --doc_out=./doc --doc_opt=json,$(SERVICE_STYLE).json $(SERVICE_STYLE).proto
 	zctl rpc proto-doc --input=doc/$(SERVICE_STYLE).json
 	@echo "Generated doc/$(SERVICE_STYLE)_api.md"
 
@@ -1852,12 +1864,14 @@ make gen-rpc-ent-logic model=all
 | ~UserInfo~ message | 核心详情结构，字段从 ent schema 自动推导（含 id/created_at/updated_at + 所有业务字段） |
 | ~Create{Model}Req~ / ~Create{Model}Resp~ | 创建请求（内嵌 UserInfo）和返回（id） |
 | ~Update{Model}Req~ | 更新请求（内嵌 UserInfo） |
-| ~Get{Model}ByIdReq~ | 按 ID 查询请求 |
-| ~Delete{Model}Req~ | 删除请求（支持批量 ids） |
+| ~Get{Model}ByIDReq~ | 按 ID 查询请求 |
+| ~Get{Model}By{UniqueField}Req~ | 按唯一字段查询请求（根据 DAO 方法动态生成） |
+| ~Update{Model}By{UniqueField}Req~ | 按唯一字段更新请求（根据 DAO 方法动态生成） |
+| ~Delete{Model}Req~ | 删除请求（支持批量 ids，仅有 deleted_at 字段时生成） |
 | ~Get{Model}ListReq~ / ~Get{Model}ListResp~ | 分页列表请求和返回 |
-| ~service~ 块 | 5 个 rpc 方法：create/update/getList/getById/delete |
+| ~service~ 块 | 方法数量根据 DAO 接口动态生成（大写开头，Go 规范） |
 
-注意：proto 文件**不会被覆盖**（即使加 ~--overwrite~），因为开发者可能已在其中添加自定义 rpc 方法。如需重新生成，请先手动删除该文件。
+注意：**如果 DAO 文件已存在，proto 不会再次生成**（即 DAO 是"只生成一次"的判断依据）。如需重新生成 proto，请先手动删除对应的 DAO 文件或使用 ~--overwrite~ 参数。
 
 **生成的 proto 命名规范**（以 ~User~ 为例）：
 
@@ -1865,15 +1879,17 @@ make gen-rpc-ent-logic model=all
 // 复用 UserInfo 作为详情载体
 message UserInfo { ... }
 
-// 每个 rpc 方法有独立的 Req/Resp，命名 = 方法名 + Req/Resp
-rpc createUser  (CreateUserReq)   returns (CreateUserResp);
-rpc updateUser  (UpdateUserReq)   returns (Empty);
-rpc getUserList (GetUserListReq)  returns (GetUserListResp);
-rpc getUserById (GetUserByIdReq)  returns (UserInfo);
-rpc deleteUser  (DeleteUserReq)   returns (Empty);
+// 每个 rpc 方法有独立的 Req/Resp，命名 = 方法名 + Req/Resp（大写开头，Go 规范）
+rpc CreateUser       (CreateUserReq)       returns (CreateUserResp);
+rpc GetUserByID      (GetUserByIDReq)      returns (UserInfo);
+rpc GetUserByEmail   (GetUserByEmailReq)   returns (UserInfo);
+rpc UpdateUser       (UpdateUserReq)       returns (Empty);
+rpc UpdateUserByEmail(UpdateUserByEmailReq) returns (Empty);
+rpc DeleteUser       (DeleteUserReq)       returns (Empty);
+rpc GetUserList      (GetUserListReq)      returns (GetUserListResp);
 ~~~
 
-规则：不使用 ~IDReq~、~IDsReq~、~BaseIDResp~ 等通用命名。空返回复用 ~Empty~，详情复用 ~UserInfo~。
+规则：rpc 方法名大写开头（Go 规范），不使用 ~IDReq~、~IDsReq~、~BaseIDResp~ 等通用命名。空返回复用 ~Empty~，详情复用 ~UserInfo~。proto 方法根据 DAO 接口动态生成，参数与 DAO 方法匹配。
 ~~~go
 type UserDao interface {
     Create(ctx context.Context, data *ent.User) (*ent.User, error)
@@ -2391,6 +2407,19 @@ remote:
   target: desc/
 `
 	return writeIfNotExist(filepath.Join(abs, "proto.yaml"), content)
+}
+
+// ==================== proto/buf/validate/validate.proto ====================
+
+//go:embed validate.proto
+var validateProtoContent string
+
+func (g *Generator) genValidateProto(abs string) error {
+	dir := filepath.Join(abs, "proto", "buf", "validate")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+	return writeIfNotExist(filepath.Join(dir, "validate.proto"), validateProtoContent)
 }
 
 // ==================== helpers ====================

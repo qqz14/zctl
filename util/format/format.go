@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 )
 
@@ -107,22 +106,13 @@ func transferTo(in string, style style) string {
 }
 
 func split(content string) ([]string, error) {
+	runes := []rune(content)
 	var (
 		list   []string
-		reader = strings.NewReader(content)
 		buffer = bytes.NewBuffer(nil)
 	)
-	for {
-		r, _, err := reader.ReadRune()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if buffer.Len() > 0 {
-					list = append(list, buffer.String())
-				}
-				return list, nil
-			}
-			return nil, err
-		}
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		if r == '_' {
 			if buffer.Len() > 0 {
 				list = append(list, buffer.String())
@@ -132,13 +122,34 @@ func split(content string) ([]string, error) {
 		}
 
 		if r >= 'A' && r <= 'Z' {
+			// Determine if we should start a new word.
+			// We do NOT split when the previous char is also uppercase
+			// AND the current char is NOT the start of a camelCase word
+			// (i.e., next char is also uppercase or end of string).
+			// This keeps acronyms like "CID", "HTTP", "API" together.
 			if buffer.Len() > 0 {
-				list = append(list, buffer.String())
+				prevRune := runes[i-1]
+				if prevRune >= 'a' && prevRune <= 'z' {
+					// lowercase→uppercase boundary: "get|C", "detail|L"
+					list = append(list, buffer.String())
+					buffer.Reset()
+				} else if prevRune >= 'A' && prevRune <= 'Z' {
+					// uppercase→uppercase: check if next is lowercase (acronym end)
+					// e.g. "CID|App" — at 'A' prev='D'(upper), next='p'(lower) → split before 'A'
+					if i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z' {
+						list = append(list, buffer.String())
+						buffer.Reset()
+					}
+					// else: still in acronym run, don't split
+				}
 			}
-			buffer.Reset()
 		}
 		buffer.WriteRune(r)
 	}
+	if buffer.Len() > 0 {
+		list = append(list, buffer.String())
+	}
+	return list, nil
 }
 
 func getStyle(flag string) (style, error) {

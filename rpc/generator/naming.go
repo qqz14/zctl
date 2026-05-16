@@ -1,30 +1,29 @@
 package generator
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/ettle/strcase"
+)
 
 // ──── Naming convention functions ────
 //
 // All code generation MUST use these functions for name conversion.
-// Never call strings.ToLower / toSnakeCase directly on model names.
+// Never call strings.ToLower / manual snake/camel conversion directly.
 //
 // Rules:
-//   File names    → snake_case ("UserInfo" → "user_info")     → use FileSnake()
-//   Directory names → all lowercase  ("UserInfo" → "userinfo") → use DirName()
-//   Go package names → all lowercase ("UserInfo" → "userinfo") → use PkgName()
-//   Ent package names → all lowercase ("UserInfo" → "userinfo")→ use EntPkg()
-//   Go struct/type  → PascalCase (keep as-is)                  → use original
+//   File names       → snake_case ("UserInfo" → "user_info")      → use FileSnake()
+//   Directory names   → all lowercase ("UserInfo" → "userinfo")    → use DirName()
+//   Go package names  → all lowercase ("UserInfo" → "userinfo")    → use PkgName()
+//   Ent package names → all lowercase ("UserInfo" → "userinfo")    → use EntPkg()
+//   Go PascalCase     → with initialisms ("api_code" → "APICode") → use GoPascal()
+//   Go camelCase      → with initialisms ("api_code" → "apiCode") → use GoCamel()
 
 // FileSnake converts PascalCase to snake_case for **file names only**.
-// "UserInfo" → "user_info", "User" → "user"
+// Uses strcase.ToSnake which correctly handles initialisms and edge cases.
+// "UserInfo" → "user_info", "User" → "user", "IamApp" → "iam_app"
 func FileSnake(s string) string {
-	var result strings.Builder
-	for i, r := range s {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteByte('_')
-		}
-		result.WriteRune(r)
-	}
-	return strings.ToLower(result.String())
+	return strcase.ToSnake(s)
 }
 
 // DirName converts PascalCase to all-lowercase for **directory names**.
@@ -46,6 +45,19 @@ func PkgName(s string) string {
 // This MUST match what `go run entgo.io/ent/cmd/ent generate` produces.
 func EntPkg(s string) string {
 	return strings.ToLower(s)
+}
+
+// GoPascal converts snake_case to PascalCase with Go initialisms support.
+// "api_code" → "APICode", "owner_uid" → "OwnerUID", "app_name" → "AppName"
+// Uses ettle/strcase.ToGoPascal which follows Go naming conventions.
+func GoPascal(s string) string {
+	return strcase.ToGoPascal(s)
+}
+
+// GoCamel converts snake_case to lowerCamelCase with Go initialisms support.
+// "api_code" → "apiCode", "owner_uid" → "ownerUID"
+func GoCamel(s string) string {
+	return strcase.ToGoCamel(s)
 }
 
 // LowerCamel converts PascalCase to lowerCamelCase for struct field / variable names.

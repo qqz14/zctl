@@ -43,10 +43,12 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 
 	var messageLines strings.Builder // all message/enum definitions
 	var rpcLines strings.Builder     // all rpc method lines
+	importSet := make(map[string]bool) // deduplicated import lines
 
 	serviceRe := regexp.MustCompile(`^\s*service\s+\w+\s*\{`)
 	rpcRe := regexp.MustCompile(`^\s*rpc\s+`)
 	headerSkip := regexp.MustCompile(`^\s*(syntax|package|option\s+(go_package|java_package))`)
+	importRe := regexp.MustCompile(`^\s*import\s+`)
 
 	for _, f := range protoFiles {
 		relPath, _ := filepath.Rel(descDir, f)
@@ -67,6 +69,12 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 
 			// Skip proto header lines
 			if headerSkip.MatchString(trimmed) {
+				continue
+			}
+
+			// Collect import lines (deduplicated)
+			if importRe.MatchString(trimmed) {
+				importSet[trimmed] = true
 				continue
 			}
 
@@ -110,6 +118,22 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 	buf.WriteString("// │  To modify, edit files under desc/ then run: make gen-rpc              │\n")
 	buf.WriteString("// └────────────────────────────────────────────────────────────────────────┘\n\n")
 	buf.WriteString(fmt.Sprintf("syntax = \"proto3\";\n\npackage %s;\noption go_package = \"./%s\";\n\n", svcLower, svcLower))
+
+	// Write deduplicated imports
+	if len(importSet) > 0 {
+		// Sort for deterministic output
+		importLines := make([]string, 0, len(importSet))
+		for imp := range importSet {
+			importLines = append(importLines, imp)
+		}
+		sort.Strings(importLines)
+		for _, imp := range importLines {
+			buf.WriteString(imp)
+			buf.WriteByte('\n')
+		}
+		buf.WriteByte('\n')
+	}
+
 	buf.WriteString(messageLines.String())
 	buf.WriteString(fmt.Sprintf("service %s {\n", svcCamel))
 	buf.WriteString(rpcLines.String())

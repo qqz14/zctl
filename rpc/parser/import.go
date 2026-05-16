@@ -188,7 +188,8 @@ func lookupProtoFile(filename string, protoPaths []string) (string, error) {
 }
 
 // isWellKnownProto reports whether filename refers to a well-known type
-// bundled with protoc (e.g. google/protobuf/timestamp.proto).
+// bundled with protoc or a third-party proto that should not be resolved locally
+// (e.g. google/protobuf/timestamp.proto, buf/validate/validate.proto).
 func isWellKnownProto(filename string) bool {
-	return strings.HasPrefix(filename, "google/")
+	return strings.HasPrefix(filename, "google/") || strings.HasPrefix(filename, "buf/")
 }

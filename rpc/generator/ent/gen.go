@@ -1,6 +1,7 @@
 package ent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"entgo.io/ent/entc"
 	"entgo.io/ent/entc/gen"
 	"entgo.io/ent/entc/load"
+	"entgo.io/ent/schema/field"
 )
 
 // GenContext holds all parameters for the rpc ent subcommand.
@@ -53,6 +55,17 @@ func GenEntLogic(g *GenContext) error {
 		return err
 	}
 
+	// Run "go mod tidy" before loading ent schema to ensure all dependencies are resolved.
+	// Without this, entc.LoadGraph may fail with "go: updates to go.mod needed".
+	fmt.Println("[zctl] Running go mod tidy...")
+	tidyCmd := exec.Command("go", "mod", "tidy")
+	tidyCmd.Dir = outputDir
+	tidyCmd.Stdout = os.Stdout
+	tidyCmd.Stderr = os.Stderr
+	if err := tidyCmd.Run(); err != nil {
+		return fmt.Errorf("go mod tidy failed: %w", err)
+	}
+
 	schemas, err := entc.LoadGraph(g.Schema, &gen.Config{})
 	if err != nil {
 		return fmt.Errorf("failed to load ent schema: %w", err)
@@ -68,6 +81,15 @@ func GenEntLogic(g *GenContext) error {
 		return err
 	}
 
+	// Build a map from schema name → gen.Type for StructField() access.
+	// gen.Type.Fields[i].StructField() returns the correct Go PascalCase name
+	// with initialisms (e.g. "api_code" → "APICode", "uid" → "UID").
+	nodeMap := make(map[string]*gen.Type)
+	for _, node := range schemas.Nodes {
+		nodeMap[node.Name] = node
+	}
+
+	var processedSchemas []string
 	for _, s := range schemas.Schemas {
 		if g.ModelName != "all" && g.ModelName != s.Name {
 			continue
@@ -82,11 +104,28 @@ func GenEntLogic(g *GenContext) error {
 			genCtx.GroupName = generator.DirName(s.Name)
 		}
 
-		if err := generateForSchema(&genCtx, projectCtx, outputDir, s); err != nil {
+		// Build field name → Go struct field name mapping from gen.Type
+		fieldMap := buildFieldMap(nodeMap[s.Name])
+
+		if err := generateForSchema(&genCtx, projectCtx, outputDir, s, fieldMap); err != nil {
 			return err
 		}
 
+		processedSchemas = append(processedSchemas, s.Name)
 		fmt.Printf("[zctl] Generated module: %s\n", s.Name)
+	}
+
+	// Generate unified DAO errcode file (all modules in one file, with unique code segments + i18n)
+	// When model=all, use all schemas; when model=single, still regenerate with all schemas
+	// to maintain correct segment numbering.
+	var allSchemaNames []string
+	for _, s := range schemas.Schemas {
+		allSchemaNames = append(allSchemaNames, s.Name)
+	}
+	if err := genDaoErrcodeAll(outputDir, allSchemaNames); err != nil {
+		fmt.Printf("[zctl] Warning: failed to generate dao errcode: %v\n", err)
+	} else {
+		fmt.Printf("[zctl] Generated pkg/errcode/dao.go (%d modules)\n", len(allSchemaNames))
 	}
 
 	// After generating desc protos, auto-run merge + protoc + logic/server generation
@@ -109,21 +148,28 @@ func GenEntLogic(g *GenContext) error {
 	return nil
 }
 
-func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema) error {
+func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema, fieldMap map[string]string) error {
 	modulePath := projectCtx.Path
+	modelSnake := generator.FileSnake(schema.Name)
+
+	// ── 先看后做：在生成 DAO 之前，记住 DAO 文件是否已经存在 ──
+	// 如果之前就有 DAO → 说明不是第一次跑 → 后面跳过 proto 生成
+	// 如果之前没有 DAO → 说明第一次跑 → 后面正常生成 proto
+	daoFilePath := filepath.Join(outputDir, "internal", "dao", modelSnake+"_dao.go")
+	daoPreExisted := pathx.FileExists(daoFilePath)
 
 	// 1. Generate DAO interface
-	if err := genDaoInterface(g, outputDir, modulePath, schema); err != nil {
+	if err := genDaoInterface(g, outputDir, modulePath, schema, fieldMap); err != nil {
 		return err
 	}
 
 	// 2. Generate DAO OceanBase impl
-	if err := genDaoOceanBaseImpl(g, outputDir, modulePath, schema); err != nil {
+	if err := genDaoOceanBaseImpl(g, outputDir, modulePath, schema, fieldMap); err != nil {
 		return err
 	}
 
 	// 3. Generate DAO mock
-	if err := genDaoMock(g, outputDir, modulePath, schema); err != nil {
+	if err := genDaoMock(g, outputDir, modulePath, schema, fieldMap); err != nil {
 		return err
 	}
 
@@ -137,24 +183,29 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 		return err
 	}
 
-	// 5. Generate test skeleton (in logic/{group}/{model_lower}/ dir)
+	// 6. Generate test skeleton (in logic/{group}/{model_lower}/ dir)
 	if err := genTestSkeleton(g, outputDir, modulePath, schema); err != nil {
 		return err
 	}
 
-	// 6. Generate module model file
+	// 7. Generate module model file
 	if err := genModuleModel(g, outputDir, schema); err != nil {
 		return err
 	}
 
-	// 7. Generate module constants file
+	// 8. Generate module constants file
 	if err := genModuleConst(g, outputDir, schema); err != nil {
 		return err
 	}
 
-	// 8. Generate desc/{group}/{model_lower}.proto
-	if err := genDescProto(g, outputDir, schema); err != nil {
-		return err
+	// 9. Generate desc/{group}/{model_lower}.proto
+	// 只在首次（DAO 之前不存在）或 --overwrite 时生成 proto
+	if daoPreExisted && !g.Overwrite {
+		fmt.Printf("  ⊘ DAO already existed for %s, skipping proto generation (use --overwrite to force)\n", schema.Name)
+	} else {
+		if err := genDescProto(g, outputDir, schema); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -162,7 +213,7 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 
 // ==================== DAO Interface ====================
 
-func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.Schema) error {
+func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.Schema, fieldMap map[string]string) error {
 	dir := filepath.Join(outputDir, "internal", "dao")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
@@ -189,7 +240,7 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 	// Build GetByXxx methods
 	var getMethods strings.Builder
 	for _, uf := range uniqueFields {
-		camel := toCamelCase(uf.Name)
+		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&getMethods, "\tGetBy%s(ctx context.Context, %s %s) (*ent.%s, error)\n", camel, uf.Name, goType, modelName)
 	}
@@ -198,7 +249,7 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 	var updateMethods strings.Builder
 	fmt.Fprintf(&updateMethods, "\tUpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error)\n", modelName, modelName)
 	for _, uf := range uniqueFields {
-		camel := toCamelCase(uf.Name)
+		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&updateMethods, "\tUpdateBy%s(ctx context.Context, %s %s, data *ent.%s) (*ent.%s, error)\n", camel, uf.Name, goType, modelName, modelName)
 	}
@@ -206,7 +257,7 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 	// Build ListFilter struct
 	var filterFields strings.Builder
 	for _, f := range indexedFields {
-		camel := toCamelCase(f.Name)
+		camel := entFieldName(fieldMap, f.Name)
 		goType := mapEntFieldTypeToGo(f)
 		fmt.Fprintf(&filterFields, "\t%s *%s // filter by %s\n", camel, goType, f.Name)
 	}
@@ -217,11 +268,33 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 		deleteMethod = "\tDeleteByID(ctx context.Context, id int) error\n"
 	}
 
+	// Check if any field type needs "time" import (for ListFilter / method params)
+	needTimeImport := false
+	for _, f := range indexedFields {
+		if mapEntFieldTypeToGo(f) == "time.Time" {
+			needTimeImport = true
+			break
+		}
+	}
+	if !needTimeImport {
+		for _, f := range uniqueFields {
+			if mapEntFieldTypeToGo(f) == "time.Time" {
+				needTimeImport = true
+				break
+			}
+		}
+	}
+
+	timeImport := ""
+	if needTimeImport {
+		timeImport = "\t\"time\"\n\n"
+	}
+
 	content := fmt.Sprintf(`package dao
 
 import (
 	"context"
-
+%s
 	"%s/ent"
 	"%s/pkg/model"
 )
@@ -256,7 +329,7 @@ type %sDao interface {
 
 	List(ctx context.Context, filter *%sListFilter, page *model.PageInfo) ([]*ent.%s, int, error)
 }
-`, modulePath, modulePath,
+`, timeImport, modulePath, modulePath,
 		modelName, modelName,
 		modelName,
 		filterFields.String(),
@@ -278,7 +351,7 @@ type %sDao interface {
 
 // genDaoMock generates internal/dao/mock/{model}_dao_mock.go with mock implementation.
 // This is always overwritten because it must stay in sync with the interface.
-func genDaoMock(g *GenContext, outputDir, modulePath string, schema *load.Schema) error {
+func genDaoMock(g *GenContext, outputDir, modulePath string, schema *load.Schema, fieldMap map[string]string) error {
 	dir := filepath.Join(outputDir, "internal", "dao", "mock")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
@@ -435,6 +508,11 @@ func parseMethodLine(line string) (daoMethod, bool) {
 	params := line[parenOpen+1 : paramEnd]
 	returns := strings.TrimSpace(line[paramEnd+1:])
 
+	// Qualify dao-local types (e.g. *IamCIDListFilter → *dao.IamCIDListFilter)
+	// so mock package can reference them correctly.
+	params = qualifyDaoTypes(params)
+	returns = qualifyDaoTypes(returns)
+
 	// Build call args (just the param names, not types)
 	callArgs := extractParamNames(params)
 
@@ -526,6 +604,106 @@ func splitReturnTypes(s string) []string {
 	return result
 }
 
+// QualifyDaoTypes rewrites types that are defined in the dao package (not a
+// built-in or already-qualified type) to use a "dao." prefix.
+// e.g. "*IamCIDListFilter" → "*dao.IamCIDListFilter"
+// This is needed because the parsed signature comes from the dao package
+// where these types need no prefix, but mock code lives in the mock package.
+// Exported for use by cli/dao.go's regenerateMock.
+func QualifyDaoTypes(sig string) string {
+	return qualifyDaoTypes(sig)
+}
+
+func qualifyDaoTypes(sig string) string {
+	// We operate on each comma-separated parameter/return segment.
+	parts := strings.Split(sig, ",")
+	for i, p := range parts {
+		parts[i] = qualifySegment(p)
+	}
+	return strings.Join(parts, ",")
+}
+
+// qualifySegment qualifies a single param or return-type segment.
+// Input examples: " filter *IamCIDListFilter", " *ent.User", " error"
+func qualifySegment(seg string) string {
+	trimmed := strings.TrimSpace(seg)
+	if trimmed == "" {
+		return seg
+	}
+
+	// Split "name type" for params, or just "type" for returns
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return seg
+	}
+
+	// The type token is the last field (or the only field for returns)
+	typeIdx := len(fields) - 1
+	typeTok := fields[typeIdx]
+
+	qualified := qualifyTypeToken(typeTok)
+	if qualified == typeTok {
+		return seg // unchanged
+	}
+
+	fields[typeIdx] = qualified
+	// Preserve leading whitespace
+	leading := ""
+	for _, ch := range seg {
+		if ch == ' ' || ch == '\t' {
+			leading += string(ch)
+		} else {
+			break
+		}
+	}
+	return leading + strings.Join(fields, " ")
+}
+
+// qualifyTypeToken adds "dao." prefix to a type token if it looks like
+// a dao-local type (starts with uppercase, no dot = no package qualifier).
+// Handles pointer and slice prefixes: "*Foo" → "*dao.Foo", "[]*Foo" → "[]*dao.Foo"
+func qualifyTypeToken(tok string) string {
+	// Known packages / built-in types that should NOT be qualified
+	builtins := map[string]bool{
+		"error": true, "string": true, "bool": true,
+		"int": true, "int8": true, "int16": true, "int32": true, "int64": true,
+		"uint": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+		"float32": true, "float64": true, "byte": true, "rune": true,
+		"interface{}": true, "any": true,
+	}
+
+	// Strip pointer/slice prefix
+	prefix := ""
+	rest := tok
+	if strings.HasPrefix(rest, "[]*") {
+		prefix = "[]*"
+		rest = rest[3:]
+	} else if strings.HasPrefix(rest, "[]") {
+		prefix = "[]"
+		rest = rest[2:]
+	} else if strings.HasPrefix(rest, "*") {
+		prefix = "*"
+		rest = rest[1:]
+	}
+
+	// If it already has a dot (e.g. "ent.User", "model.PageInfo", "context.Context"), skip
+	if strings.Contains(rest, ".") {
+		return tok
+	}
+
+	// If it's a built-in type, skip
+	if builtins[rest] {
+		return tok
+	}
+
+	// If it starts with uppercase, it's likely a dao-local type
+	if len(rest) > 0 && rest[0] >= 'A' && rest[0] <= 'Z' {
+		return prefix + "dao." + rest
+	}
+
+	return tok
+}
+
 // defaultCRUDMethods returns fallback mock methods when parsing fails.
 // Now aligned with new interface: no Delete if no deleted_at, List uses filter+page.
 func defaultCRUDMethods(modelName string) []daoMethod {
@@ -563,7 +741,7 @@ func defaultCRUDMethods(modelName string) []daoMethod {
 	}
 }
 
-func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *load.Schema) error {
+func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *load.Schema, fieldMap map[string]string) error {
 	dir := filepath.Join(outputDir, "internal", "dao", "impl")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
@@ -588,10 +766,21 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		if isBaseField(f.Name) {
 			continue
 		}
-		camel := toCamelCase(f.Name)
-		if f.Optional || f.Nillable {
-			fmt.Fprintf(&createSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
-			fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
+		camel := entFieldName(fieldMap, f.Name)
+		// JSON fields (e.g. field.JSON("x", []string{})) do NOT have SetNillable in ent.
+		// They only have Set/Append/Clear. Use Set even if Optional/Nillable.
+		isJSON := f.Info != nil && f.Info.Type == field.TypeJSON
+		if (f.Optional || f.Nillable) && !isJSON {
+			// For Nillable fields, the ent struct field is already a pointer (*T).
+			// SetNillable expects *T, so pass data.Field directly (not &data.Field).
+			// For Optional-only (not Nillable) fields, the struct field is T, so use &data.Field.
+			if f.Nillable {
+				fmt.Fprintf(&createSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
+				fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
+			} else {
+				fmt.Fprintf(&createSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
+				fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
+			}
 		} else {
 			fmt.Fprintf(&createSetters, "\t\tSet%s(data.%s).\n", camel, camel)
 			fmt.Fprintf(&updateSetters, "\t\tSet%s(data.%s).\n", camel, camel)
@@ -601,7 +790,11 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	var b strings.Builder
 
 	// Header
-	fmt.Fprintf(&b, "package impl\n\nimport (\n\t\"context\"\n\n")
+	timeImportImpl := ""
+	if hasSoftDelete {
+		timeImportImpl = "\t\"time\"\n"
+	}
+	fmt.Fprintf(&b, "package impl\n\nimport (\n\t\"context\"\n%s\n", timeImportImpl)
 	fmt.Fprintf(&b, "\t\"%s/ent\"\n", modulePath)
 	fmt.Fprintf(&b, "\t\"%s/ent/%s\"\n", modulePath, entPkg)
 	fmt.Fprintf(&b, "\t\"%s/internal/dao\"\n", modulePath)
@@ -633,7 +826,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 
 	// GetByXxx for each unique field
 	for _, uf := range uniqueFields {
-		camel := toCamelCase(uf.Name)
+		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetBy%s(ctx context.Context, %s %s) (*ent.%s, error) {\n", entPkg, camel, uf.Name, goType, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
@@ -654,7 +847,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 
 	// UpdateByXxx for each unique field
 	for _, uf := range uniqueFields {
-		camel := toCamelCase(uf.Name)
+		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateBy%s(ctx context.Context, %s %s, data *ent.%s) (*ent.%s, error) {\n", entPkg, camel, uf.Name, goType, modelName, modelName)
 		fmt.Fprintf(&b, "\texisting, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
@@ -685,7 +878,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	fmt.Fprintf(&b, "\t// Apply filter conditions (only indexed fields).\n")
 	fmt.Fprintf(&b, "\tif filter != nil {\n")
 	for _, f := range indexedFields {
-		camel := toCamelCase(f.Name)
+		camel := entFieldName(fieldMap, f.Name)
 		fmt.Fprintf(&b, "\t\tif filter.%s != nil {\n\t\t\tquery = query.Where(%s.%sEQ(*filter.%s))\n\t\t}\n", camel, entPkg, camel, camel)
 	}
 	fmt.Fprintf(&b, "\t}\n\n")
@@ -761,42 +954,133 @@ func Register%sHooks(client *ent.Client) {
 
 // ==================== Module Errcode ====================
 
+// genModuleErrcode is now a no-op for individual schemas.
+// All DAO error codes are generated collectively by genDaoErrcodeAll after the loop.
 func genModuleErrcode(g *GenContext, outputDir, modulePath string, schema *load.Schema) error {
+	return nil // handled by genDaoErrcodeAll
+}
+
+// genDaoErrcodeAll generates a single pkg/errcode/dao.go containing error codes
+// for ALL ent schemas, with each module assigned a unique 100-code segment.
+// It also auto-appends empty i18n entries to locale JSON files.
+//
+// Segment layout (base = 11000):
+//
+//	Module 0: 11100 ~ 11199
+//	Module 1: 11200 ~ 11299
+//	...
+//
+// Always overwrites to ensure consistency across all modules.
+func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	dir := filepath.Join(outputDir, "pkg", "errcode")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
 	}
 
-	// snake_case filename: user_info.go
-	filename := generator.FileSnake(schema.Name)
-	filePath := filepath.Join(dir, filename+".go")
-	if pathx.FileExists(filePath) && !g.Overwrite {
+	const segmentBase = 11000
+	const segmentSize = 100
+
+	var b strings.Builder
+	b.WriteString("package errcode\n\n")
+	b.WriteString("// Code generated by zctl. DO NOT EDIT.\n")
+	b.WriteString("// DAO module error codes — each module gets a 100-code segment.\n")
+	b.WriteString("// Messages come from i18n (pkg/i18n/locale/{lang}.json → key \"errcode.{code}\").\n\n")
+
+	// Collect all error code → empty string for i18n
+	var i18nCodes []int
+
+	for i, name := range schemaNames {
+		base := segmentBase + (i+1)*segmentSize // 11100, 11200, 11300, ...
+		notFound := base + 1
+		createFailed := base + 2
+		updateFailed := base + 3
+		deleteFailed := base + 4
+
+		b.WriteString(fmt.Sprintf("// ──── %s: %d ~ %d ────\n", name, base, base+segmentSize-1))
+		b.WriteString("const (\n")
+		b.WriteString(fmt.Sprintf("\t%sNotFound     = %d\n", name, notFound))
+		b.WriteString(fmt.Sprintf("\t%sCreateFailed = %d\n", name, createFailed))
+		b.WriteString(fmt.Sprintf("\t%sUpdateFailed = %d\n", name, updateFailed))
+		b.WriteString(fmt.Sprintf("\t%sDeleteFailed = %d\n", name, deleteFailed))
+		b.WriteString(")\n\n")
+
+		i18nCodes = append(i18nCodes, notFound, createFailed, updateFailed, deleteFailed)
+	}
+
+	filePath := filepath.Join(dir, "dao.go")
+	if err := os.WriteFile(filePath, []byte(b.String()), 0644); err != nil {
+		return err
+	}
+
+	// Auto-append i18n entries
+	if err := appendI18nEntries(outputDir, i18nCodes); err != nil {
+		fmt.Printf("  ⚠ Failed to update i18n locale files: %v\n", err)
+	}
+
+	return nil
+}
+
+// appendI18nEntries adds missing error code keys to all locale JSON files
+// with empty string values. Existing keys are NOT overwritten.
+func appendI18nEntries(outputDir string, codes []int) error {
+	localeDir := filepath.Join(outputDir, "pkg", "i18n", "locale")
+	entries, err := os.ReadDir(localeDir)
+	if err != nil {
+		return nil // i18n not set up yet, skip silently
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		filePath := filepath.Join(localeDir, entry.Name())
+		if err := mergeI18nCodes(filePath, codes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeI18nCodes reads a locale JSON file, adds missing errcode keys with empty
+// values, and writes it back with stable formatting.
+func mergeI18nCodes(filePath string, codes []int) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	// Simple JSON parse: we expect {"errcode": {"key": "val", ...}, ...}
+	// Use encoding/json for safety
+	var root map[string]map[string]string
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil // malformed JSON, skip
+	}
+
+	errSection, ok := root["errcode"]
+	if !ok {
+		errSection = make(map[string]string)
+		root["errcode"] = errSection
+	}
+
+	changed := false
+	for _, code := range codes {
+		key := fmt.Sprintf("%d", code)
+		if _, exists := errSection[key]; !exists {
+			errSection[key] = ""
+			changed = true
+		}
+	}
+
+	if !changed {
 		return nil
 	}
 
-	modelName := schema.Name
-	// Auto-calculate code segment based on model name hash
-	codeBase := 11000
-
-	content := fmt.Sprintf(`package errcode
-
-// ──── %s module error codes %d~%d ────
-// Messages come from i18n (pkg/i18n/locale/{lang}.json → key "errcode.{code}").
-const (
-	%sNotFound     = %d
-	%sCreateFailed = %d
-	%sUpdateFailed = %d
-	%sDeleteFailed = %d
-)
-`,
-		modelName, codeBase, codeBase+999,
-		modelName, codeBase+1,
-		modelName, codeBase+2,
-		modelName, codeBase+3,
-		modelName, codeBase+4,
-	)
-
-	return os.WriteFile(filePath, []byte(content), 0644)
+	// Write back with indentation
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, append(out, '\n'), 0644)
 }
 
 // ==================== Module Model (placeholder) ====================
@@ -1048,8 +1332,18 @@ func autoGenRpc(abs, style string) error {
 	// 3. Run protoc
 	typesDir := filepath.Join(abs, "types")
 	pathx.MkdirIfNotExist(typesDir)
-	protocCmd := fmt.Sprintf("protoc -I=%s %s --go_out=%s --go-grpc_out=%s",
-		abs, filepath.Base(rootProto), typesDir, typesDir)
+
+	// Map validate.proto's go_package so protoc doesn't generate it locally —
+	// the project imports it as a Go module dependency instead.
+	validateMapping := "Mbuf/validate/validate.proto=buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
+	protocCmd := fmt.Sprintf(
+		"protoc -I=%s -I=%s %s"+
+			" --go_out=%s --go_opt=%s"+
+			" --go-grpc_out=%s --go-grpc_opt=%s",
+		abs, filepath.Join(abs, "proto"), filepath.Base(rootProto),
+		typesDir, validateMapping,
+		typesDir, validateMapping,
+	)
 	fmt.Printf("[zctl] Running: %s\n", protocCmd)
 	cmd := exec.Command("sh", "-c", protocCmd)
 	cmd.Dir = abs
@@ -1084,25 +1378,44 @@ func isBaseField(name string) bool {
 }
 
 func toCamelCase(s string) string {
-	parts := strings.Split(s, "_")
-	for i, p := range parts {
-		if len(p) > 0 {
-			parts[i] = strings.ToUpper(p[:1]) + p[1:]
-		}
+	return generator.GoPascal(s)
+}
+
+// buildFieldMap creates a mapping from snake_case field name to Go PascalCase struct field name
+// using ent's gen.Type.Fields[i].StructField(), which correctly handles Go initialisms
+// (e.g. "api_code" → "APICode", "uid" → "UID", "url" → "URL").
+func buildFieldMap(node *gen.Type) map[string]string {
+	m := make(map[string]string)
+	if node == nil {
+		return m
 	}
-	return strings.Join(parts, "")
+	for _, f := range node.Fields {
+		m[f.Name] = f.StructField()
+	}
+	return m
+}
+
+// entFieldName returns the Go PascalCase struct field name for a given snake_case field name.
+// It first looks up the fieldMap (built from ent gen.Type), falling back to GoPascal.
+func entFieldName(fieldMap map[string]string, snakeName string) string {
+	if v, ok := fieldMap[snakeName]; ok {
+		return v
+	}
+	return generator.GoPascal(snakeName)
 }
 
 // ==================== Desc Proto Generation ====================
 
-// genDescProto generates desc/{group}/{model_snake}.proto with CRUD messages and service methods.
+// genDescProto generates desc/{group}/{model_snake}.proto with messages and service methods
+// derived from the DAO interface. If the DAO file already exists (meaning proto was already
+// generated once), skip proto generation to avoid overwriting user edits.
 //
 // Naming convention:
-//   - rpc createUser (CreateUserReq) returns (CreateUserResp)
+//   - rpc CreateUser (CreateUserReq) returns (CreateUserResp)  ← 大写开头
 //   - UserInfo is reused as the detail payload in create/update req and getById resp
 //   - PageInfo is reused from base.proto for list pagination
 //   - Empty is reused from base.proto for empty responses
-//   - No generic IDReq/IDsReq/BaseIDResp; each method has its own {Method}Req/{Method}Resp
+//   - Proto methods are generated from DAO interface methods (not hardcoded CRUD)
 func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
 	modelName := schema.Name
 	modelSnake := generator.FileSnake(modelName) // for proto file name: user_info.proto
@@ -1145,99 +1458,140 @@ func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
 		fieldNum++
 	}
 
-	content := fmt.Sprintf(`syntax = "proto3";
+	// Collect unique fields and check soft delete for generating appropriate methods
+	uniqueFields := collectUniqueFields(schema)
+	hasSoftDelete := hasDeletedAtField(schema)
 
-// ──── %s module ────
+	// Build proto content: messages + service methods from DAO interface methods
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("syntax = \"proto3\";\n\n"))
+	b.WriteString(fmt.Sprintf("// ──── %s module ────\n\n", modelName))
+	b.WriteString(fmt.Sprintf("// %sInfo 核心详情结构，用于创建/更新/查询详情。\n", modelName))
+	b.WriteString(fmt.Sprintf("message %sInfo {\n%s}\n\n", modelName, infoFields.String()))
 
-// %sInfo 核心详情结构，用于创建/更新/查询详情。
-message %sInfo {
-%s}
+	b.WriteString("// ──── Request / Response ────\n\n")
 
-// ──── Request / Response ────
+	// Track generated messages and rpc methods
+	type rpcEntry struct {
+		comment string
+		method  string // rpc method name (PascalCase)
+		req     string
+		resp    string
+	}
+	var rpcs []rpcEntry
+	generatedMessages := make(map[string]bool)
 
-// 创建%s请求
-message Create%sReq {
-  %sInfo info = 1;
-}
+	// ── Generate messages and rpcs based on DAO methods ──
 
-// 创建%s响应
-message Create%sResp {
-  uint64 id = 1;
-}
+	// 1. Create → CreateXxxReq / CreateXxxResp
+	b.WriteString(fmt.Sprintf("// 创建%s请求\n", modelName))
+	b.WriteString(fmt.Sprintf("message Create%sReq {\n  %sInfo info = 1;\n}\n\n", modelName, modelName))
+	b.WriteString(fmt.Sprintf("// 创建%s响应\n", modelName))
+	b.WriteString(fmt.Sprintf("message Create%sResp {\n  uint64 id = 1;\n}\n\n", modelName))
+	generatedMessages["Create"+modelName+"Req"] = true
+	generatedMessages["Create"+modelName+"Resp"] = true
+	rpcs = append(rpcs, rpcEntry{
+		comment: fmt.Sprintf("  // 创建%s\n", modelName),
+		method:  "Create" + modelName,
+		req:     "Create" + modelName + "Req",
+		resp:    "Create" + modelName + "Resp",
+	})
 
-// 更新%s请求
-message Update%sReq {
-  %sInfo info = 1;
-}
+	// 2. GetByID → GetXxxByIDReq
+	b.WriteString(fmt.Sprintf("// 按ID查询%s请求\n", modelName))
+	b.WriteString(fmt.Sprintf("message Get%sByIDReq {\n  uint64 id = 1;\n}\n\n", modelName))
+	generatedMessages["Get"+modelName+"ByIDReq"] = true
+	rpcs = append(rpcs, rpcEntry{
+		comment: fmt.Sprintf("  // 按ID获取%s详情\n", modelName),
+		method:  "Get" + modelName + "ByID",
+		req:     "Get" + modelName + "ByIDReq",
+		resp:    modelName + "Info",
+	})
 
-// 按ID查询%s请求
-message Get%sByIdReq {
-  uint64 id = 1;
-}
+	// 3. GetByXxx for each unique field → GetXxxByYyyReq
+	for _, uf := range uniqueFields {
+		fieldPascal := generator.GoPascal(uf.Name)
+		protoType := goTypeToProtoType(uf.TypeName)
+		msgName := fmt.Sprintf("Get%sBy%sReq", modelName, fieldPascal)
+		if !generatedMessages[msgName] {
+			b.WriteString(fmt.Sprintf("// 按%s查询%s请求\n", fieldPascal, modelName))
+			b.WriteString(fmt.Sprintf("message %s {\n  %s %s = 1;\n}\n\n", msgName, protoType, uf.Name))
+			generatedMessages[msgName] = true
+		}
+		rpcs = append(rpcs, rpcEntry{
+			comment: fmt.Sprintf("  // 按%s获取%s详情\n", fieldPascal, modelName),
+			method:  fmt.Sprintf("Get%sBy%s", modelName, fieldPascal),
+			req:     msgName,
+			resp:    modelName + "Info",
+		})
+	}
 
-// 删除%s请求（支持批量）
-message Delete%sReq {
-  repeated uint64 ids = 1;
-}
+	// 4. UpdateByID → UpdateXxxReq
+	b.WriteString(fmt.Sprintf("// 更新%s请求\n", modelName))
+	b.WriteString(fmt.Sprintf("message Update%sReq {\n  %sInfo info = 1;\n}\n\n", modelName, modelName))
+	generatedMessages["Update"+modelName+"Req"] = true
+	rpcs = append(rpcs, rpcEntry{
+		comment: fmt.Sprintf("  // 更新%s\n", modelName),
+		method:  "Update" + modelName,
+		req:     "Update" + modelName + "Req",
+		resp:    "Empty",
+	})
 
-// 获取%s列表请求
-message Get%sListReq {
-  uint64 page = 1;
-  uint64 page_size = 2;
-}
+	// 5. UpdateByXxx for each unique field → UpdateXxxByYyyReq
+	for _, uf := range uniqueFields {
+		fieldPascal := generator.GoPascal(uf.Name)
+		protoType := goTypeToProtoType(uf.TypeName)
+		msgName := fmt.Sprintf("Update%sBy%sReq", modelName, fieldPascal)
+		if !generatedMessages[msgName] {
+			b.WriteString(fmt.Sprintf("// 按%s更新%s请求\n", fieldPascal, modelName))
+			b.WriteString(fmt.Sprintf("message %s {\n  %s %s = 1;\n  %sInfo info = 2;\n}\n\n", msgName, protoType, uf.Name, modelName))
+			generatedMessages[msgName] = true
+		}
+		rpcs = append(rpcs, rpcEntry{
+			comment: fmt.Sprintf("  // 按%s更新%s\n", fieldPascal, modelName),
+			method:  fmt.Sprintf("Update%sBy%s", modelName, fieldPascal),
+			req:     msgName,
+			resp:    "Empty",
+		})
+	}
 
-// 获取%s列表响应
-message Get%sListResp {
-  uint64 total = 1;
-  repeated %sInfo data = 2;
-}
+	// 6. DeleteByID (only if soft delete supported)
+	if hasSoftDelete {
+		b.WriteString(fmt.Sprintf("// 删除%s请求（支持批量）\n", modelName))
+		b.WriteString(fmt.Sprintf("message Delete%sReq {\n  repeated uint64 ids = 1;\n}\n\n", modelName))
+		generatedMessages["Delete"+modelName+"Req"] = true
+		rpcs = append(rpcs, rpcEntry{
+			comment: fmt.Sprintf("  // 删除%s\n", modelName),
+			method:  "Delete" + modelName,
+			req:     "Delete" + modelName + "Req",
+			resp:    "Empty",
+		})
+	}
 
-// %s 管理服务
-service %s {
-  // 创建%s
-  rpc create%s (Create%sReq) returns (Create%sResp);
-  // 更新%s
-  rpc update%s (Update%sReq) returns (Empty);
-  // 获取%s列表
-  rpc get%sList (Get%sListReq) returns (Get%sListResp);
-  // 按ID获取%s详情
-  rpc get%sById (Get%sByIdReq) returns (%sInfo);
-  // 删除%s
-  rpc delete%s (Delete%sReq) returns (Empty);
-}
-`,
-		modelName,
-		// message UserInfoInfo
-		modelName, modelName, infoFields.String(),
-		// Create
-		modelName, modelName, modelName,
-		// CreateResp
-		modelName, modelName,
-		// Update
-		modelName, modelName, modelName,
-		// GetById
-		modelName, modelName,
-		// Delete
-		modelName, modelName,
-		// GetList
-		modelName, modelName,
-		// GetListResp
-		modelName, modelName, modelName,
-		// service
-		modelName, g.ServiceName,
-		// rpc create
-		modelName, modelName, modelName, modelName,
-		// rpc update
-		modelName, modelName, modelName,
-		// rpc getList
-		modelName, modelName, modelName, modelName,
-		// rpc getById
-		modelName, modelName, modelName, modelName,
-		// rpc delete
-		modelName, modelName, modelName,
-	)
+	// 7. List → GetXxxListReq / GetXxxListResp
+	b.WriteString(fmt.Sprintf("// 获取%s列表请求\n", modelName))
+	b.WriteString(fmt.Sprintf("message Get%sListReq {\n  uint64 page = 1;\n  uint64 page_size = 2;\n}\n\n", modelName))
+	b.WriteString(fmt.Sprintf("// 获取%s列表响应\n", modelName))
+	b.WriteString(fmt.Sprintf("message Get%sListResp {\n  uint64 total = 1;\n  repeated %sInfo data = 2;\n}\n\n", modelName, modelName))
+	generatedMessages["Get"+modelName+"ListReq"] = true
+	generatedMessages["Get"+modelName+"ListResp"] = true
+	rpcs = append(rpcs, rpcEntry{
+		comment: fmt.Sprintf("  // 获取%s列表\n", modelName),
+		method:  "Get" + modelName + "List",
+		req:     "Get" + modelName + "ListReq",
+		resp:    "Get" + modelName + "ListResp",
+	})
 
-	return os.WriteFile(filePath, []byte(content), 0644)
+	// ── Service block ──
+	b.WriteString(fmt.Sprintf("// %s 管理服务\n", modelName))
+	b.WriteString(fmt.Sprintf("service %s {\n", g.ServiceName))
+	for _, r := range rpcs {
+		b.WriteString(r.comment)
+		b.WriteString(fmt.Sprintf("  rpc %s (%s) returns (%s);\n", r.method, r.req, r.resp))
+	}
+	b.WriteString("}\n")
+
+	return os.WriteFile(filePath, []byte(b.String()), 0644)
 }
 
 // goTypeToProtoType converts Go type to proto type

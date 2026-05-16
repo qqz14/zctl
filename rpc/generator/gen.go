@@ -96,6 +96,11 @@ func (g *Generator) Generate(zctx *ZRpcContext) error {
 		return err
 	}
 
+	// Generate validate.proto before protoc so imports can resolve
+	if err = g.genValidateProto(abs); err != nil {
+		return err
+	}
+
 	err = g.GenPb(dirCtx, zctx)
 	if err != nil {
 		return err

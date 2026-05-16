@@ -213,12 +213,28 @@ func buildEnumContent(name string, values []string) string {
 
 // ─── String helpers ──────────────────────────────────────────────────────────────
 
-// toSnake: OrderStatus → order_status
+// toSnake converts CamelCase to snake_case, keeping consecutive uppercase
+// letters (acronyms) together as one word.
+//
+//	OrderStatus  → order_status
+//	CIDAppStatus → cid_app_status
+//	HTTPSProxy   → https_proxy
+//	GetCIDList   → get_cid_list
 func toSnake(s string) string {
+	runes := []rune(s)
 	var result strings.Builder
-	for i, r := range s {
+	for i, r := range runes {
 		if i > 0 && r >= 'A' && r <= 'Z' {
-			result.WriteByte('_')
+			prev := runes[i-1]
+			// Insert '_' when:
+			// 1. Previous char is lowercase (camel boundary): "orderS" → "order_s"
+			// 2. Previous char is uppercase BUT next char is lowercase (acronym end):
+			//    "CIDA" at 'A' when next is 'p' → "CID_A" → "cid_app"
+			if prev >= 'a' && prev <= 'z' {
+				result.WriteByte('_')
+			} else if i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z' {
+				result.WriteByte('_')
+			}
 		}
 		result.WriteRune(r)
 	}

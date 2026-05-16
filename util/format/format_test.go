@@ -29,7 +29,7 @@ func TestSplit(t *testing.T) {
 
 	list, err = split("GOZERO")
 	assert.Nil(t, err)
-	assert.Equal(t, []string{"G", "O", "Z", "E", "R", "O"}, list)
+	assert.Equal(t, []string{"GOZERO"}, list)
 
 	list, err = split("gozero")
 	assert.Nil(t, err)
@@ -41,7 +41,7 @@ func TestSplit(t *testing.T) {
 
 	list, err = split("a_b_CD_EF")
 	assert.Nil(t, err)
-	assert.Equal(t, []string{"a", "b", "C", "D", "E", "F"}, list)
+	assert.Equal(t, []string{"a", "b", "CD", "EF"}, list)
 
 	list, err = split("_")
 	assert.Nil(t, err)
@@ -66,6 +66,23 @@ func TestSplit(t *testing.T) {
 	list, err = split("welcome_to_go_zero")
 	assert.Nil(t, err)
 	assert.Equal(t, []string{"welcome", "to", "go", "zero"}, list)
+
+	// Acronym-aware split tests
+	list, err = split("GetCIDDetail")
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"Get", "CID", "Detail"}, list)
+
+	list, err = split("CIDAppStatus")
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"CID", "App", "Status"}, list)
+
+	list, err = split("HTTPSProxy")
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"HTTPS", "Proxy"}, list)
+
+	list, err = split("GetCIDDetail_logic")
+	assert.Nil(t, err)
+	assert.Equal(t, []string{"Get", "CID", "Detail", "logic"}, list)
 }
 
 func TestFileNamingFormat(t *testing.T) {
@@ -98,6 +115,12 @@ func TestFileNamingFormat(t *testing.T) {
 	testFileNamingFormatErr(t, "goZEro", "welcome_to_go_zero")
 	testFileNamingFormatErr(t, "goZERo", "welcome_to_go_zero")
 	testFileNamingFormatErr(t, "zerogo", "welcome_to_go_zero")
+
+	// Acronym-aware FileNamingFormat tests
+	testFileNamingFormat(t, "go_zero", "GetCIDDetail_logic", "get_cid_detail_logic")
+	testFileNamingFormat(t, "go_zero", "CIDAppStatus", "cid_app_status")
+	testFileNamingFormat(t, "gozero", "GetCIDDetail_logic", "getciddetaillogic")
+	testFileNamingFormat(t, "goZero", "GetCIDDetail_logic", "getCIDDetailLogic")
 }
 
 func testFileNamingFormat(t *testing.T, format, in, expected string) {

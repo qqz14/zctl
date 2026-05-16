@@ -106,6 +106,27 @@ func TestString_Camel2Snake(t *testing.T) {
 			input: "Go_Zero",
 			want:  "go__zero",
 		},
+		// Acronym-aware tests
+		{
+			input: "CIDAppStatus",
+			want:  "cid_app_status",
+		},
+		{
+			input: "GetCIDDetail",
+			want:  "get_cid_detail",
+		},
+		{
+			input: "HTTPSProxy",
+			want:  "https_proxy",
+		},
+		{
+			input: "APIKey",
+			want:  "api_key",
+		},
+		{
+			input: "GetCIDList",
+			want:  "get_cid_list",
+		},
 	}
 	for _, c := range cases {
 		ret := From(c.input).ToSnake()
