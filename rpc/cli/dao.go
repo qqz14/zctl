@@ -76,6 +76,9 @@ type condition struct {
 	Op     sqlOp
 	// Alias is the table alias (for JOINs). Empty for single-table queries.
 	Alias string
+	// Optional indicates this condition came from a "(? IS NULL OR col op ?)" pattern.
+	// The generated code should use pointer params with nil-check.
+	Optional bool
 }
 
 // joinClause is a parsed JOIN.
@@ -521,6 +524,25 @@ func extractWhereConditions(sql string) []condition {
 func parseConditions(wherePart string) []condition {
 	var conds []condition
 
+	// ── Pre-process: (? IS NULL OR col op ?) → optional condition ──
+	// This pattern means "if the param is nil, skip; otherwise filter by col".
+	// We replace the whole group with just the col comparison and mark it optional.
+	optRe := regexp.MustCompile(`(?i)\(\s*\?\s+IS\s+NULL\s+OR\s+(\w+(?:\.\w+)?)\s*(!=|<>|>=|<=|>|<|=)\s*\?\s*\)`)
+	for _, m := range optRe.FindAllStringSubmatch(wherePart, -1) {
+		col, alias := splitColAlias(m[1])
+		op := parseOperator(m[2])
+		conds = append(conds, condition{Column: col, Op: op, Alias: alias, Optional: true})
+	}
+	wherePart = optRe.ReplaceAllString(wherePart, "1=1")
+
+	// ── Pre-process: (? IS NULL OR col LIKE CONCAT('%', ?, '%')) ──
+	optLikeRe := regexp.MustCompile(`(?i)\(\s*\?\s+IS\s+NULL\s+OR\s+(\w+(?:\.\w+)?)\s+LIKE\s+(?:\?|CONCAT\s*\([^)]*\?\s*[^)]*\))\s*\)`)
+	for _, m := range optLikeRe.FindAllStringSubmatch(wherePart, -1) {
+		col, alias := splitColAlias(m[1])
+		conds = append(conds, condition{Column: col, Op: opLike, Alias: alias, Optional: true})
+	}
+	wherePart = optLikeRe.ReplaceAllString(wherePart, "1=1")
+
 	// Pattern: col BETWEEN ? AND ?
 	betweenRe := regexp.MustCompile(`(?i)(\w+(?:\.\w+)?)\s+BETWEEN\s+\?\s+AND\s+\?`)
 	for _, m := range betweenRe.FindAllStringSubmatch(wherePart, -1) {
@@ -554,8 +576,8 @@ func parseConditions(wherePart string) []condition {
 	}
 	wherePart = inRe.ReplaceAllString(wherePart, "1 IN (")
 
-	// Pattern: col LIKE ?
-	likeRe := regexp.MustCompile(`(?i)(\w+(?:\.\w+)?)\s+LIKE\s+\?`)
+	// Pattern: col LIKE ? OR col LIKE CONCAT('%', ?, '%')
+	likeRe := regexp.MustCompile(`(?i)(\w+(?:\.\w+)?)\s+LIKE\s+(?:\?|CONCAT\s*\([^)]*\?\s*[^)]*\))`)
 	for _, m := range likeRe.FindAllStringSubmatch(wherePart, -1) {
 		col, alias := splitColAlias(m[1])
 		conds = append(conds, condition{Column: col, Op: opLike, Alias: alias})
@@ -608,7 +630,8 @@ type schemaInfo struct {
 }
 
 // loadEntSchemas attempts to load ent schemas for type inference.
-// Returns map[lowercase_schema_name]*schemaInfo. Returns empty map on failure.
+// Returns map with multiple keys per schema: lowercase name, table name.
+// Returns empty map on failure.
 func loadEntSchemas(schemaPath string) map[string]*schemaInfo {
 	result := make(map[string]*schemaInfo)
 
@@ -626,16 +649,23 @@ func loadEntSchemas(schemaPath string) map[string]*schemaInfo {
 		return result
 	}
 
-	for _, s := range graph.Schemas {
+	for _, n := range graph.Nodes {
 		info := &schemaInfo{
-			Name:   s.Name,
+			Name:   n.Name,
 			Fields: make(map[string]string),
 		}
 		info.Fields["id"] = "int"
-		for _, f := range s.Fields {
-			info.Fields[f.Name] = f.Info.Type.String()
+		for _, f := range n.Fields {
+			info.Fields[f.Name] = f.Type.String()
 		}
-		result[strings.ToLower(s.Name)] = info
+		// Store with multiple keys for flexible lookup:
+		// 1. lowercase schema name (e.g. "iamuserappcid")
+		result[strings.ToLower(n.Name)] = info
+		// 2. table name (e.g. "iam_user_app_cid")
+		tableName := n.Table()
+		if tableName != "" {
+			result[tableName] = info
+		}
 	}
 
 	return result
@@ -710,7 +740,7 @@ func generateSelectMethodName(p *parsedSQL) string {
 		prefix = "FindBy"
 	}
 
-	condNames := conditionColumnNames(p.Conditions)
+	condNames := conditionColumnNames(p.Conditions, p)
 	if len(condNames) == 0 {
 		if prefix == "FindBy" || prefix == "CountBy" || prefix == "GetBy" {
 			return strings.TrimSuffix(prefix, "By") + "All"
@@ -731,7 +761,7 @@ func generateUpdateMethodName(p *parsedSQL) string {
 		setNames = append(setNames, toCamelCase(s.Column))
 	}
 
-	condNames := conditionColumnNames(p.Conditions)
+	condNames := conditionColumnNames(p.Conditions, p)
 
 	prefix := "Update"
 	if len(setNames) > 0 && len(setNames) <= 3 {
@@ -746,16 +776,20 @@ func generateUpdateMethodName(p *parsedSQL) string {
 }
 
 func generateDeleteMethodName(p *parsedSQL) string {
-	condNames := conditionColumnNames(p.Conditions)
+	condNames := conditionColumnNames(p.Conditions, p)
 	if len(condNames) == 0 {
 		return "DeleteAll"
 	}
 	return "DeleteBy" + strings.Join(condNames, "And")
 }
 
-func conditionColumnNames(conds []condition) []string {
+func conditionColumnNames(conds []condition, p *parsedSQL) []string {
 	var names []string
 	for _, c := range conds {
+		// Skip JOIN table conditions — they are not part of the primary query
+		if p != nil && isJoinTableCondition(c, p) {
+			continue
+		}
 		name := toCamelCase(c.Column)
 		// Append operator suffix for non-EQ operators
 		switch c.Op {
@@ -813,11 +847,7 @@ func determineReturnKind(p *parsedSQL) returnKind {
 func genDaoMethod(g *entgen.GenContext, projectCtx *ctx.ProjectContext, outputDir string, p *parsedSQL, schemaMap map[string]*schemaInfo) error {
 	modulePath := projectCtx.Path
 	modelName := toCamelCase(p.PrimaryTable)
-	modelLower := strings.ToLower(modelName)
 	modelSnake := toSnakeCase(modelName)
-
-	methodName := generateMethodName(p)
-	retKind := determineReturnKind(p)
 
 	// Look up schema for type inference
 	schema := schemaMap[strings.ToLower(p.PrimaryTable)]
@@ -826,8 +856,39 @@ func genDaoMethod(g *entgen.GenContext, projectCtx *ctx.ProjectContext, outputDi
 		schema = schemaMap[modelSnake]
 	}
 
+	// Use ent schema's actual Name (e.g. "IamUserAppCID") instead of GoPascal result (e.g. "IamUserAppCid")
+	if schema != nil && schema.Name != "" {
+		modelName = schema.Name
+		modelSnake = toSnakeCase(modelName)
+	}
+
+	// ent predicate package name: lowercase without underscores (e.g. "iamuserappcid")
+	entPkgName := strings.ToLower(strings.ReplaceAll(modelSnake, "_", ""))
+
+	methodName := generateMethodName(p)
+	retKind := determineReturnKind(p)
+
+	// Also load schemas for JOIN tables (for type inference on aliased columns)
+	joinSchemas := make(map[string]*schemaInfo) // alias → schema
+	for _, j := range p.Joins {
+		js := schemaMap[strings.ToLower(j.Table)]
+		if js == nil {
+			js = schemaMap[toSnakeCase(toCamelCase(j.Table))]
+		}
+		if js != nil {
+			if j.Alias != "" {
+				joinSchemas[j.Alias] = js
+			}
+			joinSchemas[j.Table] = js
+		}
+	}
+	// Also map primary alias
+	if p.PrimaryAlias != "" && schema != nil {
+		joinSchemas[p.PrimaryAlias] = schema
+	}
+
 	// Build method params
-	params := buildMethodParams(p, schema)
+	params := buildMethodParams(p, schema, joinSchemas)
 
 	// Build return type string
 	retStr := buildReturnType(retKind, modelName)
@@ -836,7 +897,7 @@ func genDaoMethod(g *entgen.GenContext, projectCtx *ctx.ProjectContext, outputDi
 	interfaceSig := fmt.Sprintf("\t%s(%s) %s\n", methodName, params.Signature, retStr)
 
 	// Build implementation body
-	implBody := buildImplBody(p, methodName, modelName, modelLower, modelSnake, params, retKind, modulePath, schema)
+	implBody := buildImplBody(p, methodName, modelName, entPkgName, modelSnake, params, retKind, modulePath, schema, joinSchemas)
 
 	// ── Write to DAO interface file ──
 	daoFileName := modelSnake + "_dao.go"
@@ -862,30 +923,48 @@ type methodParams struct {
 	LogFields string   // for logging: "status, name"
 }
 
-func buildMethodParams(p *parsedSQL, schema *schemaInfo) methodParams {
+func buildMethodParams(p *parsedSQL, schema *schemaInfo, joinSchemas map[string]*schemaInfo) methodParams {
 	mp := methodParams{Signature: "ctx context.Context"}
 	var names []string
 
-	// Add condition params
+	// resolveCondType resolves Go type for a condition, checking alias → joinSchemas first.
+	resolveCondType := func(c condition) string {
+		if c.Alias != "" {
+			if js, ok := joinSchemas[c.Alias]; ok {
+				return resolveGoType(c.Column, js)
+			}
+		}
+		return resolveGoType(c.Column, schema)
+	}
+
+	// Add condition params (skip JOIN table conditions — they become TODO comments)
 	for _, c := range p.Conditions {
+		if isJoinTableCondition(c, p) {
+			continue
+		}
 		switch c.Op {
 		case opIsNull, opIsNotNull:
 			continue // No param needed
 		case opBetween:
 			// Two params: min, max
-			goType := resolveGoType(c.Column, schema)
+			goType := resolveCondType(c)
 			minName := c.Column + "Min"
 			maxName := c.Column + "Max"
 			mp.Signature += fmt.Sprintf(", %s %s, %s %s", minName, goType, maxName, goType)
 			names = append(names, minName, maxName)
 		case opIN:
-			goType := resolveGoType(c.Column, schema)
+			goType := resolveCondType(c)
 			paramName := c.Column + "List"
 			mp.Signature += fmt.Sprintf(", %s []%s", paramName, goType)
 			names = append(names, paramName)
 		default:
-			goType := resolveGoType(c.Column, schema)
-			mp.Signature += fmt.Sprintf(", %s %s", c.Column, goType)
+			goType := resolveCondType(c)
+			if c.Optional {
+				// Optional params use pointer type with nil-check
+				mp.Signature += fmt.Sprintf(", %s *%s", c.Column, goType)
+			} else {
+				mp.Signature += fmt.Sprintf(", %s %s", c.Column, goType)
+			}
 			names = append(names, c.Column)
 		}
 	}
@@ -922,8 +1001,9 @@ func buildReturnType(kind returnKind, modelName string) string {
 
 // ────────────────────── Implementation body generation ──────────────────────
 
-func buildImplBody(p *parsedSQL, methodName, modelName, modelLower, modelSnake string, params methodParams, retKind returnKind, modulePath string, schema *schemaInfo) string {
+func buildImplBody(p *parsedSQL, methodName, modelName, entPkgName, modelSnake string, params methodParams, retKind returnKind, modulePath string, schema *schemaInfo, joinSchemas map[string]*schemaInfo) string {
 	var b strings.Builder
+	modelLower := strings.ToLower(strings.ReplaceAll(modelSnake, "_", ""))
 
 	// Function signature
 	retStr := buildReturnType(retKind, modelName)
@@ -938,11 +1018,11 @@ func buildImplBody(p *parsedSQL, methodName, modelName, modelLower, modelSnake s
 
 	switch p.Type {
 	case querySelect:
-		buildSelectImpl(&b, p, modelName, modelLower, modelSnake, params, retKind, schema)
+		buildSelectImpl(&b, p, modelName, entPkgName, modelSnake, params, retKind, schema)
 	case queryUpdate:
-		buildUpdateImpl(&b, p, modelName, modelLower, modelSnake, params, schema)
+		buildUpdateImpl(&b, p, modelName, entPkgName, modelSnake, params, schema)
 	case queryDelete:
-		buildDeleteImpl(&b, p, modelName, modelLower, params, schema)
+		buildDeleteImpl(&b, p, modelName, entPkgName, params, schema)
 	case queryInsert:
 		buildInsertImpl(&b, p, modelName, modelLower)
 	}
@@ -955,6 +1035,10 @@ func buildLogFields(names []string) string {
 	if len(names) == 0 {
 		return ""
 	}
+	// Use key-value pairs appended to log message string to avoid logx import dependency.
+	// Format: ctxutil.L(ctx).Infow("dao.Model.Method key1=%v key2=%v", val1, val2)
+	// But Infow doesn't support format args. So we use logx.Field instead,
+	// and ensure the import is added to the file.
 	var fields []string
 	for _, n := range names {
 		fields = append(fields, fmt.Sprintf("logx.Field(\"%s\", %s)", n, n))
@@ -962,11 +1046,45 @@ func buildLogFields(names []string) string {
 	return ", " + strings.Join(fields, ", ")
 }
 
-func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, modelSnake string, params methodParams, retKind returnKind, schema *schemaInfo) {
+// ensureImport adds an import to the file if not already present.
+func ensureImport(filePath, importPath string) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return
+	}
+	old := string(content)
+	if strings.Contains(old, fmt.Sprintf(`"%s"`, importPath)) {
+		return
+	}
+	// Find the import block and add the new import
+	importBlockRe := regexp.MustCompile(`(import\s*\()`)
+	if importBlockRe.MatchString(old) {
+		newContent := importBlockRe.ReplaceAllString(old, fmt.Sprintf("$1\n\t\"%s\"", importPath))
+		os.WriteFile(filePath, []byte(newContent), 0644)
+	}
+}
+
+// entStructReceiverName returns the receiver struct name for the DAO impl.
+// e.g. "IamUserAppCID" → "iamuserappcid"
+func entStructReceiverName(modelName string) string {
+	return strings.ToLower(modelName)
+}
+
+func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, modelSnake string, params methodParams, retKind returnKind, schema *schemaInfo) {
+	modelLower := entStructReceiverName(modelName)
+
+	// Add JOIN TODO at top if present
+	if len(p.Joins) > 0 {
+		for _, j := range p.Joins {
+			fmt.Fprintf(b, "\t// TODO: %s JOIN %s ON %s = %s → use ent edge query (e.g. .Query%s())\n",
+				j.JoinType, j.Table, j.OnLeft, j.OnRight, toCamelCase(j.Table))
+		}
+	}
+
 	if retKind == returnCount {
 		// COUNT query
-		fmt.Fprintf(b, "\tcount, err := d.client.%s.Query().\n", modelName)
-		buildWherePredicates(b, p, modelSnake, schema)
+		fmt.Fprintf(b, "\tcount, err := d.cli.Query().\n")
+		buildWherePredicates(b, p, entPkgName, schema)
 		fmt.Fprintf(b, "\t\tCount(ctx)\n")
 		fmt.Fprintf(b, "\tif err != nil {\n")
 		fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Count")
@@ -978,11 +1096,9 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, mo
 
 	if retKind == returnOne {
 		// Single result query
-		fmt.Fprintf(b, "\tresult, err := d.client.%s.Query().\n", modelName)
-		buildWherePredicates(b, p, modelSnake, schema)
-		if p.OrderBy != "" {
-			fmt.Fprintf(b, "\t\t// ORDER BY %s\n", p.OrderBy)
-		}
+		fmt.Fprintf(b, "\tresult, err := d.cli.Query().\n")
+		buildWherePredicates(b, p, entPkgName, schema)
+		buildOrderBy(b, p, entPkgName)
 		fmt.Fprintf(b, "\t\tFirst(ctx)\n")
 		fmt.Fprintf(b, "\tif err != nil {\n")
 		fmt.Fprintf(b, "\t\tif ent.IsNotFound(err) {\n")
@@ -998,23 +1114,19 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, mo
 	// List query (possibly paginated)
 	if p.HasLimit && p.HasOffset {
 		// Paginated query
-		fmt.Fprintf(b, "\tquery := d.client.%s.Query().\n", modelName)
-		buildWherePredicates(b, p, modelSnake, schema)
+		fmt.Fprintf(b, "\tquery := d.cli.Query().\n")
+		buildWherePredicates(b, p, entPkgName, schema)
 		fmt.Fprintf(b, "\t\tClone()\n")
-		if p.OrderBy != "" {
-			fmt.Fprintf(b, "\t// ORDER BY %s\n", p.OrderBy)
-		}
 		fmt.Fprintf(b, "\tlist, err := query.\n")
+		buildOrderBy(b, p, entPkgName)
 		fmt.Fprintf(b, "\t\tOffset((page - 1) * pageSize).\n")
 		fmt.Fprintf(b, "\t\tLimit(pageSize).\n")
 		fmt.Fprintf(b, "\t\tAll(ctx)\n")
 	} else {
 		// Plain list
-		fmt.Fprintf(b, "\tlist, err := d.client.%s.Query().\n", modelName)
-		buildWherePredicates(b, p, modelSnake, schema)
-		if p.OrderBy != "" {
-			fmt.Fprintf(b, "\t\t// ORDER BY %s\n", p.OrderBy)
-		}
+		fmt.Fprintf(b, "\tlist, err := d.cli.Query().\n")
+		buildWherePredicates(b, p, entPkgName, schema)
+		buildOrderBy(b, p, entPkgName)
 		if p.HasLimit && p.LimitN != "?" {
 			fmt.Fprintf(b, "\t\tLimit(%s).\n", p.LimitN)
 		}
@@ -1026,18 +1138,11 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, mo
 	fmt.Fprintf(b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "Find")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn list, nil\n")
-
-	// Add JOIN comment if present
-	if len(p.Joins) > 0 {
-		for _, j := range p.Joins {
-			fmt.Fprintf(b, "\t// TODO: %s JOIN %s ON %s = %s → use ent edge query (e.g. .Query%s())\n",
-				j.JoinType, j.Table, j.OnLeft, j.OnRight, toCamelCase(j.Table))
-		}
-	}
 }
 
-func buildUpdateImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, modelSnake string, params methodParams, schema *schemaInfo) {
-	fmt.Fprintf(b, "\taffected, err := d.client.%s.Update().\n", modelName)
+func buildUpdateImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, modelSnake string, params methodParams, schema *schemaInfo) {
+	modelLower := entStructReceiverName(modelName)
+	fmt.Fprintf(b, "\taffected, err := d.cli.Update().\n")
 
 	// SET columns
 	for _, s := range p.SetColumns {
@@ -1045,7 +1150,7 @@ func buildUpdateImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, mo
 		fmt.Fprintf(b, "\t\tSet%s(/* TODO: pass %s value */).\n", camel, s.Column)
 	}
 
-	buildWherePredicates(b, p, modelSnake, schema)
+	buildWherePredicates(b, p, entPkgName, schema)
 	fmt.Fprintf(b, "\t\tSave(ctx)\n")
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Update")
@@ -1054,20 +1159,22 @@ func buildUpdateImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower, mo
 	fmt.Fprintf(b, "\treturn affected, nil\n")
 }
 
-func buildDeleteImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower string, params methodParams, schema *schemaInfo) {
+func buildDeleteImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName string, params methodParams, schema *schemaInfo) {
 	modelSnake := toSnakeCase(modelName)
-	fmt.Fprintf(b, "\taffected, err := d.client.%s.Delete().\n", modelName)
-	buildWherePredicates(b, p, modelSnake, schema)
+	modelLower := entStructReceiverName(modelName)
+	fmt.Fprintf(b, "\taffected, err := d.cli.Delete().\n")
+	buildWherePredicates(b, p, entPkgName, schema)
 	fmt.Fprintf(b, "\t\tExec(ctx)\n")
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Delete")
 	fmt.Fprintf(b, "\t\treturn 0, errcode.Wrapf(errcode.DBDeleteFailed, \"%s.%s: %%v\", err)\n", modelLower, "Delete")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn affected, nil\n")
+	_ = modelSnake
 }
 
 func buildInsertImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower string) {
-	fmt.Fprintf(b, "\tresult, err := d.client.%s.Create().\n", modelName)
+	fmt.Fprintf(b, "\tresult, err := d.cli.Create().\n")
 	for _, col := range p.InsertColumns {
 		if isBaseField(col) {
 			continue
@@ -1084,27 +1191,101 @@ func buildInsertImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower str
 }
 
 // buildWherePredicates generates ent predicate calls from parsed conditions.
-func buildWherePredicates(b *strings.Builder, p *parsedSQL, modelSnake string, schema *schemaInfo) {
+func buildWherePredicates(b *strings.Builder, p *parsedSQL, entPkgName string, schema *schemaInfo) {
 	if len(p.Conditions) == 0 {
 		return
 	}
 
-	fmt.Fprintf(b, "\t\tWhere(\n")
-	for i, c := range p.Conditions {
-		predicate := buildEntPredicate(c, modelSnake)
-		if i < len(p.Conditions)-1 {
-			fmt.Fprintf(b, "\t\t\t%s,\n", predicate)
+	// Separate conditions into: primary table normal, primary table optional, join table
+	var normalConds, optConds, joinConds []condition
+	for _, c := range p.Conditions {
+		if isJoinTableCondition(c, p) {
+			joinConds = append(joinConds, c)
+		} else if c.Optional {
+			optConds = append(optConds, c)
 		} else {
-			fmt.Fprintf(b, "\t\t\t%s,\n", predicate)
+			normalConds = append(normalConds, c)
 		}
 	}
-	fmt.Fprintf(b, "\t\t).\n")
+
+	// Write normal predicates (primary table only) in Where()
+	if len(normalConds) > 0 {
+		fmt.Fprintf(b, "\t\tWhere(\n")
+		for _, c := range normalConds {
+			predicate := buildEntPredicate(c, entPkgName)
+			fmt.Fprintf(b, "\t\t\t%s,\n", predicate)
+		}
+		fmt.Fprintf(b, "\t\t).\n")
+	}
+
+	// Write optional predicates (primary table) with nil-check comments
+	if len(optConds) > 0 {
+		for _, c := range optConds {
+			predicate := buildEntPredicateDeref(c, entPkgName)
+			fmt.Fprintf(b, "\t\t// Optional: only apply when %s != nil\n", c.Column)
+			fmt.Fprintf(b, "\t\t// Where(%s).\n", predicate)
+		}
+	}
+
+	// Write join table conditions as TODO comments (cannot use ent predicate for another table)
+	if len(joinConds) > 0 {
+		for _, c := range joinConds {
+			alias := c.Alias
+			if alias == "" {
+				alias = "?"
+			}
+			fmt.Fprintf(b, "\t\t// TODO: %s.%s (from JOIN table) → filter via edge query or subquery\n", alias, c.Column)
+		}
+	}
+}
+
+// isJoinTableCondition checks whether a condition belongs to a JOIN table rather than the primary table.
+func isJoinTableCondition(c condition, p *parsedSQL) bool {
+	if c.Alias == "" {
+		return false // no alias → assume primary table
+	}
+	// If alias matches primary table alias → primary table
+	if p.PrimaryAlias != "" && c.Alias == p.PrimaryAlias {
+		return false
+	}
+	// If alias matches a JOIN table alias → join table
+	for _, j := range p.Joins {
+		if c.Alias == j.Alias {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEntPredicateDeref generates a predicate with dereferenced pointer param.
+func buildEntPredicateDeref(c condition, entPkgName string) string {
+	camel := toCamelCase(c.Column)
+	pkg := entPkgName
+
+	switch c.Op {
+	case opEQ:
+		return fmt.Sprintf("%s.%sEQ(*%s)", pkg, camel, c.Column)
+	case opNEQ:
+		return fmt.Sprintf("%s.%sNEQ(*%s)", pkg, camel, c.Column)
+	case opGT:
+		return fmt.Sprintf("%s.%sGT(*%s)", pkg, camel, c.Column)
+	case opGTE:
+		return fmt.Sprintf("%s.%sGTE(*%s)", pkg, camel, c.Column)
+	case opLT:
+		return fmt.Sprintf("%s.%sLT(*%s)", pkg, camel, c.Column)
+	case opLTE:
+		return fmt.Sprintf("%s.%sLTE(*%s)", pkg, camel, c.Column)
+	case opLike:
+		return fmt.Sprintf("%s.%sContains(*%s)", pkg, camel, c.Column)
+	default:
+		return fmt.Sprintf("%s.%sEQ(*%s)", pkg, camel, c.Column)
+	}
 }
 
 // buildEntPredicate generates a single ent predicate call.
-func buildEntPredicate(c condition, modelSnake string) string {
+func buildEntPredicate(c condition, entPkgName string) string {
 	camel := toCamelCase(c.Column)
-	pkg := modelSnake // ent package name is snake_case of model
+	pkg := entPkgName
 
 	switch c.Op {
 	case opEQ:
@@ -1131,6 +1312,52 @@ func buildEntPredicate(c condition, modelSnake string) string {
 		return fmt.Sprintf("%s.%sGTE(%sMin), %s.%sLTE(%sMax)", pkg, camel, c.Column, pkg, camel, c.Column)
 	default:
 		return fmt.Sprintf("%s.%sEQ(%s)", pkg, camel, c.Column)
+	}
+}
+
+// buildOrderBy generates ent Order() call from parsed ORDER BY clause.
+// e.g. "uac.id ASC" → Order(iamuserappcid.ByID())
+// e.g. "id DESC" → Order(iamuserappcid.ByID(sql.OrderDesc()))
+func buildOrderBy(b *strings.Builder, p *parsedSQL, entPkgName string) {
+	if p.OrderBy == "" {
+		return
+	}
+
+	// Parse ORDER BY parts: "col1 ASC, col2 DESC"
+	parts := strings.Split(p.OrderBy, ",")
+	var orderCalls []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		tokens := strings.Fields(part)
+		if len(tokens) == 0 {
+			continue
+		}
+
+		col := tokens[0]
+		dir := "ASC"
+		if len(tokens) >= 2 {
+			dir = strings.ToUpper(tokens[1])
+		}
+
+		// Strip table alias prefix (e.g. "uac.id" → "id")
+		if idx := strings.Index(col, "."); idx >= 0 {
+			col = col[idx+1:]
+		}
+
+		camel := toCamelCase(col)
+		if dir == "DESC" {
+			orderCalls = append(orderCalls, fmt.Sprintf("%s.By%s(sql.OrderDesc())", entPkgName, camel))
+		} else {
+			orderCalls = append(orderCalls, fmt.Sprintf("%s.By%s()", entPkgName, camel))
+		}
+	}
+
+	if len(orderCalls) > 0 {
+		fmt.Fprintf(b, "\t\tOrder(%s).\n", strings.Join(orderCalls, ", "))
 	}
 }
 
@@ -1223,6 +1450,16 @@ func appendToImpl(filePath, methodName, body string) {
 		fmt.Printf("  ⚠ Failed to write %s: %v\n", filePath, err)
 		return
 	}
+
+	// Ensure logx import exists if the generated code uses logx.Field
+	if strings.Contains(body, "logx.Field(") {
+		ensureImport(filePath, "github.com/zeromicro/go-zero/core/logx")
+	}
+	// Ensure ent dialect/sql import if using sql.OrderDesc()
+	if strings.Contains(body, "sql.OrderDesc()") {
+		ensureImport(filePath, "entgo.io/ent/dialect/sql")
+	}
+
 	fmt.Printf("  → Appended %s to %s\n", methodName, filePath)
 }
 

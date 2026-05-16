@@ -227,7 +227,7 @@ func TestGenerateMethodName_UpdateSet(t *testing.T) {
 			{Column: "id", Op: opEQ},
 		},
 	}
-	assert.Equal(t, "UpdateStatusAndNameById", generateMethodName(p))
+	assert.Equal(t, "UpdateStatusAndNameByID", generateMethodName(p))
 }
 
 func TestGenerateMethodName_DeleteBy(t *testing.T) {
@@ -238,7 +238,7 @@ func TestGenerateMethodName_DeleteBy(t *testing.T) {
 			{Column: "status", Op: opIN},
 		},
 	}
-	assert.Equal(t, "DeleteByUserIdAndStatusIn", generateMethodName(p))
+	assert.Equal(t, "DeleteByUserIDAndStatusIn", generateMethodName(p))
 }
 
 func TestGenerateMethodName_InsertTable(t *testing.T) {
@@ -256,7 +256,7 @@ func TestGenerateMethodName_SelectWithIN(t *testing.T) {
 			{Column: "id", Op: opIN},
 		},
 	}
-	assert.Equal(t, "FindByIdIn", generateMethodName(p))
+	assert.Equal(t, "FindByIDIn", generateMethodName(p))
 }
 
 func TestGenerateMethodName_SelectWithBetween(t *testing.T) {
@@ -304,7 +304,7 @@ func TestBuildEntPredicate(t *testing.T) {
 		{condition{Column: "status", Op: opEQ}, "user", "user.StatusEQ(status)"},
 		{condition{Column: "age", Op: opGTE}, "user", "user.AgeGTE(age)"},
 		{condition{Column: "name", Op: opLike}, "user", "user.NameContains(name)"},
-		{condition{Column: "id", Op: opIN}, "user", "user.IdIn(idList...)"},
+		{condition{Column: "id", Op: opIN}, "user", "user.IDIn(idList...)"},
 		{condition{Column: "deleted_at", Op: opIsNull}, "user", "user.DeletedAtIsNil()"},
 		{condition{Column: "email", Op: opIsNotNull}, "user", "user.EmailNotNil()"},
 		{condition{Column: "created_at", Op: opBetween}, "user", "user.CreatedAtGTE(created_atMin), user.CreatedAtLTE(created_atMax)"},
@@ -354,4 +354,78 @@ func TestParseSQL_MultipleOperators(t *testing.T) {
 	assert.Equal(t, opNEQ, p.Conditions[2].Op)
 	assert.Equal(t, opGTE, p.Conditions[3].Op)
 	assert.Equal(t, opLT, p.Conditions[4].Op)
+}
+
+// ── Optional condition tests ──
+
+func TestParseSQL_OptionalCondition(t *testing.T) {
+	sql := `SELECT * FROM user WHERE status = ? AND (? IS NULL OR uid = ?)`
+	p, err := parseSQL(sql)
+	require.NoError(t, err)
+
+	assert.Len(t, p.Conditions, 2)
+	// Optional condition is parsed first (pre-processing)
+	assert.Equal(t, "uid", p.Conditions[0].Column)
+	assert.Equal(t, opEQ, p.Conditions[0].Op)
+	assert.True(t, p.Conditions[0].Optional)
+
+	assert.Equal(t, "status", p.Conditions[1].Column)
+	assert.Equal(t, opEQ, p.Conditions[1].Op)
+	assert.False(t, p.Conditions[1].Optional)
+}
+
+func TestParseSQL_OptionalLikeConcat(t *testing.T) {
+	sql := `SELECT * FROM user WHERE (? IS NULL OR account LIKE CONCAT('%', ?, '%'))`
+	p, err := parseSQL(sql)
+	require.NoError(t, err)
+
+	assert.Len(t, p.Conditions, 1)
+	assert.Equal(t, "account", p.Conditions[0].Column)
+	assert.Equal(t, opLike, p.Conditions[0].Op)
+	assert.True(t, p.Conditions[0].Optional)
+}
+
+func TestParseSQL_LikeConcat(t *testing.T) {
+	sql := `SELECT * FROM user WHERE name LIKE CONCAT('%', ?, '%')`
+	p, err := parseSQL(sql)
+	require.NoError(t, err)
+
+	assert.Len(t, p.Conditions, 1)
+	assert.Equal(t, opLike, p.Conditions[0].Op)
+	assert.Equal(t, "name", p.Conditions[0].Column)
+}
+
+func TestParseSQL_JoinWithOptionalConditions(t *testing.T) {
+	sql := `SELECT uac.*, u.* FROM iam_user_app_cid uac JOIN iam_user u ON u.uid = uac.uid WHERE uac.app_code = ? AND uac.cid = ? AND (? IS NULL OR u.uid = ?) AND (? IS NULL OR u.account LIKE CONCAT('%', ?, '%')) ORDER BY uac.id ASC`
+	p, err := parseSQL(sql)
+	require.NoError(t, err)
+
+	assert.Equal(t, "iam_user_app_cid", p.PrimaryTable)
+	assert.Equal(t, "uac", p.PrimaryAlias)
+	assert.Len(t, p.Joins, 1)
+	assert.Equal(t, "iam_user", p.Joins[0].Table)
+	assert.Equal(t, "u", p.Joins[0].Alias)
+
+	// Should have 4 conditions: 2 optional (parsed first) + 2 normal
+	assert.Len(t, p.Conditions, 4)
+
+	// Optional conditions first
+	assert.True(t, p.Conditions[0].Optional)
+	assert.Equal(t, "uid", p.Conditions[0].Column)
+	assert.Equal(t, "u", p.Conditions[0].Alias)
+
+	assert.True(t, p.Conditions[1].Optional)
+	assert.Equal(t, "account", p.Conditions[1].Column)
+	assert.Equal(t, "u", p.Conditions[1].Alias)
+
+	// Normal conditions
+	assert.False(t, p.Conditions[2].Optional)
+	assert.Equal(t, "app_code", p.Conditions[2].Column)
+	assert.Equal(t, "uac", p.Conditions[2].Alias)
+
+	assert.False(t, p.Conditions[3].Optional)
+	assert.Equal(t, "cid", p.Conditions[3].Column)
+	assert.Equal(t, "uac", p.Conditions[3].Alias)
+
+	assert.Equal(t, "uac.id ASC", p.OrderBy)
 }
