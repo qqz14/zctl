@@ -178,6 +178,17 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 		return err
 	}
 
+	// ── 步骤 5-9：一次性脚手架（desc / errcode / test skeleton / model / consts / desc proto）──
+	// 与 DAO 是否首次生成保持一致：
+	//   - DAO 之前不存在（首次）→ 全套生成
+	//   - DAO 已存在（非首次）→ 全部跳过，让 desc 成为后续 logic/consts/model 的唯一权威源
+	//     用户可以放心删除 desc / logic / pkg/model / pkg/consts / pkg/errcode 中任意文件，
+	//     重跑不会被找回；如需强制重建请用 --overwrite。
+	if daoPreExisted && !g.Overwrite {
+		fmt.Printf("  ⊘ DAO already existed for %s, skipping scaffold generation (desc/errcode/model/consts/test) — use --overwrite to force\n", schema.Name)
+		return nil
+	}
+
 	// 5. Generate errcode module file
 	if err := genModuleErrcode(g, outputDir, modulePath, schema); err != nil {
 		return err
@@ -199,13 +210,8 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 	}
 
 	// 9. Generate desc/{group}/{model_lower}.proto
-	// 只在首次（DAO 之前不存在）或 --overwrite 时生成 proto
-	if daoPreExisted && !g.Overwrite {
-		fmt.Printf("  ⊘ DAO already existed for %s, skipping proto generation (use --overwrite to force)\n", schema.Name)
-	} else {
-		if err := genDescProto(g, outputDir, schema); err != nil {
-			return err
-		}
+	if err := genDescProto(g, outputDir, schema); err != nil {
+		return err
 	}
 
 	return nil
