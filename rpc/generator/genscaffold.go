@@ -133,7 +133,8 @@ import (
 // Use WithGRPC() to override for 401/403 etc.
 type Err struct {
 	code     int        // business error code (e.g. 95001)
-	msg      string     // error message
+	msg      string     // error message (may be i18n-translated)
+	origin   string     // original error message before i18n translation
 	grpcCode codes.Code // gRPC status code, default 0 = OK → HTTP 200
 }
 
@@ -168,10 +169,25 @@ func (e *Err) GRPCCode() codes.Code {
 	return e.grpcCode
 }
 
+// Origin returns the original error message before i18n translation.
+// Returns empty string if not translated.
+func (e *Err) Origin() string {
+	if e == nil {
+		return ""
+	}
+	return e.origin
+}
+
 // WithGRPC sets the gRPC status code for HTTP status override.
 // Usage: errcode.Newf(95003, "token expired").WithGRPC(codes.Unauthenticated) → HTTP 401
 func (e *Err) WithGRPC(c codes.Code) *Err {
 	e.grpcCode = c
+	return e
+}
+
+// WithOrigin preserves the original error message before i18n translation.
+func (e *Err) WithOrigin(origin string) *Err {
+	e.origin = origin
 	return e
 }
 
@@ -399,6 +415,7 @@ func MetaValue(ctx context.Context, keys ...string) string {
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/zeromicro/go-zero/core/logx"
 )
@@ -421,6 +438,29 @@ func IDField(id interface{}) logx.LogField {
 // CountField creates a logx field for count.
 func CountField(count int) logx.LogField {
 	return logx.Field("count", count)
+}
+
+// KV creates a logx field for any key-value pair.
+func KV(key string, val interface{}) logx.LogField {
+	return logx.Field(key, val)
+}
+
+// Infof logs a formatted info message with module context.
+// Usage: ctxutil.Infof(ctx, "user %s login from %s", username, ip)
+func Infof(ctx context.Context, format string, args ...interface{}) {
+	L(ctx).Info(fmt.Sprintf(format, args...))
+}
+
+// Errorf logs a formatted error message with module context.
+// Usage: ctxutil.Errorf(ctx, "failed to create user %s: %v", username, err)
+func Errorf(ctx context.Context, format string, args ...interface{}) {
+	L(ctx).Error(fmt.Sprintf(format, args...))
+}
+
+// Slowf logs a formatted slow message with module context.
+// Usage: ctxutil.Slowf(ctx, "query took %dms for user %s", cost, uid)
+func Slowf(ctx context.Context, format string, args ...interface{}) {
+	L(ctx).Slow(fmt.Sprintf(format, args...))
 }
 `)
 }
@@ -734,6 +774,7 @@ import (
 
 // I18nInterceptor translates business error messages to the client's language.
 // Input and output are both *errcode.Err — it only replaces the msg field.
+// The original msg is preserved via WithOrigin() for logging purposes.
 //
 // For non-errcode errors (should not happen if LogInterceptor enforces),
 // wraps as InternalError with translated message.
@@ -749,7 +790,7 @@ func I18nInterceptor() grpc.UnaryServerInterceptor {
 		// *errcode.Err → translate msg, return *errcode.Err
 		if e, ok := errcode.ExtractErr(err); ok {
 			if msg := i18n.TranslateErrcode(lang, e.Code()); msg != "" {
-				return nil, errcode.Newf(e.Code(), msg).WithGRPC(e.GRPCCode())
+				return nil, errcode.Newf(e.Code(), msg).WithGRPC(e.GRPCCode()).WithOrigin(e.Msg())
 			}
 			return nil, err
 		}
@@ -864,20 +905,26 @@ func LogInterceptor() grpc.UnaryServerInterceptor {
 		}
 
 		// ── Log: business error vs status error ──
+		origin := e.Origin() // original error msg before i18n translation
+
 		if errcode.IsOKCode(grpcCode) {
 			payload, _ := json.Marshal(struct {
 				Code int    `+"`"+`json:"code"`+"`"+`
 				Msg  string `+"`"+`json:"msg"`+"`"+`
 			}{Code: bizCode, Msg: e.Msg()})
-			logx.WithContext(ctx).Infow("rpc biz_error",
+			fields := []logx.LogField{
 				logx.Field("method", info.FullMethod),
 				logx.Field("error", string(payload)),
 				logx.Field("cost(ms)", duration.Milliseconds()),
 				logx.Field("client_ip", clientIP),
 				logx.Field("request", reqStr),
-			)
+			}
+			if origin != "" {
+				fields = append(fields, logx.Field("origin", origin))
+			}
+			logx.WithContext(ctx).Infow("rpc biz_error", fields...)
 		} else {
-			logx.WithContext(ctx).Errorw("rpc status_error",
+			fields := []logx.LogField{
 				logx.Field("method", info.FullMethod),
 				logx.Field("code", bizCode),
 				logx.Field("grpc_code", grpcCode.String()),
@@ -886,7 +933,11 @@ func LogInterceptor() grpc.UnaryServerInterceptor {
 				logx.Field("client_ip", clientIP),
 				logx.Field("lang", lang),
 				logx.Field("request", reqStr),
-			)
+			}
+			if origin != "" {
+				fields = append(fields, logx.Field("origin", origin))
+			}
+			logx.WithContext(ctx).Errorw("rpc status_error", fields...)
 		}
 
 		return nil, err

@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -113,6 +114,40 @@ func (d *Driver) Tx(ctx context.Context) (dialect.Tx, error) {
 	return &Tx{Tx: tx, ctx: ctx}, nil
 }
 
+// ExecContext exposes the underlying driver's ExecContext for raw-SQL DAO calls
+// (e.g. INSERT ... ON DUPLICATE KEY UPDATE batch). Without this method, ent's
+// generated client.ExecContext type-asserts c.driver against
+// interface{ ExecContext(...) } and fails because *Driver only inherits
+// dialect.Driver's method set.
+func (d *Driver) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	ex, ok := d.Driver.(interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("entlog.Driver: underlying driver does not support ExecContext")
+	}
+	start := time.Now()
+	res, err := ex.ExecContext(ctx, query, args...)
+	cost := time.Since(start)
+	logExecRaw(ctx, query, args, res, cost, err)
+	return res, err
+}
+
+// QueryContext exposes the underlying driver's QueryContext for raw-SQL DAO calls.
+func (d *Driver) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	q, ok := d.Driver.(interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("entlog.Driver: underlying driver does not support QueryContext")
+	}
+	start := time.Now()
+	rows, err := q.QueryContext(ctx, query, args...)
+	cost := time.Since(start)
+	logQuery(ctx, query, args, cost, err)
+	return rows, err
+}
+
 // ─── Tx ──────────────────────────────────────────────────────────────────────────
 
 type Tx struct {
@@ -144,6 +179,39 @@ func (t *Tx) Commit() error {
 func (t *Tx) Rollback() error {
 	logx.WithContext(t.ctx).Infow("[SQL] tx rollback")
 	return t.Tx.Rollback()
+}
+
+// ExecContext exposes the underlying tx's ExecContext for raw-SQL DAO calls
+// inside a transaction. Without this method, ent's generated txDriver
+// type-asserts tx against interface{ ExecContext(...) } and fails because
+// *Tx only inherits dialect.Tx's method set.
+func (t *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	ex, ok := t.Tx.(interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("entlog.Tx: underlying tx does not support ExecContext")
+	}
+	start := time.Now()
+	res, err := ex.ExecContext(ctx, query, args...)
+	cost := time.Since(start)
+	logExecRaw(ctx, query, args, res, cost, err)
+	return res, err
+}
+
+// QueryContext exposes the underlying tx's QueryContext for raw-SQL DAO calls inside a transaction.
+func (t *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	q, ok := t.Tx.(interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("entlog.Tx: underlying tx does not support QueryContext")
+	}
+	start := time.Now()
+	rows, err := q.QueryContext(ctx, query, args...)
+	cost := time.Since(start)
+	logQuery(ctx, query, args, cost, err)
+	return rows, err
 }
 
 // ─── Query logging ───────────────────────────────────────────────────────────────
@@ -204,6 +272,35 @@ func extractRowsAffected(v any) (int64, bool) {
 	}
 	return 0, false
 }
+
+// logExecRaw 记录原生 SQL（ExecContext）执行日志，使用 sql.Result 提取 rows_affected。
+func logExecRaw(ctx context.Context, query string, args any, res sql.Result, cost time.Duration, err error) {
+	log := logx.WithContext(ctx)
+	var ra int64
+	hasRA := false
+	if err == nil && res != nil {
+		if n, e := res.RowsAffected(); e == nil {
+			ra, hasRA = n, true
+		}
+	}
+	if err != nil {
+		if hasRA {
+			log.Error(fmt.Sprintf("[SQL] exec rows_affected[%d] error=%s cost[%s] sql=%s args=%v",
+				ra, err.Error(), cost.Truncate(time.Millisecond), query, args))
+		} else {
+			log.Error(fmt.Sprintf("[SQL] exec error=%s cost[%s] sql=%s args=%v",
+				err.Error(), cost.Truncate(time.Millisecond), query, args))
+		}
+		return
+	}
+	if hasRA {
+		log.Info(fmt.Sprintf("[SQL] exec rows_affected[%d] cost[%s] sql=%s args=%v",
+			ra, cost.Truncate(time.Millisecond), query, args))
+	} else {
+		log.Info(fmt.Sprintf("[SQL] exec cost[%s] sql=%s args=%v",
+			cost.Truncate(time.Millisecond), query, args))
+	}
+}
 `
 
 func writeEntlog(abs string) error {
@@ -213,7 +310,23 @@ func writeEntlog(abs string) error {
 	}
 	target := filepath.Join(dir, "entlog.go")
 	if pathx.FileExists(target) {
-		return nil
+		// Auto-upgrade: older entlog templates don't expose ExecContext/QueryContext
+		// on Driver/Tx, which makes ent's generated client.ExecContext (and
+		// txDriver.ExecContext) fall back to "Driver.ExecContext is not supported"
+		// / "Tx.ExecContext is not supported" — breaking any DAO that uses raw SQL
+		// (e.g. INSERT ... ON DUPLICATE KEY UPDATE batches inside a transaction).
+		// Only overwrite when the existing file is the legacy version that lacks
+		// the ExecContext passthrough. User-customized files that already added it
+		// are left untouched.
+		existing, err := os.ReadFile(target)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(existing, []byte("func (d *Driver) ExecContext(")) ||
+			bytes.Contains(existing, []byte("func (t *Tx) ExecContext(")) {
+			return nil
+		}
+		fmt.Println("[zctl] upgrading internal/dao/entlog/entlog.go (adds ExecContext/QueryContext passthrough).")
 	}
 	return os.WriteFile(target, []byte(entlogContent), 0644)
 }

@@ -237,18 +237,30 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 	// Collect unique fields (for GetByXxx / UpdateByXxx)
 	uniqueFields := collectUniqueFields(schema)
 
+	// Collect composite unique indexes (for GetByXxxYyyZzz)
+	compositeIndexes := collectCompositeUniqueIndexes(schema)
+
 	// Collect indexed fields for ListFilter (unique fields + fields with explicit indexes)
 	indexedFields := collectIndexedFields(schema)
 
 	// Check if soft delete is supported (has deleted_at field)
 	hasSoftDelete := hasDeletedAtField(schema)
 
-	// Build GetByXxx methods
+	// Build GetByXxx methods (single unique field + composite unique indexes)
 	var getMethods strings.Builder
 	for _, uf := range uniqueFields {
 		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&getMethods, "\tGetBy%s(ctx context.Context, %s %s) (*ent.%s, error)\n", camel, uf.Name, goType, modelName)
+	}
+	for _, ci := range compositeIndexes {
+		methodName := ci.MethodName(fieldMap)
+		var params []string
+		for _, f := range ci.Fields {
+			goType := mapEntFieldTypeToGo(f)
+			params = append(params, fmt.Sprintf("%s %s", f.Name, goType))
+		}
+		fmt.Fprintf(&getMethods, "\tGetBy%s(ctx context.Context, %s) (*ent.%s, error)\n", methodName, strings.Join(params, ", "), modelName)
 	}
 
 	// Build UpdateByXxx methods
@@ -763,11 +775,16 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	modelName := schema.Name
 	entPkg := generator.EntPkg(schema.Name)
 	uniqueFields := collectUniqueFields(schema)
+	compositeIndexes := collectCompositeUniqueIndexes(schema)
 	indexedFields := collectIndexedFields(schema)
 	hasSoftDelete := hasDeletedAtField(schema)
 
-	// Build field setter lines for Create and Update
+	// Build field setter lines for Create and Update (excluding base fields + deleted_at)
 	var createSetters, updateSetters strings.Builder
+	// For raw SQL: column names, placeholders, UPDATE clauses, and data.Xxx args
+	var sqlColumns, sqlPlaceholders []string
+	var sqlUpdateClauses []string
+	var sqlArgs []string
 	for _, f := range schema.Fields {
 		if isBaseField(f.Name) {
 			continue
@@ -777,9 +794,6 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		// They only have Set/Append/Clear. Use Set even if Optional/Nillable.
 		isJSON := f.Info != nil && f.Info.Type == field.TypeJSON
 		if (f.Optional || f.Nillable) && !isJSON {
-			// For Nillable fields, the ent struct field is already a pointer (*T).
-			// SetNillable expects *T, so pass data.Field directly (not &data.Field).
-			// For Optional-only (not Nillable) fields, the struct field is T, so use &data.Field.
 			if f.Nillable {
 				fmt.Fprintf(&createSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
 				fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
@@ -791,6 +805,30 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 			fmt.Fprintf(&createSetters, "\t\tSet%s(data.%s).\n", camel, camel)
 			fmt.Fprintf(&updateSetters, "\t\tSet%s(data.%s).\n", camel, camel)
 		}
+		// For raw SQL generation
+		sqlColumns = append(sqlColumns, f.Name)
+		sqlPlaceholders = append(sqlPlaceholders, "?")
+		sqlArgs = append(sqlArgs, "data."+camel)
+		// ON DUPLICATE KEY UPDATE: restore field only if deleted_at IS NOT NULL
+		sqlUpdateClauses = append(sqlUpdateClauses, fmt.Sprintf("  %s = IF(deleted_at IS NOT NULL, VALUES(%s), %s)", f.Name, f.Name, f.Name))
+	}
+
+	// Determine the first composite unique index for upsert query (if exists)
+	// This is used in Create's upsert logic to find existing records.
+	var upsertWhereClause string
+	if hasSoftDelete && len(compositeIndexes) > 0 {
+		ci := compositeIndexes[0]
+		var whereParts []string
+		for _, f := range ci.Fields {
+			camel := entFieldName(fieldMap, f.Name)
+			whereParts = append(whereParts, fmt.Sprintf("\t\t\t%s.%sEQ(data.%s),", entPkg, camel, camel))
+		}
+		upsertWhereClause = strings.Join(whereParts, "\n")
+	} else if hasSoftDelete && len(uniqueFields) > 0 {
+		// Fallback to first single unique field
+		uf := uniqueFields[0]
+		camel := entFieldName(fieldMap, uf.Name)
+		upsertWhereClause = fmt.Sprintf("\t\t\t%s.%sEQ(data.%s),", entPkg, camel, camel)
 	}
 
 	var b strings.Builder
@@ -814,49 +852,135 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	fmt.Fprintf(&b, "func New%sOceanBaseDao(client *ent.Client) dao.%sDao {\n\treturn &%sOceanBaseDao{cli: client.%s}\n}\n\n", modelName, modelName, entPkg, modelName)
 	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) WithTx(tx *ent.Tx) dao.%sDao {\n\treturn &%sOceanBaseDao{cli: tx.%s}\n}\n\n", entPkg, modelName, entPkg, modelName)
 
-	// Create
-	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
-	fmt.Fprintf(&b, "\tresult, err := d.cli.Create().\n%s\t\tSave(ctx)\n", createSetters.String())
-	fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
-	fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n\t}\n", modelName)
-	fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName)
+	// Create — raw SQL for soft-delete tables (1 IO), ent Create for others
+	tableName := generator.FileSnake(schema.Name)
+	if hasSoftDelete && upsertWhereClause != "" {
+		// Build the raw SQL string
+		allCols := append(sqlColumns, "created_at", "updated_at")
+		allPlaceholders := append(sqlPlaceholders, "?", "?")
+		allUpdateClauses := append(sqlUpdateClauses,
+			"  deleted_at = IF(deleted_at IS NOT NULL, NULL, deleted_at)",
+			"  updated_at = VALUES(updated_at)",
+		)
 
-	// GetByID
+		fmt.Fprintf(&b, "// Create 创建记录（幂等，1 次 IO）。\n")
+		fmt.Fprintf(&b, "//   - 新建：直接 INSERT。\n")
+		fmt.Fprintf(&b, "//   - 唯一键冲突且已软删（deleted_at IS NOT NULL）：恢复记录。\n")
+		fmt.Fprintf(&b, "//   - 唯一键冲突且活跃：不做任何变更（幂等）。\n")
+		fmt.Fprintf(&b, "//\n")
+		fmt.Fprintf(&b, "// 使用 id=LAST_INSERT_ID(id) 确保任何情况下都能通过 LastInsertId 拿到正确主键。\n")
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
+		fmt.Fprintf(&b, "\tnow := time.Now().UTC()\n\n")
+		fmt.Fprintf(&b, "\tconst sql = `\nINSERT INTO %s (%s)\nVALUES (%s)\nON DUPLICATE KEY UPDATE\n  id = LAST_INSERT_ID(id),\n%s\n`\n\n",
+			tableName,
+			strings.Join(allCols, ", "),
+			strings.Join(allPlaceholders, ", "),
+			strings.Join(allUpdateClauses, ",\n"),
+		)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.ExecContext(ctx, sql,\n\t\t%s, now, now,\n\t)\n", strings.Join(sqlArgs, ", "))
+		fmt.Fprintf(&b, "\tif err != nil {\n")
+		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n", modelName)
+		fmt.Fprintf(&b, "\t}\n\n")
+		fmt.Fprintf(&b, "\tid, _ := result.LastInsertId()\n")
+		fmt.Fprintf(&b, "\tdata.ID = int(id)\n")
+		fmt.Fprintf(&b, "\tdata.CreatedAt = now\n")
+		fmt.Fprintf(&b, "\tdata.UpdatedAt = now\n")
+		fmt.Fprintf(&b, "\treturn data, nil\n}\n\n")
+	} else {
+		// Plain create (no soft delete or no unique key)
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.Create().\n%s\t\tSave(ctx)\n", createSetters.String())
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName)
+	}
+
+	// GetByID — with soft-delete filter
 	fmt.Fprintf(&b, "// ──── Get single record ────\n\n")
-	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id int) (*ent.%s, error) {\n", entPkg, modelName)
-	fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, id)\n")
-	fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
-	fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
-	fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
-	fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
+	if hasSoftDelete {
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id int) (*ent.%s, error) {\n", entPkg, modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.ID(id), %s.DeletedAtIsNil()).Only(ctx)\n", entPkg, entPkg)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
+	} else {
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id int) (*ent.%s, error) {\n", entPkg, modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, id)\n")
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
+	}
 
-	// GetByXxx for each unique field
+	// GetByXxx for each single unique field — with soft-delete filter
 	for _, uf := range uniqueFields {
 		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetBy%s(ctx context.Context, %s %s) (*ent.%s, error) {\n", entPkg, camel, uf.Name, goType, modelName)
-		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
+		if hasSoftDelete {
+			fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.%sEQ(%s), %s.DeletedAtIsNil()).Only(ctx)\n", entPkg, camel, uf.Name, entPkg)
+		} else {
+			fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
+		}
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetBy%s failed\", ctxutil.ErrField(err))\n", modelName, camel)
 		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetBy%s %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, camel)
 	}
 
-	// UpdateByID
-	fmt.Fprintf(&b, "// ──── Update single record ────\n\n")
-	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
-	fmt.Fprintf(&b, "\tresult, err := d.cli.UpdateOneID(data.ID).\n%s\t\tSave(ctx)\n", updateSetters.String())
-	fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t\t}\n", modelName, modelName)
-	fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateByID failed\", ctxutil.IDField(data.ID), ctxutil.ErrField(err))\n", modelName)
-	fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
-	fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateByID ok\", ctxutil.IDField(data.ID))\n\treturn result, nil\n}\n\n", modelName)
+	// GetByXxxYyyZzz for each composite unique index — with soft-delete filter
+	for _, ci := range compositeIndexes {
+		methodName := ci.MethodName(fieldMap)
+		var params, whereParts []string
+		for _, f := range ci.Fields {
+			camel := entFieldName(fieldMap, f.Name)
+			goType := mapEntFieldTypeToGo(f)
+			params = append(params, fmt.Sprintf("%s %s", f.Name, goType))
+			whereParts = append(whereParts, fmt.Sprintf("%s.%sEQ(%s)", entPkg, camel, f.Name))
+		}
+		if hasSoftDelete {
+			whereParts = append(whereParts, fmt.Sprintf("%s.DeletedAtIsNil()", entPkg))
+		}
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetBy%s(ctx context.Context, %s) (*ent.%s, error) {\n", entPkg, methodName, strings.Join(params, ", "), modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s).Only(ctx)\n", strings.Join(whereParts, ", "))
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found by composite key\")\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetBy%s failed\", ctxutil.ErrField(err))\n", modelName, methodName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetBy%s: %%v\", err)\n\t}\n", modelName, methodName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, methodName)
+	}
 
-	// UpdateByXxx for each unique field
+	// UpdateByID — with soft-delete filter
+	fmt.Fprintf(&b, "// ──── Update single record ────\n\n")
+	if hasSoftDelete {
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
+		fmt.Fprintf(&b, "\taffected, err := d.cli.Update().\n\t\tWhere(%s.ID(data.ID), %s.DeletedAtIsNil()).\n%s\t\tSave(ctx)\n", entPkg, entPkg, updateSetters.String())
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateByID failed\", ctxutil.IDField(data.ID), ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, data.ID)\n")
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.UpdateByID refetch: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateByID ok\", ctxutil.IDField(data.ID))\n\treturn result, nil\n}\n\n", modelName)
+	} else {
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
+		fmt.Fprintf(&b, "\tresult, err := d.cli.UpdateOneID(data.ID).\n%s\t\tSave(ctx)\n", updateSetters.String())
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateByID failed\", ctxutil.IDField(data.ID), ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateByID ok\", ctxutil.IDField(data.ID))\n\treturn result, nil\n}\n\n", modelName)
+	}
+
+	// UpdateByXxx for each unique field — with soft-delete filter
 	for _, uf := range uniqueFields {
 		camel := entFieldName(fieldMap, uf.Name)
 		goType := mapEntFieldTypeToGo(uf)
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateBy%s(ctx context.Context, %s %s, data *ent.%s) (*ent.%s, error) {\n", entPkg, camel, uf.Name, goType, modelName, modelName)
-		fmt.Fprintf(&b, "\texisting, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
+		if hasSoftDelete {
+			fmt.Fprintf(&b, "\texisting, err := d.cli.Query().Where(%s.%sEQ(%s), %s.DeletedAtIsNil()).Only(ctx)\n", entPkg, camel, uf.Name, entPkg)
+		} else {
+			fmt.Fprintf(&b, "\texisting, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
+		}
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateBy%s query failed\", ctxutil.ErrField(err))\n", modelName, camel)
 		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.UpdateBy%s query %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
@@ -866,21 +990,25 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, camel)
 	}
 
-	// Soft delete (only if has deleted_at)
+	// Soft delete — with DeletedAtIsNil filter
 	if hasSoftDelete {
 		fmt.Fprintf(&b, "// ──── Delete (soft) ────\n\n")
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) DeleteByID(ctx context.Context, id int) error {\n", entPkg)
-		fmt.Fprintf(&b, "\t_, err := d.cli.UpdateOneID(id).\n\t\tSetDeletedAt(time.Now()).\n\t\tSave(ctx)\n")
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
-		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.DeleteByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
+		fmt.Fprintf(&b, "\taffected, err := d.cli.Update().\n\t\tWhere(%s.ID(id), %s.DeletedAtIsNil()).\n\t\tSetDeletedAt(time.Now()).\n\t\tSave(ctx)\n", entPkg, entPkg)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.DeleteByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
 		fmt.Fprintf(&b, "\t\treturn errcode.Wrapf(errcode.DBDeleteFailed, \"%s.DeleteByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.DeleteByID ok\", ctxutil.IDField(id))\n\treturn nil\n}\n\n", modelName)
 	}
 
-	// List with filter + optional pagination
+	// List with filter + optional pagination + soft-delete filter
 	fmt.Fprintf(&b, "// ──── List ────\n\n")
 	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) List(ctx context.Context, filter *dao.%sListFilter, page *model.PageInfo) ([]*ent.%s, int, error) {\n", entPkg, modelName, modelName)
-	fmt.Fprintf(&b, "\tquery := d.cli.Query()\n\n")
+	if hasSoftDelete {
+		fmt.Fprintf(&b, "\tquery := d.cli.Query().Where(%s.DeletedAtIsNil())\n\n", entPkg)
+	} else {
+		fmt.Fprintf(&b, "\tquery := d.cli.Query()\n\n")
+	}
 	fmt.Fprintf(&b, "\t// Apply filter conditions (only indexed fields).\n")
 	fmt.Fprintf(&b, "\tif filter != nil {\n")
 	for _, f := range indexedFields {
@@ -1220,14 +1348,14 @@ func collectUniqueFields(schema *load.Schema) []uniqueFieldInfo {
 }
 
 // collectIndexedFields returns fields that have indexes (unique fields + explicit index fields).
-// For ListFilter: only fields with some kind of index.
+// For ListFilter: only fields with some kind of index. Excludes deleted_at (handled by soft-delete logic).
 func collectIndexedFields(schema *load.Schema) []uniqueFieldInfo {
 	seen := make(map[string]bool)
 	var result []uniqueFieldInfo
 
 	// Unique fields are indexed
 	for _, f := range schema.Fields {
-		if f.Unique {
+		if f.Unique && f.Name != "deleted_at" {
 			result = append(result, uniqueFieldInfo{Name: f.Name, TypeName: f.Info.Type.String()})
 			seen[f.Name] = true
 		}
@@ -1236,7 +1364,7 @@ func collectIndexedFields(schema *load.Schema) []uniqueFieldInfo {
 	// Explicit indexes (from Indexes() method)
 	for _, idx := range schema.Indexes {
 		for _, col := range idx.Fields {
-			if seen[col] {
+			if seen[col] || col == "deleted_at" {
 				continue
 			}
 			// Find field info
@@ -1269,6 +1397,55 @@ func hasDeletedAtField(schema *load.Schema) bool {
 		}
 	}
 	return false
+}
+
+// compositeUniqueIndex represents a composite unique index with multiple fields.
+type compositeUniqueIndex struct {
+	Fields []uniqueFieldInfo // ordered fields in the composite index
+}
+
+// MethodName returns the Go method name suffix like "AppCodeAPIIDPermCode".
+func (c compositeUniqueIndex) MethodName(fieldMap map[string]string) string {
+	var parts []string
+	for _, f := range c.Fields {
+		parts = append(parts, entFieldName(fieldMap, f.Name))
+	}
+	return strings.Join(parts, "")
+}
+
+// collectCompositeUniqueIndexes returns composite unique indexes (Unique=true, len(Fields)>1).
+// Excludes indexes that contain deleted_at.
+func collectCompositeUniqueIndexes(schema *load.Schema) []compositeUniqueIndex {
+	var result []compositeUniqueIndex
+	for _, idx := range schema.Indexes {
+		if !idx.Unique || len(idx.Fields) <= 1 {
+			continue
+		}
+		// Skip indexes containing deleted_at
+		hasDeletedAt := false
+		for _, col := range idx.Fields {
+			if col == "deleted_at" {
+				hasDeletedAt = true
+				break
+			}
+		}
+		if hasDeletedAt {
+			continue
+		}
+		var fields []uniqueFieldInfo
+		for _, col := range idx.Fields {
+			for _, f := range schema.Fields {
+				if f.Name == col {
+					fields = append(fields, uniqueFieldInfo{Name: f.Name, TypeName: f.Info.Type.String()})
+					break
+				}
+			}
+		}
+		if len(fields) == len(idx.Fields) {
+			result = append(result, compositeUniqueIndex{Fields: fields})
+		}
+	}
+	return result
 }
 
 // mapEntFieldTypeToGo maps an ent field info to a Go type string.
@@ -1377,7 +1554,7 @@ func autoGenRpc(abs, style string) error {
 
 func isBaseField(name string) bool {
 	switch name {
-	case "id", "created_at", "updated_at", "create_time", "update_time":
+	case "id", "created_at", "updated_at", "create_time", "update_time", "deleted_at":
 		return true
 	}
 	return false
