@@ -28,9 +28,3 @@ Prometheus:
   Host: 0.0.0.0
   Port: 4000
   Path: /metrics
-
-#Telemetry:
-#  Name: {{.serviceName}}-rpc
-#  Endpoint: localhost:4317
-#  Sampler: 1.0
-#  Batcher: otlpgrpc
