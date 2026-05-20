@@ -78,6 +78,14 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 	if err := g.genGitignore(abs); err != nil {
 		return err
 	}
+	// cmd/migrate-ddl/main.go (offline DDL diff tool: ent schema vs DB → migrations/*.sql)
+	if err := g.genCmdMigrateDDL(abs, serviceName, modulePath); err != nil {
+		return err
+	}
+	// migrations/ directory placeholder (gen-ddl outputs .sql here)
+	if err := pathx.MkdirIfNotExist(filepath.Join(abs, "migrations")); err != nil {
+		return err
+	}
 	// README.md
 	if err := g.genProjectReadme(abs, serviceName, zctx); err != nil {
 		return err
@@ -1176,7 +1184,12 @@ PROJECT_STYLE=go_zero
 PROJECT_I18N=true
 
 # Ent enabled features | Ent 启用的官方特性
-ENT_FEATURE=sql/execquery,intercept
+# - sql/execquery: 暴露底层 ExecContext/QueryContext，便于自定义裸 SQL
+# - intercept:     启用 Interceptor 机制（cachex 等中间件依赖此特性）
+# - sql/upsert:    启用 Create.OnConflict / CreateBulk.OnConflict（编译为 INSERT ... ON DUPLICATE KEY UPDATE），
+#                  在 MySQL/OceanBase 下针对所有 UNIQUE KEY 冲突生效，提供原子的幂等写入语义，
+#                  适用于配置同步 / 批量导入去重 / 避免"先 Get 再 Create/Update"的竞态
+ENT_FEATURE=sql/execquery,intercept,sql/upsert
 
 # The service port | 服务端口
 PORT=%d
@@ -1248,6 +1261,13 @@ gen-ent-new: # Create new ent schema | 新建 ent schema (usage: make gen-ent-ne
 		echo "Renamed ent/schema/$$_LOWER.go → ent/schema/$$_SNAKE.go"; \
 	fi
 	@echo "Created ent schema: $(_ENT_NAME)"
+
+.PHONY: gen-ddl
+gen-ddl: # Generate DDL diff (review-only, NOT executed) | 输出 ent schema 与 DB 的差量 DDL 到 migrations/ (usage: make gen-ddl [name=add_role_cid])
+	$(eval _DDL_NAME := $(if $(name),$(name),auto))
+	@mkdir -p migrations
+	go run ./cmd/migrate-ddl -f etc/$(SERVICE_STYLE).yaml -dir migrations -name "$(_DDL_NAME)"
+	@echo "[gen-ddl] Done. Review the latest file under migrations/ before applying to prod."
 
 # Allow positional args like "make gen-ent-new User" without error
 %%:
@@ -1772,6 +1792,30 @@ make test-func func=TestCreateUserInfo pkg=./internal/logic/userinfo/user_info/.
 make help   # 查看所有可用命令
 `+"```"+`
 
+## 数据库 schema 变更（DDL）
+
+| 环境       | DDL 落地方式 |
+| ---------- | ------------ |
+| dev/stage  | 服务启动时 `+"`"+`entClient.Schema.Create()`+"`"+` 自动同步 |
+| uat/prod   | **手工执行**：`+"`"+`make gen-ddl`+"`"+` 输出差量 SQL → DBA 评审 → 人工 apply |
+
+`+"```"+`bash
+make gen-ddl                              # 默认 name=auto
+make gen-ddl name=add_role_cid_to_user_role  # 推荐：语义化命名
+# → migrations/{YYYYMMDD_HHMMSS}_{name}.sql
+`+"```"+`
+
+底层调 `+"`"+`cmd/migrate-ddl`+"`"+`，用 ent 的 `+"`"+`Schema.WriteTo(file, WithDropColumn(true), WithDropIndex(true))`+"`"+` 把 `+"`"+`ent/schema/*.go`+"`"+` 与 DB 现状的差量 DDL **写入文件**（走 `+"`"+`schema.WriteDriver`+"`"+`，物理上不会落到 DB）。
+
+**DBA 评审 checklist**：
+
+- [ ] `+"`"+`DROP COLUMN`+"`"+` 是真删字段，还是重命名？是重命名 → 改写成 `+"`"+`ALTER TABLE ... CHANGE COLUMN`+"`"+` 保留数据
+- [ ] `+"`"+`DROP INDEX`+"`"+` 在大表上是否触发慢查询，是否走 OnlineDDL / pt-osc / gh-ost
+- [ ] 唯一键列变化前是否清理重复数据（`+"`"+`GROUP BY ... HAVING COUNT(*)>1`+"`"+`）
+- [ ] 灰度顺序：先发应用代码兼容新旧 schema → apply DDL → 下线兼容代码
+
+`+"`"+`migrations/*.sql`+"`"+` 全部纳入 git，作为生产 DDL 的可追溯真相。
+
 ## 项目结构
 
 `+"```"+`
@@ -1979,7 +2023,7 @@ make gen-ent
 **注意事项**：
 - ~ent/~ 目录下除 ~ent/schema/~ 以外的所有文件 **每次都会被覆盖**，不要手动修改。
 - 修改 schema 后必须重新运行此命令。
-- 启用的 ent features 在 Makefile 的 ~ENT_FEATURE~ 变量中配置（默认 ~sql/execquery,intercept~）。
+- 启用的 ent features 在 Makefile 的 ~ENT_FEATURE~ 变量中配置（默认 ~sql/execquery,intercept,sql/upsert~）。
 
 **前置条件**：至少有一个 schema（先运行 ~make gen-ent-new name=XXX~）。
 
@@ -2582,6 +2626,176 @@ func (g *Generator) genValidateProto(abs string) error {
 		return err
 	}
 	return writeIfNotExist(filepath.Join(dir, "validate.proto"), validateProtoContent)
+}
+
+// ==================== cmd/migrate-ddl/main.go ====================
+
+// genCmdMigrateDDL writes cmd/migrate-ddl/main.go — an offline DDL diff tool.
+//
+// 设计要点：
+//   - 工具读取 etc/{svcLower}.yaml 的 DatabaseConf 拼 DSN 连 DB（与服务运行同源配置）；
+//   - 用 ent client.Schema.WriteTo(file, WithDropColumn, WithDropIndex) 把
+//     "ent/schema 真相 vs DB 现状" 的差量 DDL 写到 migrations/{stamp}_{name}.sql，
+//     底层走 schema.WriteDriver，io.Writer 透传 SQL，物理上不会写到 DB；
+//   - 显式开启 WithDropColumn / WithDropIndex：否则只能输出 ADD，重命名 / 唯一键调整等
+//     需要 DROP+ADD 的场景会丢 DROP，DBA 拿到的脚本不完整。
+//
+// 模板渲染：用 strings.ReplaceAll 替换 __SVC_LOWER__ / __MODULE_PATH__ 两个占位符；
+// 不用 fmt.Sprintf 是因为模板里大量 % 字符（%q/%v/%-30s 等）转义后极易出错。
+func (g *Generator) genCmdMigrateDDL(abs, serviceName, modulePath string) error {
+	svcLower := strings.ToLower(serviceName)
+
+	tmpl := `// Package main 提供一个【纯输出】DDL 的离线命令：
+//
+//	它会：
+//	  1) 读取 etc/__SVC_LOWER__.yaml 中的 DatabaseConf（与服务运行使用同一份配置，避免环境漂移）；
+//	  2) 用 entClient.Schema.WriteTo(file, WithDropColumn, WithDropIndex)
+//	     把 "ent schema 真相 vs 数据库当前状态" 的差量 DDL 写到一个 .sql 文件里；
+//	  3) 输出文件命名为 migrations/{YYYYMMDD_HHMMSS}_{name}.sql。
+//
+// 它不会：
+//   - 执行任何 DDL：底层走 ent 的 schema.WriteDriver，所有 SQL 都进 io.Writer，不进 DB；
+//   - 修改任何代码 / schema 文件 / 应用启动行为。
+//
+// 设计要点：
+//   - 必须显式开启 WithDropColumn / WithDropIndex：否则只能看到 "加列/加索引"，
+//     "应该删除的旧列、旧索引" 会被静默忽略，导致 DBA 拿到一份不完整的迁移脚本（典型场景：
+//     重命名字段、调整唯一键列顺序——必须 DROP+ADD 才能完整表达，不带这两个开关时漏 DROP）。
+//   - 使用方式: ` + "`" + `make gen-ddl [name=<short_desc>]` + "`" + `，name 可选，缺省为 ` + "`" + `auto` + "`" + `，详见 Makefile::gen-ddl。
+//   - 输出文件一律纳入 git，作为评审与生产回放的真相源。
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"entgo.io/ent/dialect"
+	"entgo.io/ent/dialect/sql/schema"
+
+	entsql "entgo.io/ent/dialect/sql"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/zeromicro/go-zero/core/conf"
+
+	"__MODULE_PATH__/ent"
+	"__MODULE_PATH__/internal/config"
+)
+
+// migrateConfig 只解析 DDL 输出所需字段。
+//
+// 不直接复用 internal/config.Config 的原因：
+//   - Config 内嵌 zrpc.RpcServerConf（要求 ListenOn / Etcd 等），但本工具不起 RPC 服务，
+//     强行复用会因为 ListenOn 等必填字段缺失而 panic；
+//   - 这里只需要 DatabaseConf（且字段与 internal/config.DatabaseConf 完全一致），
+//     用一个最小化结构体就够，避免无关依赖。
+type migrateConfig struct {
+	DatabaseConf config.DatabaseConf
+}
+
+func main() {
+	var (
+		cfgPath = flag.String("f", "etc/__SVC_LOWER__.yaml", "service config file (DatabaseConf is read from here)")
+		outDir  = flag.String("dir", "migrations", "output directory for generated .sql")
+		name    = flag.String("name", "auto", "short kebab/snake description (e.g. add_xxx_to_yyy); default: auto")
+	)
+	flag.Parse()
+
+	// name 仅作为输出文件名后缀，缺省时用 "auto"，方便快速生成。
+	// 仅做字符白名单校验，避免出现路径穿越/空格等。
+	if strings.TrimSpace(*name) == "" {
+		*name = "auto"
+	}
+	if !nameRe.MatchString(*name) {
+		log.Fatalf("[migrate-ddl] invalid -name=%q, allowed chars: [a-z0-9_-]", *name)
+	}
+
+	// 1) 读配置（复用 internal/config.DatabaseConf 的字段定义，保证与服务一致）
+	var c migrateConfig
+	if err := conf.Load(*cfgPath, &c); err != nil {
+		log.Fatalf("[migrate-ddl] load config %s failed: %v", *cfgPath, err)
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=UTC",
+		c.DatabaseConf.Username, c.DatabaseConf.Password,
+		c.DatabaseConf.Host, c.DatabaseConf.Port, c.DatabaseConf.DBName)
+
+	// 2) 连 DB（仅用于 inspect 当前 schema，本工具不会写 DB——见 step 4 注释）
+	drv, err := entsql.Open(dialect.MySQL, dsn)
+	if err != nil {
+		log.Fatalf("[migrate-ddl] open mysql failed: %v", err)
+	}
+	client := ent.NewClient(ent.Driver(drv))
+	defer client.Close()
+
+	// 3) 准备输出文件
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		log.Fatalf("[migrate-ddl] mkdir %s failed: %v", *outDir, err)
+	}
+	stamp := time.Now().Format("20060102_150405")
+	fname := filepath.Join(*outDir, fmt.Sprintf("%s_%s.sql", stamp, *name))
+	f, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		log.Fatalf("[migrate-ddl] open output %s failed: %v", fname, err)
+	}
+	defer f.Close()
+
+	// 头部注释：让 DBA 一眼看清楚来源、时间、警告事项
+	header := fmt.Sprintf(` + "`" + `-- ╔══════════════════════════════════════════════════════════════════╗
+-- ║ AUTO-GENERATED BY: make gen-ddl name=%-30s║
+-- ║ GENERATED AT     : %-48s║
+-- ║ SOURCE OF TRUTH  : ent/schema/*.go                                  ║
+-- ║ DROP_COLUMN/DROP_INDEX = ON  (full diff, including removals)        ║
+-- ║                                                                     ║
+-- ║ ⚠ DO NOT auto-apply this file in production.                        ║
+-- ║ ⚠ DBA must review every DROP statement before execution.            ║
+-- ║ ⚠ Rename columns appears as DROP+ADD here — manually rewrite to     ║
+-- ║   ALTER TABLE ... CHANGE COLUMN <old> <new> ... to preserve data.   ║
+-- ╚══════════════════════════════════════════════════════════════════╝
+` + "`" + `, *name, time.Now().Format(time.RFC3339))
+	if _, err := f.WriteString(header); err != nil {
+		log.Fatalf("[migrate-ddl] write header failed: %v", err)
+	}
+	headerLen := int64(len(header))
+
+	// 4) 调 ent 的 WriteTo —— 仅 diff 写文件，不执行
+	//    ent 内部用 schema.WriteDriver 包装真实 driver：
+	//    所有 SQL 都进 io.Writer，物理上不可能写到 DB（go ent 源码可查）。
+	ctx := context.Background()
+	if err := client.Schema.WriteTo(ctx, f,
+		schema.WithDropColumn(true),
+		schema.WithDropIndex(true),
+		schema.WithForeignKeys(false), // 走业务唯一键 + 软删除，不依赖物理外键
+	); err != nil {
+		log.Fatalf("[migrate-ddl] write schema diff failed: %v", err)
+	}
+
+	stat, _ := f.Stat()
+	if stat != nil && stat.Size() <= headerLen {
+		log.Printf("[migrate-ddl] ✅ no schema diff detected (DB already aligned with ent/schema)")
+		log.Printf("[migrate-ddl]    file: %s (header only, no DDL)", fname)
+		return
+	}
+	log.Printf("[migrate-ddl] ✅ DDL diff written → %s", fname)
+	log.Printf("[migrate-ddl]    review the file, then hand it to DBA for execution.")
+}
+
+var nameRe = regexp.MustCompile(` + "`" + `^[a-z0-9_-]+$` + "`" + `)
+`
+
+	content := strings.ReplaceAll(tmpl, "__SVC_LOWER__", svcLower)
+	content = strings.ReplaceAll(content, "__MODULE_PATH__", modulePath)
+
+	dir := filepath.Join(abs, "cmd", "migrate-ddl")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+	return writeIfNotExist(filepath.Join(dir, "main.go"), content)
 }
 
 // ==================== helpers ====================
