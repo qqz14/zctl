@@ -778,13 +778,16 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	compositeIndexes := collectCompositeUniqueIndexes(schema)
 	indexedFields := collectIndexedFields(schema)
 	hasSoftDelete := hasDeletedAtField(schema)
+	// hasUpdatedAt: schema is the source of truth. ent's UpdateDefault(time.Now) hook only
+	// runs on OpUpdate path; OnConflictColumns().Update(...) is OpCreate context, so
+	// updated_at is NOT auto-refreshed in the conflict branch. We must (and only must)
+	// emit `SetUpdatedAt(now)` when the schema actually has this field.
+	hasUpdatedAt := hasUpdatedAtField(schema)
 
-	// Build field setter lines for Create and Update (excluding base fields + deleted_at)
+	// Build field setter lines for Create and Update (excluding base fields + deleted_at).
+	// Immutable() fields go into createSetters only; updateSetters skips them so that
+	//身份字段（业务唯一键 / 创建人 / 创建来源 等被显式 Immutable 标记的字段）不会被 Update 覆盖。
 	var createSetters, updateSetters strings.Builder
-	// For raw SQL: column names, placeholders, UPDATE clauses, and data.Xxx args
-	var sqlColumns, sqlPlaceholders []string
-	var sqlUpdateClauses []string
-	var sqlArgs []string
 	for _, f := range schema.Fields {
 		if isBaseField(f.Name) {
 			continue
@@ -793,42 +796,31 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		// JSON fields (e.g. field.JSON("x", []string{})) do NOT have SetNillable in ent.
 		// They only have Set/Append/Clear. Use Set even if Optional/Nillable.
 		isJSON := f.Info != nil && f.Info.Type == field.TypeJSON
+		var setterLine string
 		if (f.Optional || f.Nillable) && !isJSON {
 			if f.Nillable {
-				fmt.Fprintf(&createSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
-				fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(data.%s).\n", camel, camel)
+				setterLine = fmt.Sprintf("\t\tSetNillable%s(data.%s).\n", camel, camel)
 			} else {
-				fmt.Fprintf(&createSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
-				fmt.Fprintf(&updateSetters, "\t\tSetNillable%s(&data.%s).\n", camel, camel)
+				setterLine = fmt.Sprintf("\t\tSetNillable%s(&data.%s).\n", camel, camel)
 			}
 		} else {
-			fmt.Fprintf(&createSetters, "\t\tSet%s(data.%s).\n", camel, camel)
-			fmt.Fprintf(&updateSetters, "\t\tSet%s(data.%s).\n", camel, camel)
+			setterLine = fmt.Sprintf("\t\tSet%s(data.%s).\n", camel, camel)
 		}
-		// For raw SQL generation
-		sqlColumns = append(sqlColumns, f.Name)
-		sqlPlaceholders = append(sqlPlaceholders, "?")
-		sqlArgs = append(sqlArgs, "data."+camel)
-		// ON DUPLICATE KEY UPDATE: restore field only if deleted_at IS NOT NULL
-		sqlUpdateClauses = append(sqlUpdateClauses, fmt.Sprintf("  %s = IF(deleted_at IS NOT NULL, VALUES(%s), %s)", f.Name, f.Name, f.Name))
+		createSetters.WriteString(setterLine)
+		if !f.Immutable {
+			updateSetters.WriteString(setterLine)
+		}
 	}
 
-	// Determine the first composite unique index for upsert query (if exists)
-	// This is used in Create's upsert logic to find existing records.
-	var upsertWhereClause string
+	// Determine the conflict columns (composite unique index first, fallback to first single unique field)
+	// for ent OnConflictColumns. Only meaningful when soft-delete is on.
+	var conflictColCamels []string
 	if hasSoftDelete && len(compositeIndexes) > 0 {
-		ci := compositeIndexes[0]
-		var whereParts []string
-		for _, f := range ci.Fields {
-			camel := entFieldName(fieldMap, f.Name)
-			whereParts = append(whereParts, fmt.Sprintf("\t\t\t%s.%sEQ(data.%s),", entPkg, camel, camel))
+		for _, f := range compositeIndexes[0].Fields {
+			conflictColCamels = append(conflictColCamels, entFieldName(fieldMap, f.Name))
 		}
-		upsertWhereClause = strings.Join(whereParts, "\n")
 	} else if hasSoftDelete && len(uniqueFields) > 0 {
-		// Fallback to first single unique field
-		uf := uniqueFields[0]
-		camel := entFieldName(fieldMap, uf.Name)
-		upsertWhereClause = fmt.Sprintf("\t\t\t%s.%sEQ(data.%s),", entPkg, camel, camel)
+		conflictColCamels = append(conflictColCamels, entFieldName(fieldMap, uniqueFields[0].Name))
 	}
 
 	var b strings.Builder
@@ -852,40 +844,60 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	fmt.Fprintf(&b, "func New%sOceanBaseDao(client *ent.Client) dao.%sDao {\n\treturn &%sOceanBaseDao{cli: client.%s}\n}\n\n", modelName, modelName, entPkg, modelName)
 	fmt.Fprintf(&b, "func (d *%sOceanBaseDao) WithTx(tx *ent.Tx) dao.%sDao {\n\treturn &%sOceanBaseDao{cli: tx.%s}\n}\n\n", entPkg, modelName, entPkg, modelName)
 
-	// Create — raw SQL for soft-delete tables (1 IO), ent Create for others
-	tableName := generator.FileSnake(schema.Name)
-	if hasSoftDelete && upsertWhereClause != "" {
-		// Build the raw SQL string
-		allCols := append(sqlColumns, "created_at", "updated_at")
-		allPlaceholders := append(sqlPlaceholders, "?", "?")
-		allUpdateClauses := append(sqlUpdateClauses,
-			"  deleted_at = IF(deleted_at IS NOT NULL, NULL, deleted_at)",
-			"  updated_at = VALUES(updated_at)",
-		)
+	// Create — ent OnConflictColumns for soft-delete tables (1 IO, idempotent),
+	// plain ent Create for tables without soft-delete or without unique key.
+	if hasSoftDelete && len(conflictColCamels) > 0 {
+		// Build the OnConflictColumns argument list, e.g.:
+		//     iamapi.FieldAppCode,
+		//     iamapi.FieldProtocol,
+		var conflictColLines strings.Builder
+		for _, c := range conflictColCamels {
+			fmt.Fprintf(&conflictColLines, "\t\t\t%s.Field%s,\n", entPkg, c)
+		}
 
-		fmt.Fprintf(&b, "// Create 创建记录（幂等，1 次 IO）。\n")
-		fmt.Fprintf(&b, "//   - 新建：直接 INSERT。\n")
-		fmt.Fprintf(&b, "//   - 唯一键冲突且已软删（deleted_at IS NOT NULL）：恢复记录。\n")
-		fmt.Fprintf(&b, "//   - 唯一键冲突且活跃：不做任何变更（幂等）。\n")
+		fmt.Fprintf(&b, "// Create 创建/恢复单条记录（幂等，1 次 IO）。\n")
 		fmt.Fprintf(&b, "//\n")
-		fmt.Fprintf(&b, "// 使用 id=LAST_INSERT_ID(id) 确保任何情况下都能通过 LastInsertId 拿到正确主键。\n")
+		fmt.Fprintf(&b, "// IO 路径（恒 1 次，由 dialect 翻译为 UPSERT）：\n")
+		fmt.Fprintf(&b, "//\n")
+		fmt.Fprintf(&b, "//\tINSERT INTO %s(...) VALUES (...)\n", generator.FileSnake(schema.Name))
+		if hasUpdatedAt {
+			fmt.Fprintf(&b, "//\tON DUPLICATE KEY UPDATE deleted_at=NULL, updated_at=NOW()\n")
+		} else {
+			fmt.Fprintf(&b, "//\tON DUPLICATE KEY UPDATE deleted_at=NULL\n")
+		}
+		fmt.Fprintf(&b, "//\n")
+		fmt.Fprintf(&b, "// 语义：\n")
+		fmt.Fprintf(&b, "//   - 新建：直接 INSERT。\n")
+		fmt.Fprintf(&b, "//   - 唯一键冲突且已软删（deleted_at IS NOT NULL）：恢复记录为活跃。\n")
+		if hasUpdatedAt {
+			fmt.Fprintf(&b, "//   - 唯一键冲突且活跃：deleted_at 本就 NULL，ClearDeletedAt 为 no-op；仅刷新 updated_at（幂等）。\n")
+		} else {
+			fmt.Fprintf(&b, "//   - 唯一键冲突且活跃：deleted_at 本就 NULL，ClearDeletedAt 为 no-op，整次操作幂等。\n")
+		}
+		fmt.Fprintf(&b, "//\n")
+		fmt.Fprintf(&b, "// 走 ent OpCreate hook（cachex 据 dirty fields 失效缓存）；ID 由 ent 内部\n")
+		fmt.Fprintf(&b, "// 通过 LAST_INSERT_ID(id) 技巧回填，无需二次查询。\n")
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
-		fmt.Fprintf(&b, "\tnow := time.Now().UTC()\n\n")
-		fmt.Fprintf(&b, "\tconst sql = `\nINSERT INTO %s (%s)\nVALUES (%s)\nON DUPLICATE KEY UPDATE\n  id = LAST_INSERT_ID(id),\n%s\n`\n\n",
-			tableName,
-			strings.Join(allCols, ", "),
-			strings.Join(allPlaceholders, ", "),
-			strings.Join(allUpdateClauses, ",\n"),
-		)
-		fmt.Fprintf(&b, "\tresult, err := d.cli.ExecContext(ctx, sql,\n\t\t%s, now, now,\n\t)\n", strings.Join(sqlArgs, ", "))
+		// `now` only when we will explicitly call SetUpdatedAt(now) below.
+		if hasUpdatedAt {
+			fmt.Fprintf(&b, "\tnow := time.Now()\n")
+		}
+		fmt.Fprintf(&b, "\tid, err := d.cli.Create().\n%s", createSetters.String())
+		fmt.Fprintf(&b, "\t\tOnConflictColumns(\n%s\t\t).\n", conflictColLines.String())
+		fmt.Fprintf(&b, "\t\tUpdate(func(u *ent.%sUpsert) {\n", modelName)
+		if hasUpdatedAt {
+			fmt.Fprintf(&b, "\t\t\tu.ClearDeletedAt().SetUpdatedAt(now)\n")
+		} else {
+			fmt.Fprintf(&b, "\t\t\tu.ClearDeletedAt()\n")
+		}
+		fmt.Fprintf(&b, "\t\t}).\n")
+		fmt.Fprintf(&b, "\t\tID(ctx)\n")
 		fmt.Fprintf(&b, "\tif err != nil {\n")
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
 		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n", modelName)
-		fmt.Fprintf(&b, "\t}\n\n")
-		fmt.Fprintf(&b, "\tid, _ := result.LastInsertId()\n")
-		fmt.Fprintf(&b, "\tdata.ID = int(id)\n")
-		fmt.Fprintf(&b, "\tdata.CreatedAt = now\n")
-		fmt.Fprintf(&b, "\tdata.UpdatedAt = now\n")
+		fmt.Fprintf(&b, "\t}\n")
+		fmt.Fprintf(&b, "\tdata.ID = id\n")
+		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(id))\n", modelName)
 		fmt.Fprintf(&b, "\treturn data, nil\n}\n\n")
 	} else {
 		// Plain create (no soft delete or no unique key)
@@ -1389,14 +1401,30 @@ func collectIndexedFields(schema *load.Schema) []uniqueFieldInfo {
 	return result
 }
 
-// hasDeletedAtField checks if the schema has a "deleted_at" field (for soft delete).
-func hasDeletedAtField(schema *load.Schema) bool {
+// hasField checks whether the schema declares a field with the given snake_case name.
+// Used to gate generation of code paths that depend on a specific base/special field
+// (e.g. deleted_at for soft-delete, updated_at for explicit refresh in upsert closure,
+// created_at for the timestamp column in proto Info messages).
+func hasField(schema *load.Schema, name string) bool {
 	for _, f := range schema.Fields {
-		if f.Name == "deleted_at" {
+		if f.Name == name {
 			return true
 		}
 	}
 	return false
+}
+
+// hasDeletedAtField checks if the schema has a "deleted_at" field (for soft delete).
+func hasDeletedAtField(schema *load.Schema) bool {
+	return hasField(schema, "deleted_at")
+}
+
+// hasUpdatedAtField checks if the schema has an "updated_at" field. ent's UpdateDefault
+// hook only fires on the OpUpdate path; OnConflictColumns().Update() runs OpCreate hooks
+// and therefore does NOT auto-refresh updated_at, so the upsert closure must set it explicitly
+// when (and only when) the schema actually has this field.
+func hasUpdatedAtField(schema *load.Schema) bool {
+	return hasField(schema, "updated_at")
 }
 
 // compositeUniqueIndex represents a composite unique index with multiple fields.
@@ -1614,15 +1642,24 @@ func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
 		return nil
 	}
 
-	// Build message fields from ent schema
+	// Build message fields from ent schema.
+	// Base/audit columns (id / created_at / updated_at) are emitted as the first 1~3 fields
+	// ONLY when the schema actually declares them. ent provides the `id` primary key implicitly,
+	// so id is always emitted; created_at / updated_at must be schema-driven to avoid
+	// fabricating columns the underlying table does not have (e.g. an iam_user_role schema
+	// that intentionally has no updated_at must NOT produce updated_at in proto Info).
 	var infoFields strings.Builder
 	fieldNum := 1
 	infoFields.WriteString(fmt.Sprintf("  // 主键ID\n  optional uint64 id = %d;\n", fieldNum))
 	fieldNum++
-	infoFields.WriteString(fmt.Sprintf("  // 创建时间\n  optional int64 created_at = %d;\n", fieldNum))
-	fieldNum++
-	infoFields.WriteString(fmt.Sprintf("  // 更新时间\n  optional int64 updated_at = %d;\n", fieldNum))
-	fieldNum++
+	if hasField(schema, "created_at") {
+		infoFields.WriteString(fmt.Sprintf("  // 创建时间\n  optional int64 created_at = %d;\n", fieldNum))
+		fieldNum++
+	}
+	if hasField(schema, "updated_at") {
+		infoFields.WriteString(fmt.Sprintf("  // 更新时间\n  optional int64 updated_at = %d;\n", fieldNum))
+		fieldNum++
+	}
 
 	for _, f := range schema.Fields {
 		if isBaseField(f.Name) {
