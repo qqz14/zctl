@@ -38,8 +38,12 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 		return protoFiles[i] < protoFiles[j]
 	})
 
-	svcLower := strings.ToLower(serviceName)
-	svcCamel := strings.ToUpper(serviceName[:1]) + serviceName[1:]
+	// Service-name normalization (single source of truth):
+	//   - protoPkg : proto3 package identifier (no dashes, lower)            "cs-agent-rpc" → "csagentrpc"
+	//   - svcGo    : PascalCase Go-style service identifier                  "cs-agent-rpc" → "CsAgentRpc"
+	// Both inputs `cs-agent-rpc` / `cs_agent_rpc` / `csAgentRpc` map to the same outputs.
+	protoPkg := ProtoPkg(serviceName)
+	svcGo := GoPascal(serviceName)
 
 	var messageLines strings.Builder // all message/enum definitions
 	var rpcLines strings.Builder     // all rpc method lines
@@ -143,7 +147,7 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 	buf.WriteString("// │  Source: desc/**/*.proto                                               │\n")
 	buf.WriteString("// │  To modify, edit files under desc/ then run: make gen-rpc              │\n")
 	buf.WriteString("// └────────────────────────────────────────────────────────────────────────┘\n\n")
-	buf.WriteString(fmt.Sprintf("syntax = \"proto3\";\n\npackage %s;\noption go_package = \"./%s\";\n\n", svcLower, svcLower))
+	buf.WriteString(fmt.Sprintf("syntax = \"proto3\";\n\npackage %s;\noption go_package = \"./%s\";\n\n", protoPkg, protoPkg))
 
 	// Write deduplicated imports
 	if len(importSet) > 0 {
@@ -161,7 +165,7 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 	}
 
 	buf.WriteString(messageLines.String())
-	buf.WriteString(fmt.Sprintf("service %s {\n", svcCamel))
+	buf.WriteString(fmt.Sprintf("service %s {\n", svcGo))
 	buf.WriteString(rpcLines.String())
 	buf.WriteString("}\n")
 

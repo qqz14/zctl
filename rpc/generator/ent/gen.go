@@ -47,6 +47,21 @@ func (g *GenContext) Validate() error {
 }
 
 // GenEntLogic generates CRUD logic + DAO + errcode for one or all ent schemas.
+//
+// 三阶段原子化流程（**dao 永不回滚**）：
+//   PhaseA  →  写 dao/impl/mock/hook         （独立落盘，失败直接退出，不进 tracker）
+//   PhaseB  →  写 desc proto                  （进 tracker，与 protoc 一起作为原子单元）
+//   protoc 预校验  →  merge desc/ → 根 .proto → protoc 编译
+//                     失败：tracker 回滚 PhaseB 新增 desc proto + 根 .proto + types/ 新增 pb，
+//                           **dao 保留**，PhaseC + 尾部全部跳过；用户照着 dao 改 desc 后重跑即可。
+//                     成功：继续
+//   PhaseC  →  写 errcode 模块 / test 骨架 / pkg/model / pkg/consts
+//   尾部    →  genDaoErrcodeAll / GenEnumsFromProto / GenLogicFiles / EnsureEntInfra
+//
+// 这样保证：
+//  1) dao 永远会被生成（前置物，proto 出错时也是用户排查依据）；
+//  2) protoc 失败时 desc proto 与 logic/test 都回退干净，不会出现 logic/<group>/<model>/_test.go 孤儿；
+//  3) 用户对 desc proto 的修改重跑只走 dao 跳过 + 重新校验路径，不会被覆盖。
 func GenEntLogic(g *GenContext) error {
 	fmt.Println("[zctl] Generating from ent schema...")
 
@@ -82,14 +97,20 @@ func GenEntLogic(g *GenContext) error {
 	}
 
 	// Build a map from schema name → gen.Type for StructField() access.
-	// gen.Type.Fields[i].StructField() returns the correct Go PascalCase name
-	// with initialisms (e.g. "api_code" → "APICode", "uid" → "UID").
 	nodeMap := make(map[string]*gen.Type)
 	for _, node := range schemas.Nodes {
 		nodeMap[node.Name] = node
 	}
 
-	var processedSchemas []string
+	// 收集所有要处理的 schema 上下文，供后续多阶段循环复用。
+	type schemaWithCtx struct {
+		schema        *load.Schema
+		genCtx        GenContext
+		fieldMap      map[string]string
+		daoPreExisted bool
+	}
+	var processed []schemaWithCtx
+
 	for _, s := range schemas.Schemas {
 		if g.ModelName != "all" && g.ModelName != s.Name {
 			continue
@@ -104,20 +125,113 @@ func GenEntLogic(g *GenContext) error {
 			genCtx.GroupName = generator.DirName(s.Name)
 		}
 
-		// Build field name → Go struct field name mapping from gen.Type
 		fieldMap := buildFieldMap(nodeMap[s.Name])
 
-		if err := generateForSchema(&genCtx, projectCtx, outputDir, s, fieldMap); err != nil {
+		// ── PhaseA: 生成 DAO（独立落盘，不进 tracker） ──
+		// dao 是后续所有产物的前置物：proto 出错用户也要照着 dao 改 desc，所以 dao 必须保住。
+		preExisted, err := generateSchemaPhaseA(&genCtx, projectCtx, outputDir, s, fieldMap)
+		if err != nil {
 			return err
 		}
 
-		processedSchemas = append(processedSchemas, s.Name)
-		fmt.Printf("[zctl] Generated module: %s\n", s.Name)
+		processed = append(processed, schemaWithCtx{
+			schema:        s,
+			genCtx:        genCtx,
+			fieldMap:      fieldMap,
+			daoPreExisted: preExisted,
+		})
+	}
+
+	// ── PhaseB: 生成 desc proto（进 tracker，与 protoc 一起作为原子单元） ──
+	// 仅追踪 desc/ 与 types/，dao 保留不动。根 .proto 单独通过 trackedRootProto 处理。
+	tracker := newFileTracker(
+		filepath.Join(outputDir, "desc"),
+		filepath.Join(outputDir, "types"),
+	)
+	tracker.snapshot()
+
+	rootProtoCandidate := filepath.Join(outputDir, deriveServiceFileBase(outputDir)+".proto")
+	rootProtoExistedBefore := pathx.FileExists(rootProtoCandidate)
+
+	// ── PhaseB 预校验 + 写 desc proto ──
+	// 规则（与 make gen-rpc 的幂等语义对齐）：
+	//   1) dao 已存在 + 未 --overwrite        → 跳过 desc 写入（"以现有 desc 为权威源"）
+	//   2) desc/<targetGroup>/<x>.proto 已存在 → 跳过（不动用户已有 proto）
+	//   3) desc/<其它 group>/<x>.proto 已存在  → 跳过 + 把本次 GroupName 校准到已有 group，
+	//                                            后续 logic / errcode / model / consts 都落到正确位置
+	//   4) 任何 group 下都没有同名 proto      → 按默认 GroupName 在 desc/<group>/ 下新建
+	// 典型场景：用户历史在 desc/user/cs_user_profile.proto，这次没传 --group，
+	//   默认 group=DirName(schemaName)=csuserprofile → 命中规则 3：跳过写盘 + 把 GroupName
+	//   改回 user，避免同名 proto 在两个 group 下共存被 protoc 报"already defined"，也避免
+	//   logic/csuserprofile/ 与 desc/user/ 错位。
+	descRoot := filepath.Join(outputDir, "desc")
+	for i := range processed {
+		p := &processed[i]
+		modelSnake := generator.FileSnake(p.schema.Name)
+		protoFileName := modelSnake + ".proto"
+
+		// dao 已存在 + 未 overwrite：维持原语义，不动 desc
+		if p.daoPreExisted && !p.genCtx.Overwrite {
+			continue
+		}
+
+		targetGroup := p.genCtx.GroupName
+		targetPath := filepath.Join(descRoot, targetGroup, protoFileName)
+
+		// 规则 2：目标位置已有同名 proto → 跳过（不覆盖用户既有 proto）
+		if pathx.FileExists(targetPath) && !p.genCtx.Overwrite {
+			fmt.Printf("[zctl] desc proto already exists, skip: desc/%s/%s\n", targetGroup, protoFileName)
+			continue
+		}
+
+		// 规则 3：其它 group 下有同名 proto → 跳过写入并校准 GroupName，后续 logic 落到正确位置
+		if existingPaths := findProtoConflicts(descRoot, protoFileName, targetGroup); len(existingPaths) > 0 {
+			rel, _ := filepath.Rel(descRoot, existingPaths[0])
+			parts := strings.Split(rel, string(filepath.Separator))
+			if len(parts) >= 2 {
+				existingGroup := parts[0]
+				fmt.Printf("[zctl] desc proto already exists under another group, reuse it: desc/%s/%s (was going to write desc/%s/%s)\n",
+					existingGroup, protoFileName, targetGroup, protoFileName)
+				p.genCtx.GroupName = existingGroup
+			}
+			continue
+		}
+
+		// 规则 4：全新 schema → 按默认 GroupName 写盘
+		if err := genDescProto(&p.genCtx, outputDir, p.schema); err != nil {
+			tracker.rollback()
+			return err
+		}
+	}
+
+	// ── protoc 预校验：merge + protoc，失败仅回滚 PhaseB ──
+	fmt.Println("[zctl] Validating proto: merge desc/ + protoc compile ...")
+	rootProto, mergeErr := runMergeAndProtoc(outputDir, g.Style)
+	if mergeErr != nil {
+		fmt.Printf("[zctl] ✗ proto validation failed: %v\n", mergeErr)
+		fmt.Println("[zctl] Rolling back desc proto / merged root proto / pb files generated in this run ...")
+		fmt.Println("[zctl] (DAO files are preserved — fix desc proto and re-run)")
+		// 仅当根 .proto 是本次新生成的才删除（保护用户 PhaseB 之前就有的根 .proto）
+		if rootProto != "" && !rootProtoExistedBefore {
+			if _, err := os.Stat(rootProto); err == nil {
+				_ = os.Remove(rootProto)
+				fmt.Printf("[zctl] Removed merged root proto: %s\n", rootProto)
+			}
+		}
+		tracker.rollback()
+		return fmt.Errorf("proto validation failed, rolled back desc/types (DAO preserved): %w", mergeErr)
+	}
+	fmt.Println("[zctl] ✓ proto validation passed.")
+
+	// ── PhaseC: 生成 errcode/test/model/consts，仅在 protoc 通过后执行 ──
+	for _, p := range processed {
+		if err := generateSchemaPhaseC(&p.genCtx, outputDir, p.schema, p.daoPreExisted); err != nil {
+			return err
+		}
+		fmt.Printf("[zctl] Generated module: %s\n", p.schema.Name)
 	}
 
 	// Generate unified DAO errcode file (all modules in one file, with unique code segments + i18n)
-	// When model=all, use all schemas; when model=single, still regenerate with all schemas
-	// to maintain correct segment numbering.
 	var allSchemaNames []string
 	for _, s := range schemas.Schemas {
 		allSchemaNames = append(allSchemaNames, s.Name)
@@ -128,16 +242,13 @@ func GenEntLogic(g *GenContext) error {
 		fmt.Printf("[zctl] Generated pkg/errcode/dao.go (%d modules)\n", len(allSchemaNames))
 	}
 
-	// After generating desc protos, auto-run merge + protoc + logic/server generation
-	// so that logic files have correct pb signatures immediately.
-	fmt.Println("[zctl] Auto-running merge-proto + protoc + logic/server generation...")
-	if err := autoGenRpc(outputDir, g.Style); err != nil {
-		fmt.Printf("[zctl] Warning: auto gen-rpc failed: %v\n", err)
+	// ── 尾部：enum + logic 文件（protoc 已成功，几乎不会失败） ──
+	if err := runPostProtoc(outputDir, g.Style); err != nil {
+		fmt.Printf("[zctl] Warning: post-protoc generation failed: %v\n", err)
 		fmt.Println("[zctl] You can manually run: make gen-rpc")
 	}
 
-	// Install ent infra (entlog/entx + ent init in svc) and register DAOs
-	// into ServiceContext. Idempotent — re-running has no extra side effect.
+	// Install ent infra (entlog/entx + ent init in svc) and register DAOs into ServiceContext.
 	if err := generator.EnsureEntInfra(outputDir, projectCtx.Path); err != nil {
 		fmt.Printf("[zctl] Warning: failed to ensure ent infra: %v\n", err)
 	} else {
@@ -148,54 +259,126 @@ func GenEntLogic(g *GenContext) error {
 	return nil
 }
 
+// deriveServiceFileBase 从 Makefile 的 SERVICE_STYLE 推导根 proto 文件名（不含后缀）。
+// 与 runMergeAndProtoc 内部的同名解析逻辑保持一致，避免重复实现。
+func deriveServiceFileBase(abs string) string {
+	serviceName := filepath.Base(abs)
+	if data, err := os.ReadFile(filepath.Join(abs, "Makefile")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "SERVICE_STYLE=") {
+				if v := strings.TrimSpace(strings.TrimPrefix(line, "SERVICE_STYLE=")); v != "" {
+					return v
+				}
+			}
+		}
+	}
+	return serviceName
+}
+
+// findProtoConflicts 在 descRoot 下递归查找所有 base==targetFileName 的 proto 文件，
+// 返回那些位于非 targetGroup 目录下的路径。targetGroup 为空时不做过滤（任何重名都算冲突）。
+//
+// 用于 PhaseB 写 desc proto 前的预校验，避免出现 desc/<groupA>/x.proto 与 desc/<groupB>/x.proto
+// 共存导致 merge 后 protoc 报"already defined"的尴尬场景。
+func findProtoConflicts(descRoot, targetFileName, targetGroup string) []string {
+	var conflicts []string
+	_ = filepath.Walk(descRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != targetFileName {
+			return nil
+		}
+		// 计算该 proto 所在的一级 group 目录（desc/<group>/...）
+		rel, relErr := filepath.Rel(descRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) < 2 {
+			// 直接放在 desc/ 根下（如 base.proto）— 不算 group 内的
+			return nil
+		}
+		fileGroup := parts[0]
+		if fileGroup != targetGroup {
+			conflicts = append(conflicts, path)
+		}
+		return nil
+	})
+	return conflicts
+}
+
 func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema, fieldMap map[string]string) error {
+	// 兼容入口（历史调用方使用）：依次跑 PhaseA → desc proto → PhaseC，无 protoc 校验。
+	// 新主流程 GenEntLogic 已不再走这里，而是显式拆 A / B / C 三阶段并加 protoc 预校验。
+	preExisted, err := generateSchemaPhaseA(g, projectCtx, outputDir, schema, fieldMap)
+	if err != nil {
+		return err
+	}
+	if !preExisted || g.Overwrite {
+		if err := genDescProto(g, outputDir, schema); err != nil {
+			return err
+		}
+	}
+	return generateSchemaPhaseC(g, outputDir, schema, preExisted)
+}
+
+// generateSchemaPhaseA 仅生成 DAO 层产物（DAO 接口 / OB 实现 / Mock / Hook）。
+//
+// **dao 永远独立落盘**，不参与 protoc 校验失败回滚。即便 desc proto 校验失败，
+// dao 也是用户照着改 desc 的关键参考物，必须保留。
+//
+// 返回 daoPreExisted —— 表示"在本函数执行之前 DAO 文件就已存在"。这是后续
+// PhaseB（desc proto）/ PhaseC（errcode/test/model/consts）是否跳过的判定依据，
+// 与原 generateForSchema 中的语义保持一致。
+func generateSchemaPhaseA(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema, fieldMap map[string]string) (daoPreExisted bool, err error) {
 	modulePath := projectCtx.Path
 	modelSnake := generator.FileSnake(schema.Name)
 
 	// ── 先看后做：在生成 DAO 之前，记住 DAO 文件是否已经存在 ──
-	// 如果之前就有 DAO → 说明不是第一次跑 → 后面跳过 proto 生成
-	// 如果之前没有 DAO → 说明第一次跑 → 后面正常生成 proto
 	daoFilePath := filepath.Join(outputDir, "internal", "dao", modelSnake+"_dao.go")
-	daoPreExisted := pathx.FileExists(daoFilePath)
+	daoPreExisted = pathx.FileExists(daoFilePath)
 
 	// 1. Generate DAO interface
-	if err := genDaoInterface(g, outputDir, modulePath, schema, fieldMap); err != nil {
-		return err
+	if err = genDaoInterface(g, outputDir, modulePath, schema, fieldMap); err != nil {
+		return
 	}
 
 	// 2. Generate DAO OceanBase impl
-	if err := genDaoOceanBaseImpl(g, outputDir, modulePath, schema, fieldMap); err != nil {
-		return err
+	if err = genDaoOceanBaseImpl(g, outputDir, modulePath, schema, fieldMap); err != nil {
+		return
 	}
 
 	// 3. Generate DAO mock
-	if err := genDaoMock(g, outputDir, modulePath, schema, fieldMap); err != nil {
-		return err
+	if err = genDaoMock(g, outputDir, modulePath, schema, fieldMap); err != nil {
+		return
 	}
 
 	// 4. Generate DAO hook file
-	if err := genDaoHook(g, outputDir, modulePath, schema); err != nil {
-		return err
+	if err = genDaoHook(g, outputDir, modulePath, schema); err != nil {
+		return
 	}
+	return
+}
 
-	// ── 步骤 5-9：一次性脚手架（desc / errcode / test skeleton / model / consts / desc proto）──
-	// 与 DAO 是否首次生成保持一致：
-	//   - DAO 之前不存在（首次）→ 全套生成
-	//   - DAO 已存在（非首次）→ 全部跳过，让 desc 成为后续 logic/consts/model 的唯一权威源
-	//     用户可以放心删除 desc / logic / pkg/model / pkg/consts / pkg/errcode 中任意文件，
-	//     重跑不会被找回；如需强制重建请用 --overwrite。
+// generateSchemaPhaseC 生成"protoc 预校验通过后"的产物：
+//   errcode 模块文件 / test 骨架 / pkg/model 占位 / pkg/consts 占位。
+//
+// 这些产物全部依赖 desc proto 已经合法（否则 logic/test 会引用不存在的 pb 类型）。
+// 当 daoPreExisted=true 且未指定 --overwrite 时，与原逻辑一致整体跳过。
+func generateSchemaPhaseC(g *GenContext, outputDir string, schema *load.Schema, daoPreExisted bool) error {
 	if daoPreExisted && !g.Overwrite {
-		fmt.Printf("  ⊘ DAO already existed for %s, skipping scaffold generation (desc/errcode/model/consts/test) — use --overwrite to force\n", schema.Name)
+		fmt.Printf("  ⊘ DAO already existed for %s, skipping scaffold generation (errcode/model/consts/test) — use --overwrite to force\n", schema.Name)
 		return nil
 	}
 
 	// 5. Generate errcode module file
-	if err := genModuleErrcode(g, outputDir, modulePath, schema); err != nil {
+	if err := genModuleErrcode(g, outputDir, "", schema); err != nil {
 		return err
 	}
 
 	// 6. Generate test skeleton (in logic/{group}/{model_lower}/ dir)
-	if err := genTestSkeleton(g, outputDir, modulePath, schema); err != nil {
+	if err := genTestSkeleton(g, outputDir, "", schema); err != nil {
 		return err
 	}
 
@@ -206,11 +389,6 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 
 	// 8. Generate module constants file
 	if err := genModuleConst(g, outputDir, schema); err != nil {
-		return err
-	}
-
-	// 9. Generate desc/{group}/{model_lower}.proto
-	if err := genDescProto(g, outputDir, schema); err != nil {
 		return err
 	}
 
@@ -280,10 +458,12 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 		fmt.Fprintf(&filterFields, "\t%s *%s // filter by %s\n", camel, goType, f.Name)
 	}
 
-	// Build delete method (only soft delete)
+	// Build delete method (only soft delete).
+	// Primary-key Go type is derived from the ent schema (single source of truth).
+	idGoType := idFieldGoType(schema)
 	var deleteMethod string
 	if hasSoftDelete {
-		deleteMethod = "\tDeleteByID(ctx context.Context, id int) error\n"
+		deleteMethod = fmt.Sprintf("\tDeleteByID(ctx context.Context, id %s) error\n", idGoType)
 	}
 
 	// Check if any field type needs "time" import (for ListFilter / method params)
@@ -336,7 +516,7 @@ type %sDao interface {
 
 	// ──── Get single record ────
 
-	GetByID(ctx context.Context, id int) (*ent.%s, error)
+	GetByID(ctx context.Context, id %s) (*ent.%s, error)
 %s
 	// ──── Update single record ────
 
@@ -356,7 +536,9 @@ type %sDao interface {
 		modelName,
 		modelName,
 		modelName, modelName,
-		modelName,
+		// GetByID(ctx context.Context, id %s) (*ent.%s, error)
+		// 第一个 verb 是主键 Go 类型（来自 ent schema：uint64/int64/string 等），第二个是 ent 模型名。
+		idGoType, modelName,
 		getMethods.String(),
 		updateMethods.String(),
 		deleteMethod,
@@ -384,8 +566,9 @@ func genDaoMock(g *GenContext, outputDir, modulePath string, schema *load.Schema
 	daoFile := filepath.Join(outputDir, "internal", "dao", modelSnake+"_dao.go")
 	methods, err := parseDaoMethods(daoFile)
 	if err != nil {
-		// If we can't parse, generate from known CRUD methods
-		methods = defaultCRUDMethods(modelName)
+		// If we can't parse, generate from known CRUD methods.
+		// Primary-key type still derived from ent schema (single source of truth).
+		methods = defaultCRUDMethods(modelName, idFieldGoType(schema))
 	}
 
 	var methodsCode strings.Builder
@@ -724,7 +907,8 @@ func qualifyTypeToken(tok string) string {
 
 // defaultCRUDMethods returns fallback mock methods when parsing fails.
 // Now aligned with new interface: no Delete if no deleted_at, List uses filter+page.
-func defaultCRUDMethods(modelName string) []daoMethod {
+// idGoType is the primary-key Go type derived from the ent schema (single source of truth).
+func defaultCRUDMethods(modelName, idGoType string) []daoMethod {
 	entType := "*ent." + modelName
 	entSlice := "[]*ent." + modelName
 	return []daoMethod{
@@ -737,7 +921,7 @@ func defaultCRUDMethods(modelName string) []daoMethod {
 		},
 		{
 			Name:       "GetByID",
-			Params:     "ctx context.Context, id int",
+			Params:     fmt.Sprintf("ctx context.Context, id %s", idGoType),
 			Returns:    "(" + entType + ", error)",
 			CallArgs:   "ctx, id",
 			ReturnStmt: fmt.Sprintf("\treturn args.Get(0).(%s), args.Error(1)\n", entType),
@@ -908,17 +1092,19 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName)
 	}
 
-	// GetByID — with soft-delete filter
+	// GetByID — with soft-delete filter.
+	// Primary-key Go type derived from ent schema (single source of truth).
+	idGoType := idFieldGoType(schema)
 	fmt.Fprintf(&b, "// ──── Get single record ────\n\n")
 	if hasSoftDelete {
-		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id int) (*ent.%s, error) {\n", entPkg, modelName)
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id %s) (*ent.%s, error) {\n", entPkg, idGoType, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.ID(id), %s.DeletedAtIsNil()).Only(ctx)\n", entPkg, entPkg)
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
 		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
 	} else {
-		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id int) (*ent.%s, error) {\n", entPkg, modelName)
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id %s) (*ent.%s, error) {\n", entPkg, idGoType, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, id)\n")
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
@@ -1002,10 +1188,11 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, camel)
 	}
 
-	// Soft delete — with DeletedAtIsNil filter
+	// Soft delete — with DeletedAtIsNil filter.
+	// Primary-key Go type already resolved above as idGoType.
 	if hasSoftDelete {
 		fmt.Fprintf(&b, "// ──── Delete (soft) ────\n\n")
-		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) DeleteByID(ctx context.Context, id int) error {\n", entPkg)
+		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) DeleteByID(ctx context.Context, id %s) error {\n", entPkg, idGoType)
 		fmt.Fprintf(&b, "\taffected, err := d.cli.Update().\n\t\tWhere(%s.ID(id), %s.DeletedAtIsNil()).\n\t\tSetDeletedAt(time.Now()).\n\t\tSave(ctx)\n", entPkg, entPkg)
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.DeleteByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
 		fmt.Fprintf(&b, "\t\treturn errcode.Wrapf(errcode.DBDeleteFailed, \"%s.DeleteByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
@@ -1476,6 +1663,25 @@ func collectCompositeUniqueIndexes(schema *load.Schema) []compositeUniqueIndex {
 	return result
 }
 
+// idFieldGoType returns the Go type of the schema's primary-key ("id") field,
+// **directly derived from the ent schema** as the single source of truth.
+//
+// Resolution rules:
+//  1. If the schema explicitly declares an `id` field (e.g. `field.Uint64("id")`),
+//     return its real Go type via mapEntFieldTypeToGo (uint64 / int64 / uint32 / ...).
+//  2. Otherwise fall back to "int", which matches ent's implicit default primary key.
+//
+// Used by every dao template that references the primary-key parameter type
+// (GetByID / DeleteByID, etc.) so codegen never drifts from the ent schema.
+func idFieldGoType(schema *load.Schema) string {
+	for _, f := range schema.Fields {
+		if f.Name == "id" {
+			return mapEntFieldTypeToGo(uniqueFieldInfo{Name: f.Name, TypeName: f.Info.Type.String()})
+		}
+	}
+	return "int"
+}
+
 // mapEntFieldTypeToGo maps an ent field info to a Go type string.
 func mapEntFieldTypeToGo(f uniqueFieldInfo) string {
 	switch f.TypeName {
@@ -1516,9 +1722,12 @@ func mapEntFieldTypeToGo(f uniqueFieldInfo) string {
 
 // ==================== Auto gen-rpc (merge + protoc + logic) ====================
 
-// autoGenRpc performs merge-proto + protoc + GenLogicFiles after desc protos are generated.
-// This ensures logic files are created with correct pb signatures in one step.
-func autoGenRpc(abs, style string) error {
+// runMergeAndProtoc 仅执行 merge desc → 根 proto + protoc 编译两步。
+// 失败时返回 error，调用方负责 rollback。这是"protoc 预校验"的核心：
+// 任何 desc proto 之间的 message/service 名冲突会在这里立即暴露。
+//
+// 返回额外的 rootProto 路径，便于调用方登记到 tracker（失败时删掉）。
+func runMergeAndProtoc(abs, style string) (rootProto string, err error) {
 	// 1. Find service name
 	serviceName := filepath.Base(abs)
 	if data, err := os.ReadFile(filepath.Join(abs, "Makefile")); err == nil {
@@ -1534,9 +1743,9 @@ func autoGenRpc(abs, style string) error {
 
 	// 2. Merge desc/ → root proto
 	descDir := filepath.Join(abs, "desc")
-	rootProto := filepath.Join(abs, serviceName+".proto")
-	if err := generator.MergeDescProtos(descDir, rootProto, serviceName); err != nil {
-		return fmt.Errorf("merge proto: %w", err)
+	rootProto = filepath.Join(abs, serviceName+".proto")
+	if mErr := generator.MergeDescProtos(descDir, rootProto, serviceName); mErr != nil {
+		return rootProto, fmt.Errorf("merge proto: %w", mErr)
 	}
 	fmt.Printf("[zctl] Merged desc/ → %s.proto\n", serviceName)
 
@@ -1560,22 +1769,34 @@ func autoGenRpc(abs, style string) error {
 	cmd.Dir = abs
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("protoc: %w", err)
+	if rErr := cmd.Run(); rErr != nil {
+		return rootProto, fmt.Errorf("protoc: %w", rErr)
 	}
 
-	// 4. Auto-generate enum helpers
+	return rootProto, nil
+}
+
+// runPostProtoc 在 protoc 成功后执行 enum 提取与 logic 文件生成。
+// 这一阶段只读 protoc 产物 + 写 logic 文件，不会再触发 protoc 错误。
+func runPostProtoc(abs, style string) error {
 	_ = generator.GenEnumsFromProto(abs)
 
-	// 5. Generate logic files with correct pb signatures
 	if style == "" {
 		style = "go_zero"
 	}
 	if err := generator.GenLogicFiles(abs, style, false); err != nil {
 		return fmt.Errorf("gen logic: %w", err)
 	}
-
 	return nil
+}
+
+// autoGenRpc 兼容旧调用入口：merge + protoc + post。
+// 推荐新代码使用 runMergeAndProtoc + runPostProtoc 两段式调用，便于做 protoc 预校验。
+func autoGenRpc(abs, style string) error {
+	if _, err := runMergeAndProtoc(abs, style); err != nil {
+		return err
+	}
+	return runPostProtoc(abs, style)
 }
 
 // ==================== Helpers ====================
@@ -1804,7 +2025,8 @@ func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
 
 	// ── Service block ──
 	b.WriteString(fmt.Sprintf("// %s 管理服务\n", modelName))
-	b.WriteString(fmt.Sprintf("service %s {\n", g.ServiceName))
+	// generator.GoPascal: dashed/snake names → PascalCase ident, e.g. "cs-agent-rpc" → "CsAgentRpc"
+	b.WriteString(fmt.Sprintf("service %s {\n", generator.GoPascal(g.ServiceName)))
 	for _, r := range rpcs {
 		b.WriteString(r.comment)
 		b.WriteString(fmt.Sprintf("  rpc %s (%s) returns (%s);\n", r.method, r.req, r.resp))
@@ -1837,5 +2059,114 @@ func goTypeToProtoType(goType string) string {
 		return "int64"
 	default:
 		return "string"
+	}
+}
+
+// ==================== File Tracker (atomic generation rollback) ====================
+//
+// fileTracker 用于"原子化"生成：先对若干关键目录拍快照，等 PhaseA 写盘 + protoc 校验
+// 全部通过后再继续 PhaseB；若 protoc 校验失败，按 diff 把 PhaseA 新建的文件全部删除，
+// 让磁盘回到 PhaseA 之前的状态，避免出现"desc/dao 新建了一半，logic/test 又孤儿留下"
+// 的不一致状态。
+//
+// 仅追踪"新增文件"，不追踪"被覆盖的文件"——因为现有 gen 函数对已存在文件一律 skip，
+// 所以新增 = diff 即可表达全部副作用。
+type fileTracker struct {
+	// roots 是要追踪的目录绝对路径（递归）。
+	roots []string
+	// before 记录每个目录在 snapshot 时刻已存在的文件集合（绝对路径）。
+	before map[string]struct{}
+	// extraFiles 是手动登记的额外文件（如根 .proto），不属于任何 root 但要参与回滚。
+	extraFiles []string
+}
+
+func newFileTracker(roots ...string) *fileTracker {
+	return &fileTracker{
+		roots:  roots,
+		before: make(map[string]struct{}),
+	}
+}
+
+// snapshot 记录当前所有 root 目录下的文件列表，作为回滚基线。
+func (t *fileTracker) snapshot() {
+	for _, root := range t.roots {
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			t.before[path] = struct{}{}
+			return nil
+		})
+	}
+}
+
+// trackExtra 登记一个不在 root 目录范围内、但需要参与回滚的文件（典型如根 .proto）。
+// 仅当 snapshot 时该文件不存在，才会在 rollback 时尝试删除。
+func (t *fileTracker) trackExtra(path string) {
+	if _, err := os.Stat(path); err == nil {
+		// 已存在 → snapshot 之前就有 → 不属于"新增"，不删
+		return
+	}
+	t.extraFiles = append(t.extraFiles, path)
+}
+
+// rollback 删除 snapshot 之后新增的所有文件，并清理产生的空目录。
+func (t *fileTracker) rollback() {
+	var deleted []string
+
+	// 1. 删除 root 目录下的新增文件
+	for _, root := range t.roots {
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info == nil || info.IsDir() {
+				return nil
+			}
+			if _, existed := t.before[path]; !existed {
+				if rmErr := os.Remove(path); rmErr == nil {
+					deleted = append(deleted, path)
+				}
+			}
+			return nil
+		})
+	}
+
+	// 2. 删除手动登记的 extra 文件
+	for _, p := range t.extraFiles {
+		if _, err := os.Stat(p); err == nil {
+			if rmErr := os.Remove(p); rmErr == nil {
+				deleted = append(deleted, p)
+			}
+		}
+	}
+
+	// 3. 清理由此产生的空目录（自底向上，最多三层，避免误删）
+	dirSet := make(map[string]struct{})
+	for _, p := range deleted {
+		d := filepath.Dir(p)
+		dirSet[d] = struct{}{}
+		dirSet[filepath.Dir(d)] = struct{}{}
+	}
+	// 对路径长度逆序排序，先删深层目录
+	dirs := make([]string, 0, len(dirSet))
+	for d := range dirSet {
+		dirs = append(dirs, d)
+	}
+	// 简单冒泡：长度长的排前面
+	for i := 0; i < len(dirs); i++ {
+		for j := i + 1; j < len(dirs); j++ {
+			if len(dirs[j]) > len(dirs[i]) {
+				dirs[i], dirs[j] = dirs[j], dirs[i]
+			}
+		}
+	}
+	for _, d := range dirs {
+		// 仅当目录为空时才删
+		entries, err := os.ReadDir(d)
+		if err == nil && len(entries) == 0 {
+			_ = os.Remove(d)
+		}
+	}
+
+	if len(deleted) > 0 {
+		fmt.Printf("[zctl] Rolled back %d file(s) generated in this run.\n", len(deleted))
 	}
 }

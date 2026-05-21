@@ -68,3 +68,29 @@ func LowerCamel(s string) string {
 	}
 	return strings.ToLower(s[:1]) + s[1:]
 }
+
+// ProtoPkg converts an arbitrary service name to a **proto package identifier**.
+// proto3 only accepts ident chars [A-Za-z0-9_]; dashes are illegal. Service names
+// like "cs-agent-rpc" must be normalized before being written into
+// `package xxx;` / `option go_package = "./xxx";`.
+//
+// Rules: drop everything that is not [A-Za-z0-9_], then ToLower.
+//
+//	"cs-agent-rpc" → "csagentrpc"
+//	"cs_agent_rpc" → "cs_agent_rpc"
+//	"Passport"     → "passport"
+//	"My-Svc_v2"    → "mysvc_v2"
+func ProtoPkg(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+			// every other char (incl. '-') is dropped
+		}
+	}
+	return b.String()
+}

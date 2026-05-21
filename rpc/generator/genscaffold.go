@@ -1175,7 +1175,9 @@ func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) erro
 		port = zctx.Port
 	}
 	svcLower := strings.ToLower(serviceName)
-	svcCamel := strings.ToUpper(serviceName[:1]) + serviceName[1:]
+	// Use GoPascal so dashed names like "cs-agent-rpc" become "CsAgentRpc" (a valid Go identifier),
+	// matching the service ident emitted by mergeproto.go (single source of truth).
+	svcCamel := GoPascal(serviceName)
 
 	content := fmt.Sprintf(`# Custom configuration | 独立配置
 # Service name | 项目名称
@@ -1452,8 +1454,11 @@ RUN chmod +x ./entrypoint.sh
 
 COPY ./etc/%s.yaml.template ./etc/%s.yaml.template
 
+# i18n locale files (required at runtime by %s.go — see pkg/i18n/locale/*.json)
+COPY --from=builder /build/pkg/i18n/locale ./pkg/i18n/locale
+
 ENTRYPOINT ["./entrypoint.sh"]
-`, svcLower, svcLower, svcLower, svcLower, svcLower)
+`, svcLower, svcLower, svcLower, svcLower, svcLower, svcLower)
 
 	return writeIfNotExist(filepath.Join(abs, "Dockerfile"), content)
 }
@@ -2550,7 +2555,8 @@ func (g *Generator) genDescDir(abs, serviceName string) error {
 }
 
 func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
-	svcLower := strings.ToLower(serviceName)
+	svcLower := strings.ToLower(serviceName) // raw lower (may contain '-')
+	protoPkg := ProtoPkg(serviceName)        // valid proto3 ident (no '-'/space)
 
 	content := fmt.Sprintf(`#!/bin/bash
 # merge_proto.sh — Merge all desc/**/*.proto into root %s.proto
@@ -2559,18 +2565,21 @@ func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
 set -e
 
 SERVICE="%s"
+# PROTO_PKG: proto3 package identifier (only [A-Za-z0-9_]). Service names with
+# dashes (e.g. "cs-agent-rpc") are normalized to "csagentrpc" by zctl at scaffold time.
+PROTO_PKG="%s"
 ROOT_PROTO="./${SERVICE}.proto"
 DESC_DIR="./desc"
 
-# Extract package and go_package from base.proto
+# Extract package and go_package from base.proto (authoritative source)
 PKG=$(grep '^package ' "${DESC_DIR}/base.proto" 2>/dev/null | head -1 | sed 's/package //;s/;//')
 GO_PKG=$(grep 'go_package' "${DESC_DIR}/base.proto" 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/')
 
 if [ -z "$PKG" ]; then
-  PKG="${SERVICE}"
+  PKG="${PROTO_PKG}"
 fi
 if [ -z "$GO_PKG" ]; then
-  GO_PKG="./${SERVICE}"
+  GO_PKG="./${PROTO_PKG}"
 fi
 
 # Header
@@ -2595,7 +2604,7 @@ for f in $FILES; do
 done
 
 echo "[merge_proto] Generated ${ROOT_PROTO} from $(echo $FILES | wc -w | tr -d ' ') proto files"
-`, svcLower, svcLower)
+`, svcLower, svcLower, protoPkg)
 
 	scriptPath := filepath.Join(abs, "merge_proto.sh")
 	if err := writeIfNotExist(scriptPath, content); err != nil {
