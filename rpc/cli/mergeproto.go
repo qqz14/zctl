@@ -49,6 +49,13 @@ func MergeProto(_ *cobra.Command, _ []string) error {
 	}
 	fmt.Printf("[zctl] Done. Merged into %s\n", rootProto)
 
+	// 按需注入 google/api 依赖：当合并产物里出现 google.api.http annotation 时，
+	// 自动把 proto/google/api/{annotations,http}.proto 写入项目（幂等：已存在则跳过），
+	// 避免使用方手动从 googleapis 拷贝。机制与 buf/validate 类似但按需触发。
+	if err := generator.EnsureGoogleAPIProtoIfReferenced(abs, rootProto); err != nil {
+		fmt.Printf("[zctl] Warning: ensure google/api proto failed: %v\n", err)
+	}
+
 	// Auto-generate enum helpers from proto enum definitions in desc/
 	if err := generator.GenEnumsFromProto(abs); err != nil {
 		fmt.Printf("[zctl] Warning: enum generation failed: %v\n", err)

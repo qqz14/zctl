@@ -99,8 +99,16 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 		return err
 	}
 	// merge_proto.sh
-	if err := g.genMergeProtoScript(abs, serviceName); err != nil {
-		return err
+	//
+	// 历史脚本：早期版本由 zctl 生成的本地兜底合并脚本；现在 `make gen-rpc` 走
+	// `zctl rpc merge-proto`（Go 实现），sh 脚本已无用途。为避免新项目里产出
+	// 容易被误调的死脚本，这里通过常量开关默认关闭；如需临时回退，把该常量
+	// 改为 true 即会重新生成 merge_proto.sh。
+	const enableMergeProtoScript = false
+	if enableMergeProtoScript {
+		if err := g.genMergeProtoScript(abs, serviceName); err != nil {
+			return err
+		}
 	}
 	// proto.yaml (remote proto config, optional)
 	if err := g.genProtoYaml(abs); err != nil {
@@ -108,6 +116,11 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 	}
 	// proto/buf/validate/validate.proto (protovalidate dependency)
 	if err := g.genValidateProto(abs); err != nil {
+		return err
+	}
+	// proto/google/api/{annotations,http}.proto (grpc-transcoding dependency)
+	// 用于在 desc/*.proto 中使用 option (google.api.http) = {...} 定义 HTTP 路由。
+	if err := g.genGoogleAPIProto(abs); err != nil {
 		return err
 	}
 	// types/ directory
@@ -2356,7 +2369,6 @@ make gen-rpc  # 内部会先调用 merge-proto
 {{SERVICE}}/
 ├── {{SERVICE}}.go              # 主入口
 ├── {{SERVICE}}.proto           # 合并后的 proto（自动生成，勿编辑）
-├── merge_proto.sh              # desc/ → 根 proto 合并脚本
 ├── Makefile
 ├── Dockerfile
 ├── entrypoint.sh
@@ -2626,6 +2638,55 @@ func (g *Generator) genValidateProto(abs string) error {
 		return err
 	}
 	return writeIfNotExist(filepath.Join(dir, "validate.proto"), validateProtoContent)
+}
+
+// ==================== proto/google/api/{annotations,http}.proto ====================
+//
+// grpc-transcoding 依赖：在 desc/*.proto 中可使用
+//   option (google.api.http) = {get: "/v1/xxx"};
+// 来声明 gRPC↔HTTP 路由映射；annotations.proto 内部 import http.proto，
+// 二者必须同时落盘。文件源自 grpc-ecosystem/grpc-gateway third_party/googleapis，
+// Apache-2.0 许可，原样转写。
+
+//go:embed annotations.proto
+var googleAPIAnnotationsProtoContent string
+
+//go:embed http.proto
+var googleAPIHTTPProtoContent string
+
+// ensureGoogleAPIProtoFiles 把 annotations.proto + http.proto 写入 proto/google/api/
+// （幂等：已存在则跳过）。供 Generator.genGoogleAPIProto（创建新项目时）与
+// EnsureGoogleAPIProtoIfReferenced（已存项目 merge-proto 触发时）共用。
+func ensureGoogleAPIProtoFiles(abs string) error {
+	dir := filepath.Join(abs, "proto", "google", "api")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+	if err := writeIfNotExist(filepath.Join(dir, "annotations.proto"), googleAPIAnnotationsProtoContent); err != nil {
+		return err
+	}
+	return writeIfNotExist(filepath.Join(dir, "http.proto"), googleAPIHTTPProtoContent)
+}
+
+func (g *Generator) genGoogleAPIProto(abs string) error {
+	return ensureGoogleAPIProtoFiles(abs)
+}
+
+// EnsureGoogleAPIProtoIfReferenced 由 zctl rpc merge-proto 在合并完成后调用：
+// 扫描合并产物（rootProto），若发现 google.api.http annotation 或对
+// google/api/annotations.proto 的 import，则自动把所需 proto 文件写入项目；
+// 否则什么也不做（避免给不需要 HTTP transcoding 的项目留无用文件）。
+func EnsureGoogleAPIProtoIfReferenced(abs, rootProto string) error {
+	data, err := os.ReadFile(rootProto)
+	if err != nil {
+		return err
+	}
+	content := string(data)
+	if !strings.Contains(content, "google.api.http") &&
+		!strings.Contains(content, "google/api/annotations.proto") {
+		return nil
+	}
+	return ensureGoogleAPIProtoFiles(abs)
 }
 
 // ==================== cmd/migrate-ddl/main.go ====================

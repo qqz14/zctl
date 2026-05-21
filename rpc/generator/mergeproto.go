@@ -62,6 +62,10 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 		scanner := bufio.NewScanner(strings.NewReader(string(content)))
 		inService := false
 		braceDepth := 0
+		// rpcBraceDepth>0 表示当前正处在 rpc 花括号块体内，按花括号配平
+		// 整段原样保留 rpc 行 + 内部 option 行（如 google.api.http）+ 收尾 `}`。
+		// 仅在 rpc 块体外才依照 rpcRe / 注释 / 空行 等老规则决定是否保留。
+		rpcBraceDepth := 0
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -88,13 +92,35 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 			}
 
 			if inService {
+				// 已经在某个 rpc 的花括号块体内 → 整行原样保留并继续配平
+				if rpcBraceDepth > 0 {
+					rpcLines.WriteString(line)
+					rpcLines.WriteByte('\n')
+					rpcBraceDepth += strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+					if rpcBraceDepth <= 0 {
+						rpcBraceDepth = 0
+					}
+					continue
+				}
+
 				braceDepth += strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
 				if braceDepth <= 0 {
 					inService = false
 					continue
 				}
-				// Collect rpc lines and comments inside service block
-				if rpcRe.MatchString(trimmed) || strings.HasPrefix(trimmed, "//") || trimmed == "" {
+				// rpc 行：可能是单行（以 `;` 结尾）也可能是花括号块开头（以 `{` 结尾）
+				if rpcRe.MatchString(trimmed) {
+					rpcLines.WriteString(line)
+					rpcLines.WriteByte('\n')
+					// 进入 rpc 块体：行内净开 `{` 大于 0 → 设置 depth
+					depth := strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+					if depth > 0 {
+						rpcBraceDepth = depth
+					}
+					continue
+				}
+				// 注释 / 空行：保留，作为 rpc 之间的间隔说明
+				if strings.HasPrefix(trimmed, "//") || trimmed == "" {
 					rpcLines.WriteString(line)
 					rpcLines.WriteByte('\n')
 				}
