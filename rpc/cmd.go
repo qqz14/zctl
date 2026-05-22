@@ -1,10 +1,10 @@
 package rpc
 
 import (
-	"github.com/spf13/cobra"
 	"github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/internal/cobrax"
 	"github.com/qqz14/zctl/rpc/cli"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -16,13 +16,13 @@ var (
 		return cli.RPCTemplate(false)
 	}))
 
-	newCmd       = cobrax.NewCommand("new", cobrax.WithRunE(cli.RPCNew), cobrax.WithArgs(cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs)))
-	protocCmd    = cobrax.NewCommand("protoc", cobrax.WithRunE(cli.ZRPC), cobrax.WithArgs(cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs)))
-	entCmd       = cobrax.NewCommand("ent", cobrax.WithRunE(cli.EntCRUDLogic))
-	daoCmd       = cobrax.NewCommand("dao", cobrax.WithRunE(cli.DaoFromSQL))
-	mergeCmd     = cobrax.NewCommand("merge-proto", cobrax.WithRunE(cli.MergeProto))
-	enumCmd      = cobrax.NewCommand("enum", cobrax.WithRunE(cli.EnumGen))
-	protoDocCmd  = cobrax.NewCommand("proto-doc", cobrax.WithRunE(cli.ProtoDoc))
+	newCmd      = cobrax.NewCommand("new", cobrax.WithRunE(cli.RPCNew), cobrax.WithArgs(cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs)))
+	protocCmd   = cobrax.NewCommand("protoc", cobrax.WithRunE(cli.ZRPC), cobrax.WithArgs(cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs)))
+	entCmd      = cobrax.NewCommand("ent", cobrax.WithRunE(cli.EntCRUDLogic))
+	daoCmd      = cobrax.NewCommand("dao", cobrax.WithRunE(cli.DaoFromSQL))
+	mergeCmd    = cobrax.NewCommand("merge-proto", cobrax.WithRunE(cli.MergeProto))
+	enumCmd     = cobrax.NewCommand("enum", cobrax.WithRunE(cli.EnumGen))
+	protoDocCmd = cobrax.NewCommand("proto-doc", cobrax.WithRunE(cli.ProtoDoc))
 )
 
 func init() {

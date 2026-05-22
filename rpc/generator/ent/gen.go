@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/qqz14/zctl/rpc/generator"
@@ -18,6 +19,16 @@ import (
 	"entgo.io/ent/entc/load"
 	"entgo.io/ent/schema/field"
 )
+
+// enableLegacyLogicGen 控制 zctl rpc ent 是否在 PhaseB 之后继续执行
+// 「protoc 预校验 + PhaseC（errcode/test/model/consts）+ enum + logic/server」。
+//
+// 默认 false：zctl rpc ent 只负责 dao + EntInfra + desc proto，后续合并 / protoc / logic
+// 一律由用户调用 `make gen-rpc`（即 `zctl rpc merge-proto` + `zctl rpc protoc`）完成，
+// 与 make gen-rpc 完全同源，不再自己拼 protoc 命令。
+//
+// 旧路径代码保留在 GenEntLogic 末尾以备回查，需要复用时把这里改成 true 并重编译 zctl 即可。
+const enableLegacyLogicGen = false
 
 // GenContext holds all parameters for the rpc ent subcommand.
 type GenContext struct {
@@ -46,22 +57,19 @@ func (g *GenContext) Validate() error {
 	return nil
 }
 
-// GenEntLogic generates CRUD logic + DAO + errcode for one or all ent schemas.
+// GenEntLogic generates DAO + desc proto for one or all ent schemas.
 //
-// 三阶段原子化流程（**dao 永不回滚**）：
-//   PhaseA  →  写 dao/impl/mock/hook         （独立落盘，失败直接退出，不进 tracker）
-//   PhaseB  →  写 desc proto                  （进 tracker，与 protoc 一起作为原子单元）
-//   protoc 预校验  →  merge desc/ → 根 .proto → protoc 编译
-//                     失败：tracker 回滚 PhaseB 新增 desc proto + 根 .proto + types/ 新增 pb，
-//                           **dao 保留**，PhaseC + 尾部全部跳过；用户照着 dao 改 desc 后重跑即可。
-//                     成功：继续
-//   PhaseC  →  写 errcode 模块 / test 骨架 / pkg/model / pkg/consts
-//   尾部    →  genDaoErrcodeAll / GenEnumsFromProto / GenLogicFiles / EnsureEntInfra
+// 默认职责（对齐用户工作流）：
+//   PhaseA  →  写 dao/impl/mock/hook         （独立落盘，失败直接退出）
+//   EntInfra → 写 entlog/entx + patch ServiceContext（紧贴 PhaseA，让 dao 阶段产物自洽可编译）
+//   PhaseB  →  写 desc proto                  （已存在或 dao 已存在则跳过；空目录/空文件自动剪枝）
+//   ── 到此为止。后续 merge desc → 根 .proto → protoc → logic/server 由用户跑 `make gen-rpc`
+//      （即 `zctl rpc merge-proto` + `zctl rpc protoc`）完成，确保与 `make gen-rpc` 完全同源。
 //
-// 这样保证：
-//  1) dao 永远会被生成（前置物，proto 出错时也是用户排查依据）；
-//  2) protoc 失败时 desc proto 与 logic/test 都回退干净，不会出现 logic/<group>/<model>/_test.go 孤儿；
-//  3) 用户对 desc proto 的修改重跑只走 dao 跳过 + 重新校验路径，不会被覆盖。
+// 旧路径（包内常量 enableLegacyLogicGen，默认 false）：
+//   PhaseB 之后追加 protoc 预校验 + PhaseC（errcode/test/model/consts）+ enum + logic/server。
+//   需要时改 enableLegacyLogicGen=true 并重编译 zctl；不暴露 CLI flag，避免命令面增加。
+//   失败时仅回滚 PhaseB 新增 desc proto / 根 .proto / types/ pb，**dao 与 EntInfra 永不回滚**。
 func GenEntLogic(g *GenContext) error {
 	fmt.Println("[zctl] Generating from ent schema...")
 
@@ -142,8 +150,17 @@ func GenEntLogic(g *GenContext) error {
 		})
 	}
 
-	// ── PhaseB: 生成 desc proto（进 tracker，与 protoc 一起作为原子单元） ──
-	// 仅追踪 desc/ 与 types/，dao 保留不动。根 .proto 单独通过 trackedRootProto 处理。
+	// ── EntInfra（紧贴 PhaseA）：写 entlog/entx + patch ServiceContext ──
+	// 与 desc/types/protoc 零依赖；DAO 一旦落盘就把基础设施补齐，保证 dao 阶段产物自洽可编译，
+	// 方便用户在 PhaseB 还没写 desc 时也能直接 `go build` 验证 dao。
+	if err := generator.EnsureEntInfra(outputDir, projectCtx.Path); err != nil {
+		fmt.Printf("[zctl] Warning: failed to ensure ent infra: %v\n", err)
+	} else {
+		fmt.Println("[zctl] ent infra ready (entlog/entx + ServiceContext patched).")
+	}
+
+	// ── PhaseB: 生成 desc proto（两阶段提交：plan → prune → commit） ──
+	// tracker 仅追踪 desc/ 与 types/，dao 保留不动。根 .proto 单独通过 rootProtoExistedBefore 处理。
 	tracker := newFileTracker(
 		filepath.Join(outputDir, "desc"),
 		filepath.Join(outputDir, "types"),
@@ -153,56 +170,43 @@ func GenEntLogic(g *GenContext) error {
 	rootProtoCandidate := filepath.Join(outputDir, deriveServiceFileBase(outputDir)+".proto")
 	rootProtoExistedBefore := pathx.FileExists(rootProtoCandidate)
 
-	// ── PhaseB 预校验 + 写 desc proto ──
-	// 规则（与 make gen-rpc 的幂等语义对齐）：
-	//   1) dao 已存在 + 未 --overwrite        → 跳过 desc 写入（"以现有 desc 为权威源"）
-	//   2) desc/<targetGroup>/<x>.proto 已存在 → 跳过（不动用户已有 proto）
-	//   3) desc/<其它 group>/<x>.proto 已存在  → 跳过 + 把本次 GroupName 校准到已有 group，
-	//                                            后续 logic / errcode / model / consts 都落到正确位置
-	//   4) 任何 group 下都没有同名 proto      → 按默认 GroupName 在 desc/<group>/ 下新建
-	// 典型场景：用户历史在 desc/user/cs_user_profile.proto，这次没传 --group，
-	//   默认 group=DirName(schemaName)=csuserprofile → 命中规则 3：跳过写盘 + 把 GroupName
-	//   改回 user，避免同名 proto 在两个 group 下共存被 protoc 报"already defined"，也避免
-	//   logic/csuserprofile/ 与 desc/user/ 错位。
-	descRoot := filepath.Join(outputDir, "desc")
+	// ── PhaseB-Plan: 把"本次该新增什么"全算到内存里 ──
+	// 与 zctl-commands.md §4 "DAO 是只生成一次的判断依据" 严格对齐：
+	//   1) 目标 desc/<group>/<model>.proto 已存在 OR DAO 已存在 → 整个 schema 视为 PhaseB 已完成，跳过；
+	//      不动用户已有 proto 一个字节（无论里面是 CRUD 还是用户自定义 rpc），不在别处补差量。
+	//   2) 目标不存在 且 DAO 是本次新建 → 渲染该 schema 的全集 message/rpc，单文件落到
+	//      desc/<group>/<model>.proto，与 make gen-rpc 全新生成时的产物完全一致。
+	//   3) commit 阶段会把空 file / 空 dir 自动剪枝（多 schema 部分跳过部分新建场景）。
+	plan, err := newDescPlan(g, outputDir)
+	if err != nil {
+		return err
+	}
 	for i := range processed {
 		p := &processed[i]
-		modelSnake := generator.FileSnake(p.schema.Name)
-		protoFileName := modelSnake + ".proto"
-
-		// dao 已存在 + 未 overwrite：维持原语义，不动 desc
-		if p.daoPreExisted && !p.genCtx.Overwrite {
-			continue
-		}
-
-		targetGroup := p.genCtx.GroupName
-		targetPath := filepath.Join(descRoot, targetGroup, protoFileName)
-
-		// 规则 2：目标位置已有同名 proto → 跳过（不覆盖用户既有 proto）
-		if pathx.FileExists(targetPath) && !p.genCtx.Overwrite {
-			fmt.Printf("[zctl] desc proto already exists, skip: desc/%s/%s\n", targetGroup, protoFileName)
-			continue
-		}
-
-		// 规则 3：其它 group 下有同名 proto → 跳过写入并校准 GroupName，后续 logic 落到正确位置
-		if existingPaths := findProtoConflicts(descRoot, protoFileName, targetGroup); len(existingPaths) > 0 {
-			rel, _ := filepath.Rel(descRoot, existingPaths[0])
-			parts := strings.Split(rel, string(filepath.Separator))
-			if len(parts) >= 2 {
-				existingGroup := parts[0]
-				fmt.Printf("[zctl] desc proto already exists under another group, reuse it: desc/%s/%s (was going to write desc/%s/%s)\n",
-					existingGroup, protoFileName, targetGroup, protoFileName)
-				p.genCtx.GroupName = existingGroup
-			}
-			continue
-		}
-
-		// 规则 4：全新 schema → 按默认 GroupName 写盘
-		if err := genDescProto(&p.genCtx, outputDir, p.schema); err != nil {
-			tracker.rollback()
-			return err
-		}
+		plan.addSchema(&p.genCtx, p.schema, p.genCtx.GroupName, p.daoPreExisted)
 	}
+
+	// ── PhaseB-Commit: 落盘 plan，空目录/空文件自动剪枝 ──
+	if err := plan.commit(tracker); err != nil {
+		tracker.rollback()
+		return err
+	}
+
+	for _, p := range processed {
+		fmt.Printf("[zctl] Generated module: %s\n", p.schema.Name)
+	}
+
+	// 默认到这里就结束：用户自己跑 `make gen-rpc` 完成 merge + protoc + logic/server。
+	if !enableLegacyLogicGen {
+		fmt.Println("[zctl] Done. Run `make gen-rpc` to generate logic/server from desc/.")
+		return nil
+	}
+
+	// ──────────────────────────────────────────────────────────────────
+	// 以下为旧路径（默认关闭，enableLegacyLogicGen=true 时启用）：
+	//   protoc 预校验 + PhaseC + 尾部 enum/logic
+	// 保留代码以便回查与必要时复用，正式工作流请直接走 `make gen-rpc`。
+	// ──────────────────────────────────────────────────────────────────
 
 	// ── protoc 预校验：merge + protoc，失败仅回滚 PhaseB ──
 	fmt.Println("[zctl] Validating proto: merge desc/ + protoc compile ...")
@@ -228,7 +232,6 @@ func GenEntLogic(g *GenContext) error {
 		if err := generateSchemaPhaseC(&p.genCtx, outputDir, p.schema, p.daoPreExisted); err != nil {
 			return err
 		}
-		fmt.Printf("[zctl] Generated module: %s\n", p.schema.Name)
 	}
 
 	// Generate unified DAO errcode file (all modules in one file, with unique code segments + i18n)
@@ -246,13 +249,6 @@ func GenEntLogic(g *GenContext) error {
 	if err := runPostProtoc(outputDir, g.Style); err != nil {
 		fmt.Printf("[zctl] Warning: post-protoc generation failed: %v\n", err)
 		fmt.Println("[zctl] You can manually run: make gen-rpc")
-	}
-
-	// Install ent infra (entlog/entx + ent init in svc) and register DAOs into ServiceContext.
-	if err := generator.EnsureEntInfra(outputDir, projectCtx.Path); err != nil {
-		fmt.Printf("[zctl] Warning: failed to ensure ent infra: %v\n", err)
-	} else {
-		fmt.Println("[zctl] ent infra ready (entlog/entx + ServiceContext patched).")
 	}
 
 	fmt.Println("[zctl] Done.")
@@ -273,39 +269,6 @@ func deriveServiceFileBase(abs string) string {
 		}
 	}
 	return serviceName
-}
-
-// findProtoConflicts 在 descRoot 下递归查找所有 base==targetFileName 的 proto 文件，
-// 返回那些位于非 targetGroup 目录下的路径。targetGroup 为空时不做过滤（任何重名都算冲突）。
-//
-// 用于 PhaseB 写 desc proto 前的预校验，避免出现 desc/<groupA>/x.proto 与 desc/<groupB>/x.proto
-// 共存导致 merge 后 protoc 报"already defined"的尴尬场景。
-func findProtoConflicts(descRoot, targetFileName, targetGroup string) []string {
-	var conflicts []string
-	_ = filepath.Walk(descRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		if filepath.Base(path) != targetFileName {
-			return nil
-		}
-		// 计算该 proto 所在的一级 group 目录（desc/<group>/...）
-		rel, relErr := filepath.Rel(descRoot, path)
-		if relErr != nil {
-			return nil
-		}
-		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) < 2 {
-			// 直接放在 desc/ 根下（如 base.proto）— 不算 group 内的
-			return nil
-		}
-		fileGroup := parts[0]
-		if fileGroup != targetGroup {
-			conflicts = append(conflicts, path)
-		}
-		return nil
-	})
-	return conflicts
 }
 
 func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema, fieldMap map[string]string) error {
@@ -1848,193 +1811,24 @@ func entFieldName(fieldMap map[string]string, snakeName string) string {
 //   - PageInfo is reused from base.proto for list pagination
 //   - Empty is reused from base.proto for empty responses
 //   - Proto methods are generated from DAO interface methods (not hardcoded CRUD)
+// genDescProto 是兼容入口（generateForSchema 单 schema 路径仍在用）。
+// 内部走与主流程一致的 plan 模式：算差集 → 空剪枝 → 落盘。
+// 这样维护单一渲染逻辑（renderProtoFile），不再保留独立的字符串拼接代码。
+//
+// 行为契约（保持向后兼容）：
+//   - 已存在的目标文件 + 未指定 --overwrite → 不动用户文件，返回 nil。
+//   - 当差集为空时不创建空目录（与旧实现"已存在则跳过"语义一致）。
+//   - 这里不接 fileTracker：兼容入口本就没有 protoc 预校验，由调用方自己负责。
 func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
-	modelName := schema.Name
-	modelSnake := generator.FileSnake(modelName) // for proto file name: user_info.proto
-	groupName := g.GroupName
-
-	descDir := filepath.Join(outputDir, "desc", groupName)
-	if err := pathx.MkdirIfNotExist(descDir); err != nil {
+	plan, err := newDescPlan(g, outputDir)
+	if err != nil {
 		return err
 	}
-
-	filePath := filepath.Join(descDir, modelSnake+".proto")
-	if pathx.FileExists(filePath) && !g.Overwrite {
-		return nil
-	}
-
-	// Build message fields from ent schema.
-	// Base/audit columns (id / created_at / updated_at) are emitted as the first 1~3 fields
-	// ONLY when the schema actually declares them. ent provides the `id` primary key implicitly,
-	// so id is always emitted; created_at / updated_at must be schema-driven to avoid
-	// fabricating columns the underlying table does not have (e.g. an iam_user_role schema
-	// that intentionally has no updated_at must NOT produce updated_at in proto Info).
-	var infoFields strings.Builder
-	fieldNum := 1
-	infoFields.WriteString(fmt.Sprintf("  // 主键ID\n  optional uint64 id = %d;\n", fieldNum))
-	fieldNum++
-	if hasField(schema, "created_at") {
-		infoFields.WriteString(fmt.Sprintf("  // 创建时间\n  optional int64 created_at = %d;\n", fieldNum))
-		fieldNum++
-	}
-	if hasField(schema, "updated_at") {
-		infoFields.WriteString(fmt.Sprintf("  // 更新时间\n  optional int64 updated_at = %d;\n", fieldNum))
-		fieldNum++
-	}
-
-	for _, f := range schema.Fields {
-		if isBaseField(f.Name) {
-			continue
-		}
-		protoType := goTypeToProtoType(f.Info.Type.String())
-		optional := ""
-		if f.Optional || f.Nillable {
-			optional = "optional "
-		}
-		// Add comment from ent schema if available
-		if f.Comment != "" {
-			infoFields.WriteString(fmt.Sprintf("  // %s\n", f.Comment))
-		}
-		infoFields.WriteString(fmt.Sprintf("  %s%s %s = %d;\n", optional, protoType, f.Name, fieldNum))
-		fieldNum++
-	}
-
-	// Collect unique fields and check soft delete for generating appropriate methods
-	uniqueFields := collectUniqueFields(schema)
-	hasSoftDelete := hasDeletedAtField(schema)
-
-	// Build proto content: messages + service methods from DAO interface methods
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("syntax = \"proto3\";\n\n"))
-	b.WriteString(fmt.Sprintf("// ──── %s module ────\n\n", modelName))
-	b.WriteString(fmt.Sprintf("// %sInfo 核心详情结构，用于创建/更新/查询详情。\n", modelName))
-	b.WriteString(fmt.Sprintf("message %sInfo {\n%s}\n\n", modelName, infoFields.String()))
-
-	b.WriteString("// ──── Request / Response ────\n\n")
-
-	// Track generated messages and rpc methods
-	type rpcEntry struct {
-		comment string
-		method  string // rpc method name (PascalCase)
-		req     string
-		resp    string
-	}
-	var rpcs []rpcEntry
-	generatedMessages := make(map[string]bool)
-
-	// ── Generate messages and rpcs based on DAO methods ──
-
-	// 1. Create → CreateXxxReq / CreateXxxResp
-	b.WriteString(fmt.Sprintf("// 创建%s请求\n", modelName))
-	b.WriteString(fmt.Sprintf("message Create%sReq {\n  %sInfo info = 1;\n}\n\n", modelName, modelName))
-	b.WriteString(fmt.Sprintf("// 创建%s响应\n", modelName))
-	b.WriteString(fmt.Sprintf("message Create%sResp {\n  uint64 id = 1;\n}\n\n", modelName))
-	generatedMessages["Create"+modelName+"Req"] = true
-	generatedMessages["Create"+modelName+"Resp"] = true
-	rpcs = append(rpcs, rpcEntry{
-		comment: fmt.Sprintf("  // 创建%s\n", modelName),
-		method:  "Create" + modelName,
-		req:     "Create" + modelName + "Req",
-		resp:    "Create" + modelName + "Resp",
-	})
-
-	// 2. GetByID → GetXxxByIDReq
-	b.WriteString(fmt.Sprintf("// 按ID查询%s请求\n", modelName))
-	b.WriteString(fmt.Sprintf("message Get%sByIDReq {\n  uint64 id = 1;\n}\n\n", modelName))
-	generatedMessages["Get"+modelName+"ByIDReq"] = true
-	rpcs = append(rpcs, rpcEntry{
-		comment: fmt.Sprintf("  // 按ID获取%s详情\n", modelName),
-		method:  "Get" + modelName + "ByID",
-		req:     "Get" + modelName + "ByIDReq",
-		resp:    modelName + "Info",
-	})
-
-	// 3. GetByXxx for each unique field → GetXxxByYyyReq
-	for _, uf := range uniqueFields {
-		fieldPascal := generator.GoPascal(uf.Name)
-		protoType := goTypeToProtoType(uf.TypeName)
-		msgName := fmt.Sprintf("Get%sBy%sReq", modelName, fieldPascal)
-		if !generatedMessages[msgName] {
-			b.WriteString(fmt.Sprintf("// 按%s查询%s请求\n", fieldPascal, modelName))
-			b.WriteString(fmt.Sprintf("message %s {\n  %s %s = 1;\n}\n\n", msgName, protoType, uf.Name))
-			generatedMessages[msgName] = true
-		}
-		rpcs = append(rpcs, rpcEntry{
-			comment: fmt.Sprintf("  // 按%s获取%s详情\n", fieldPascal, modelName),
-			method:  fmt.Sprintf("Get%sBy%s", modelName, fieldPascal),
-			req:     msgName,
-			resp:    modelName + "Info",
-		})
-	}
-
-	// 4. UpdateByID → UpdateXxxReq
-	b.WriteString(fmt.Sprintf("// 更新%s请求\n", modelName))
-	b.WriteString(fmt.Sprintf("message Update%sReq {\n  %sInfo info = 1;\n}\n\n", modelName, modelName))
-	generatedMessages["Update"+modelName+"Req"] = true
-	rpcs = append(rpcs, rpcEntry{
-		comment: fmt.Sprintf("  // 更新%s\n", modelName),
-		method:  "Update" + modelName,
-		req:     "Update" + modelName + "Req",
-		resp:    "Empty",
-	})
-
-	// 5. UpdateByXxx for each unique field → UpdateXxxByYyyReq
-	for _, uf := range uniqueFields {
-		fieldPascal := generator.GoPascal(uf.Name)
-		protoType := goTypeToProtoType(uf.TypeName)
-		msgName := fmt.Sprintf("Update%sBy%sReq", modelName, fieldPascal)
-		if !generatedMessages[msgName] {
-			b.WriteString(fmt.Sprintf("// 按%s更新%s请求\n", fieldPascal, modelName))
-			b.WriteString(fmt.Sprintf("message %s {\n  %s %s = 1;\n  %sInfo info = 2;\n}\n\n", msgName, protoType, uf.Name, modelName))
-			generatedMessages[msgName] = true
-		}
-		rpcs = append(rpcs, rpcEntry{
-			comment: fmt.Sprintf("  // 按%s更新%s\n", fieldPascal, modelName),
-			method:  fmt.Sprintf("Update%sBy%s", modelName, fieldPascal),
-			req:     msgName,
-			resp:    "Empty",
-		})
-	}
-
-	// 6. DeleteByID (only if soft delete supported)
-	if hasSoftDelete {
-		b.WriteString(fmt.Sprintf("// 删除%s请求（支持批量）\n", modelName))
-		b.WriteString(fmt.Sprintf("message Delete%sReq {\n  repeated uint64 ids = 1;\n}\n\n", modelName))
-		generatedMessages["Delete"+modelName+"Req"] = true
-		rpcs = append(rpcs, rpcEntry{
-			comment: fmt.Sprintf("  // 删除%s\n", modelName),
-			method:  "Delete" + modelName,
-			req:     "Delete" + modelName + "Req",
-			resp:    "Empty",
-		})
-	}
-
-	// 7. List → GetXxxListReq / GetXxxListResp
-	b.WriteString(fmt.Sprintf("// 获取%s列表请求\n", modelName))
-	b.WriteString(fmt.Sprintf("message Get%sListReq {\n  uint64 page = 1;\n  uint64 page_size = 2;\n}\n\n", modelName))
-	b.WriteString(fmt.Sprintf("// 获取%s列表响应\n", modelName))
-	b.WriteString(fmt.Sprintf("message Get%sListResp {\n  uint64 total = 1;\n  repeated %sInfo data = 2;\n}\n\n", modelName, modelName))
-	generatedMessages["Get"+modelName+"ListReq"] = true
-	generatedMessages["Get"+modelName+"ListResp"] = true
-	rpcs = append(rpcs, rpcEntry{
-		comment: fmt.Sprintf("  // 获取%s列表\n", modelName),
-		method:  "Get" + modelName + "List",
-		req:     "Get" + modelName + "ListReq",
-		resp:    "Get" + modelName + "ListResp",
-	})
-
-	// ── Service block ──
-	b.WriteString(fmt.Sprintf("// %s 管理服务\n", modelName))
-	// generator.GoPascal: dashed/snake names → PascalCase ident, e.g. "cs-agent-rpc" → "CsAgentRpc"
-	b.WriteString(fmt.Sprintf("service %s {\n", generator.GoPascal(g.ServiceName)))
-	for _, r := range rpcs {
-		b.WriteString(r.comment)
-		b.WriteString(fmt.Sprintf("  rpc %s (%s) returns (%s);\n", r.method, r.req, r.resp))
-	}
-	b.WriteString("}\n")
-
-	return os.WriteFile(filePath, []byte(b.String()), 0644)
+	// 兼容入口默认 daoPreExisted=false：addSchema 内部仍会用"目标文件已存在"做幂等保护。
+	plan.addSchema(g, schema, g.GroupName, false)
+	return plan.commit(nil)
 }
+
 
 // goTypeToProtoType converts Go type to proto type
 func goTypeToProtoType(goType string) string {
@@ -2169,4 +1963,798 @@ func (t *fileTracker) rollback() {
 	if len(deleted) > 0 {
 		fmt.Printf("[zctl] Rolled back %d file(s) generated in this run.\n", len(deleted))
 	}
+}
+
+// ==================== Desc Plan (two-phase commit + prune) ====================
+//
+// ==================== Desc Plan (single-file write OR full skip) ====================
+//
+// 设计要点（v2，与 zctl-commands.md §4 PhaseB 覆盖契约严格对齐）：
+//
+//  1) 三阶段串行 + 幂等：
+//     PhaseA(DAO) → PhaseB(desc proto) → PhaseC(errcode/test/model/consts/protoc/logic)。
+//     任一阶段都遵循"已有则跳过、缺失才创建"的硬规则。
+//
+//  2) PhaseB 跳过判定（只看一个事实）：
+//        目标文件 desc/<group>/<model>.proto 已存在 OR DAO 文件已存在 → 整个 schema 视为完成。
+//     不再做任何"差集补写"——避免在 desc/ 下凭空多出 _gen.proto / 其它 group 镜像文件。
+//
+//  3) PhaseB 创建路径：仅当上述判定不命中时，才把该 schema 的全集 message/rpc 写到
+//     单文件 desc/<group>/<model>.proto，与 make gen-rpc 全新生成时的预期完全一致。
+//
+//  4) commit 阶段做空剪枝（多 schema 跑、其中部分跳过部分新建时不会留空目录）。
+//
+//  5) 仅本次实际写出的文件才进 fileTracker，protoc 校验失败时回滚干净，不动用户已有 proto。
+
+type descPlan struct {
+	descRoot string
+	g        *GenContext // 公用 ServiceName / Style 等只读字段
+	dirs     map[string]*dirPlan
+	// schemaTargetGroup 记录"本次为这个 schema 选定的写盘 group"，便于 PhaseC 把
+	// logic / errcode / model / consts 落到一致的位置。
+	schemaTargetGroup map[string]string
+
+	// ── 扫描态：newDescPlan 时全量扫 desc/，给 addSchema 用作 rpc 名过滤与 message 一致性判定。
+	// existingRPCsByService: 服务名 → 该服务下已存在的 rpc method 名集合。
+	existingRPCsByService map[string]map[string]bool
+	// existingMessages: message 名 → 该 message 在 desc/ 里的定义信息（路径 + 字段签名）。
+	// 跨多个 .proto 同名 message 只保留首遇定义（重复定义本就是 protoc 非法状态）。
+	existingMessages map[string]existingMessageInfo
+}
+
+// existingMessageInfo 描述磁盘上 desc/ 里已定义的某个 message。
+// relPath 为相对 desc/ 的路径（如 "user/cs_user_profile.proto"），fields 为按 tag 升序排列的字段签名。
+type existingMessageInfo struct {
+	relPath string
+	fields  []protoFieldSig
+}
+
+// protoFieldSig 是字段签名比对单元。比对维度严格为：
+//   - repeated / optional 修饰符（map 化为 modifier 字段）
+//   - 字段名 name
+//   - 字段类型 typeName（含完整自定义类型名，如 "CsUserProfileInfo"）
+//   - 字段编号 tag
+//
+// 不比对：注释 / 字段顺序（外层会按 tag 升序）/ proto option（如 [json_name=...]）。
+type protoFieldSig struct {
+	modifier string // "" | "optional" | "repeated"
+	typeName string
+	name     string
+	tag      int
+}
+
+type dirPlan struct {
+	absDir string                     // desc/<group>
+	files  map[string]*protoFilePlan // 文件名 → 文件计划
+}
+
+// protoFilePlan 描述 desc/<group>/<file>.proto 一份待写 proto 的完整内容。
+// 仅当该 schema 在 PhaseB 中被判定为"需要新建"时才会被挂上来。
+type protoFilePlan struct {
+	absPath   string
+	modelName string // schema.Name，用于在校准 service 块名 / 注释时复用
+	messages  []protoMessageBlock
+	rpcs      []protoRPCEntry
+	// imports 记录本文件需要 import 的其它 .proto 路径（相对 desc/，如 "user/cs_user_profile.proto"）。
+	// 由 addSchema 在 message 一致性体检时填充，commit 阶段渲染到文件头部。
+	imports []string
+}
+
+type protoMessageBlock struct {
+	name    string
+	comment string // 含 "// xxx\n"
+	body    string // "{ ... }" 内部，含字段定义；不带 message 头 / 尾大括号
+	// fields 是 body 的结构化版本，仅用于跨文件 message 一致性比对，不参与渲染。
+	fields []protoFieldSig
+}
+
+type protoRPCEntry struct {
+	method  string
+	req     string
+	resp    string
+	comment string // "  // xxx\n"
+	// deps 列出该 rpc 依赖的所有 message 名（含 Req / Resp / 嵌套 Info），
+	// 但不包含 base.proto 提供的内置 message（如 Empty）。供 addSchema 做一致性判定。
+	deps []string
+}
+
+func newDescPlan(g *GenContext, outputDir string) (*descPlan, error) {
+	p := &descPlan{
+		descRoot:              filepath.Join(outputDir, "desc"),
+		g:                     g,
+		dirs:                  make(map[string]*dirPlan),
+		schemaTargetGroup:     make(map[string]string),
+		existingRPCsByService: make(map[string]map[string]bool),
+		existingMessages:      make(map[string]existingMessageInfo),
+	}
+	// 全量扫描 desc/ 下所有 .proto，构造 rpc 名集合 + message 字段签名表。
+	// desc/ 不存在（首次跑）也不算错误，留两个空 map 即可。
+	if err := scanDescDir(p.descRoot, p.existingRPCsByService, p.existingMessages); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// addSchema 决定 PhaseB 是否为该 schema 落盘 desc proto。
+//
+// 唯一判定（对齐 zctl-commands.md §4 "DAO 是只生成一次的判断依据"）：
+//   - daoPreExisted=true（PhaseA 判定 DAO 是上一次跑剩下的）→ 整个 PhaseB 跳过；
+//   - 目标 desc/<group>/<model>.proto 已存在 → 整个 PhaseB 跳过；
+//     此时无论目标文件里是 CRUD 全集、用户自定义 rpc，还是别的什么，都一字不动。
+//   - 否则 → 把该 schema 的全集 message + rpc 渲染成单文件，挂到 plan，由 commit 落盘。
+//
+// 跨 group 重名风险：如果用户已经在 desc/<其它 group>/<model>.proto 持有了 CRUD，
+// 那么 PhaseA 几乎一定会发现 DAO 已存在（它们是同一时刻产物），daoPreExisted=true 自然跳过。
+// 即便用户只手维护了 proto 而没生成 DAO（极小概率），后续 protoc 校验也会因
+// "message/rpc 重名" 而报错并回滚 PhaseB —— 用户显式删除冲突 proto 后再跑即可。
+func (p *descPlan) addSchema(genCtx *GenContext, schema *load.Schema, targetGroup string, daoPreExisted bool) {
+	modelName := schema.Name
+	modelSnake := generator.FileSnake(modelName)
+	fileName := modelSnake + ".proto"
+
+	dirAbs := filepath.Join(p.descRoot, targetGroup)
+	absPath := filepath.Join(dirAbs, fileName)
+
+	// 始终登记 targetGroup，让 PhaseC 能拿到正确的 group 写 logic / errcode 等。
+	p.schemaTargetGroup[modelName] = targetGroup
+
+	// 门 1：daoPreExisted=true → DAO 是上一次跑剩下的，本次 PhaseB 不再补任何 desc。
+	if daoPreExisted {
+		return
+	}
+
+	// 门 2：目标 desc/<group>/<model>.proto 已存在 → 文件级覆盖原则：一字不动。
+	if pathx.FileExists(absPath) {
+		return
+	}
+
+	// ── 进入"算预期 → 过滤 → 体检 → 剪枝"流程 ──
+	full := buildFullProtoEntries(genCtx, schema)
+	if len(full.rpcs) == 0 {
+		return
+	}
+
+	serviceName := generator.GoPascal(genCtx.ServiceName)
+	existingRPCs := p.existingRPCsByService[serviceName]
+
+	// 索引：本 schema 全集 message → 字段签名（用于一致性比对 / 落盘剪枝）。
+	expectedMsg := make(map[string]protoMessageBlock, len(full.messages))
+	for _, m := range full.messages {
+		expectedMsg[m.name] = m
+	}
+
+	// 步骤 A：rpc 名过滤（同 service 内已存在的 rpc 直接剔除）。
+	// 步骤 B：message 一致性体检（依赖 message 中只要有一个"已存在且不一致"，本 rpc 整体跳过 + 告警）。
+	// 步骤 C：剩余 rpc 的 message 划分为 "本文件新建" / "import 别处" 两路。
+	keptRPCs := make([]protoRPCEntry, 0, len(full.rpcs))
+	neededLocalMsg := make(map[string]bool) // 本文件需要原地定义的 message
+	importPaths := make(map[string]bool)    // 需 import 的 .proto 相对路径
+	for _, r := range full.rpcs {
+		if existingRPCs[r.method] {
+			fmt.Printf("[zctl] desc rpc already exists in service %s, skip: %s\n", serviceName, r.method)
+			continue
+		}
+
+		// 该 rpc 依赖的所有 message 中，是否存在 "已存在但不一致" 的——只要有 1 个，整个 rpc 就跳过。
+		mismatch := ""
+		for _, dep := range r.deps {
+			if isBaseProtoMessage(dep) {
+				continue // base.proto 提供，跳过比对
+			}
+			expected, ok := expectedMsg[dep]
+			if !ok {
+				// 防御：buildFullProtoEntries 应已把所有依赖都登记到 messages，进不到这里。
+				continue
+			}
+			if existing, exists := p.existingMessages[dep]; exists {
+				if !messageFieldsEqual(expected.fields, existing.fields) {
+					mismatch = fmt.Sprintf("%s (defined in desc/%s, fields differ from ent schema)", dep, existing.relPath)
+					break
+				}
+			}
+		}
+		if mismatch != "" {
+			fmt.Printf("[zctl] desc message conflict, skip rpc %s.%s: %s\n", serviceName, r.method, mismatch)
+			continue
+		}
+
+		// rpc 通过体检：把它依赖的每个 message 归类。
+		for _, dep := range r.deps {
+			if isBaseProtoMessage(dep) {
+				continue
+			}
+			if existing, exists := p.existingMessages[dep]; exists {
+				// 已存在且一致 → import
+				importPaths[existing.relPath] = true
+			} else {
+				// 不存在 → 本文件新建
+				neededLocalMsg[dep] = true
+			}
+		}
+		keptRPCs = append(keptRPCs, r)
+	}
+
+	if len(keptRPCs) == 0 {
+		// 所有 rpc 都被过滤/跳过 → 不生成文件，目录由 commit 剪枝。
+		return
+	}
+
+	// 收敛 messages：仅保留本文件需要新建的那部分，按 buildFullProtoEntries 的原顺序。
+	keptMsgs := make([]protoMessageBlock, 0, len(full.messages))
+	for _, m := range full.messages {
+		if neededLocalMsg[m.name] {
+			keptMsgs = append(keptMsgs, m)
+		}
+	}
+
+	// imports 去重 + 字典序排序；自身路径若被算进来，剔除（理论不会，门 2 已挡）。
+	selfRel, _ := filepath.Rel(p.descRoot, absPath)
+	selfRel = filepath.ToSlash(selfRel)
+	imports := make([]string, 0, len(importPaths))
+	for ip := range importPaths {
+		ip = filepath.ToSlash(ip)
+		if ip == selfRel {
+			continue
+		}
+		imports = append(imports, ip)
+	}
+	sort.Strings(imports)
+
+	dp, ok := p.dirs[dirAbs]
+	if !ok {
+		dp = &dirPlan{absDir: dirAbs, files: make(map[string]*protoFilePlan)}
+		p.dirs[dirAbs] = dp
+	}
+	fp := &protoFilePlan{
+		absPath:   absPath,
+		modelName: modelName,
+		messages:  keptMsgs,
+		rpcs:      keptRPCs,
+		imports:   imports,
+	}
+	dp.files[fileName] = fp
+}
+
+// commit 落盘所有 plan。空 file / 空 dir 自动剪枝；写出的文件挂到 tracker 以便回滚。
+//
+// 双保险：addSchema 已经在 plan 阶段对"目标文件已存在"做过跳过判断，但 plan 计算
+// 与 commit 写盘之间不是原子的（用户在中途手动修改 desc/ 也属于合法操作）。这里再
+// 兜一次"已存在则不覆盖"，与 zctl-commands.md §4 PhaseB 覆盖契约硬对齐：
+// 已有目标文件 → 一字不动 → 视为该 schema 本阶段已完成。
+func (p *descPlan) commit(tracker *fileTracker) error {
+	for _, dp := range p.dirs {
+		// 文件全空 → 跳过整个目录
+		nonEmpty := false
+		for _, fp := range dp.files {
+			if len(fp.rpcs) > 0 {
+				nonEmpty = true
+				break
+			}
+		}
+		if !nonEmpty {
+			continue
+		}
+		if err := pathx.MkdirIfNotExist(dp.absDir); err != nil {
+			return err
+		}
+		for _, fp := range dp.files {
+			if len(fp.rpcs) == 0 {
+				continue
+			}
+			if pathx.FileExists(fp.absPath) {
+				// 已存在 → 一字不动，硬对齐 PhaseB"新建/跳过已有"覆盖契约。
+				fmt.Printf("[zctl] desc proto already exists, skip: %s\n", fp.absPath)
+				continue
+			}
+			content := renderProtoFile(p.g, fp)
+			if err := os.WriteFile(fp.absPath, []byte(content), 0o644); err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(p.descRoot, fp.absPath)
+			fmt.Printf("[zctl] Wrote desc proto: desc/%s\n", rel)
+			_ = tracker // tracker 自动通过 snapshot 差集捕获新文件，无需手动登记
+		}
+	}
+	return nil
+}
+
+// fullProtoSet 仅是 buildFullProtoEntries 的返回容器。
+type fullProtoSet struct {
+	messages []protoMessageBlock
+	rpcs     []protoRPCEntry
+}
+
+// buildFullProtoEntries 基于 ent schema 计算"全集"的 message + rpc 列表。
+// 与旧 genDescProto 的渲染规则保持完全一致（CRUD + ByUnique + List + 软删 Delete）。
+//
+// 注意：这里只产出"块定义"，不直接拼最终文件文本。最终文本由 renderProtoFile 完成，
+// 因为是否输出 service header / Info message 取决于差集结果。
+func buildFullProtoEntries(g *GenContext, schema *load.Schema) fullProtoSet {
+	modelName := schema.Name
+
+	// ── Info message body ──
+	var infoFields strings.Builder
+	infoSig := []protoFieldSig{}
+	fieldNum := 1
+	infoFields.WriteString(fmt.Sprintf("  // 主键ID\n  optional uint64 id = %d;\n", fieldNum))
+	infoSig = append(infoSig, protoFieldSig{modifier: "optional", typeName: "uint64", name: "id", tag: fieldNum})
+	fieldNum++
+	if hasField(schema, "created_at") {
+		infoFields.WriteString(fmt.Sprintf("  // 创建时间\n  optional int64 created_at = %d;\n", fieldNum))
+		infoSig = append(infoSig, protoFieldSig{modifier: "optional", typeName: "int64", name: "created_at", tag: fieldNum})
+		fieldNum++
+	}
+	if hasField(schema, "updated_at") {
+		infoFields.WriteString(fmt.Sprintf("  // 更新时间\n  optional int64 updated_at = %d;\n", fieldNum))
+		infoSig = append(infoSig, protoFieldSig{modifier: "optional", typeName: "int64", name: "updated_at", tag: fieldNum})
+		fieldNum++
+	}
+	for _, f := range schema.Fields {
+		if isBaseField(f.Name) {
+			continue
+		}
+		protoType := goTypeToProtoType(f.Info.Type.String())
+		optional := ""
+		modifier := ""
+		if f.Optional || f.Nillable {
+			optional = "optional "
+			modifier = "optional"
+		}
+		if f.Comment != "" {
+			infoFields.WriteString(fmt.Sprintf("  // %s\n", f.Comment))
+		}
+		infoFields.WriteString(fmt.Sprintf("  %s%s %s = %d;\n", optional, protoType, f.Name, fieldNum))
+		infoSig = append(infoSig, protoFieldSig{modifier: modifier, typeName: protoType, name: f.Name, tag: fieldNum})
+		fieldNum++
+	}
+
+	uniqueFields := collectUniqueFields(schema)
+	hasSoftDelete := hasDeletedAtField(schema)
+
+	out := fullProtoSet{}
+	addMsg := func(name, comment, body string, fields []protoFieldSig) {
+		out.messages = append(out.messages, protoMessageBlock{
+			name:    name,
+			comment: comment,
+			body:    body,
+			fields:  fields,
+		})
+	}
+	addRPC := func(method, req, resp, comment string, deps []string) {
+		out.rpcs = append(out.rpcs, protoRPCEntry{
+			method:  method,
+			req:     req,
+			resp:    resp,
+			comment: comment,
+			deps:    deps,
+		})
+	}
+
+	// Info
+	addMsg(modelName+"Info",
+		fmt.Sprintf("// %sInfo 核心详情结构，用于创建/更新/查询详情。\n", modelName),
+		infoFields.String(),
+		infoSig)
+
+	// 1. Create
+	addMsg("Create"+modelName+"Req",
+		fmt.Sprintf("// 创建%s请求\n", modelName),
+		fmt.Sprintf("  %sInfo info = 1;\n", modelName),
+		[]protoFieldSig{{typeName: modelName + "Info", name: "info", tag: 1}})
+	addMsg("Create"+modelName+"Resp",
+		fmt.Sprintf("// 创建%s响应\n", modelName),
+		"  uint64 id = 1;\n",
+		[]protoFieldSig{{typeName: "uint64", name: "id", tag: 1}})
+	addRPC("Create"+modelName, "Create"+modelName+"Req", "Create"+modelName+"Resp",
+		fmt.Sprintf("  // 创建%s\n", modelName),
+		[]string{"Create" + modelName + "Req", "Create" + modelName + "Resp", modelName + "Info"})
+
+	// 2. GetByID
+	addMsg("Get"+modelName+"ByIDReq",
+		fmt.Sprintf("// 按ID查询%s请求\n", modelName),
+		"  uint64 id = 1;\n",
+		[]protoFieldSig{{typeName: "uint64", name: "id", tag: 1}})
+	addRPC("Get"+modelName+"ByID", "Get"+modelName+"ByIDReq", modelName+"Info",
+		fmt.Sprintf("  // 按ID获取%s详情\n", modelName),
+		[]string{"Get" + modelName + "ByIDReq", modelName + "Info"})
+
+	// 3. GetByUnique
+	for _, uf := range uniqueFields {
+		fieldPascal := generator.GoPascal(uf.Name)
+		protoType := goTypeToProtoType(uf.TypeName)
+		msgName := fmt.Sprintf("Get%sBy%sReq", modelName, fieldPascal)
+		addMsg(msgName,
+			fmt.Sprintf("// 按%s查询%s请求\n", fieldPascal, modelName),
+			fmt.Sprintf("  %s %s = 1;\n", protoType, uf.Name),
+			[]protoFieldSig{{typeName: protoType, name: uf.Name, tag: 1}})
+		addRPC(fmt.Sprintf("Get%sBy%s", modelName, fieldPascal), msgName, modelName+"Info",
+			fmt.Sprintf("  // 按%s获取%s详情\n", fieldPascal, modelName),
+			[]string{msgName, modelName + "Info"})
+	}
+
+	// 4. UpdateByID
+	addMsg("Update"+modelName+"Req",
+		fmt.Sprintf("// 更新%s请求\n", modelName),
+		fmt.Sprintf("  %sInfo info = 1;\n", modelName),
+		[]protoFieldSig{{typeName: modelName + "Info", name: "info", tag: 1}})
+	addRPC("Update"+modelName, "Update"+modelName+"Req", "Empty",
+		fmt.Sprintf("  // 更新%s\n", modelName),
+		[]string{"Update" + modelName + "Req", modelName + "Info"})
+
+	// 5. UpdateByUnique
+	for _, uf := range uniqueFields {
+		fieldPascal := generator.GoPascal(uf.Name)
+		protoType := goTypeToProtoType(uf.TypeName)
+		msgName := fmt.Sprintf("Update%sBy%sReq", modelName, fieldPascal)
+		addMsg(msgName,
+			fmt.Sprintf("// 按%s更新%s请求\n", fieldPascal, modelName),
+			fmt.Sprintf("  %s %s = 1;\n  %sInfo info = 2;\n", protoType, uf.Name, modelName),
+			[]protoFieldSig{
+				{typeName: protoType, name: uf.Name, tag: 1},
+				{typeName: modelName + "Info", name: "info", tag: 2},
+			})
+		addRPC(fmt.Sprintf("Update%sBy%s", modelName, fieldPascal), msgName, "Empty",
+			fmt.Sprintf("  // 按%s更新%s\n", fieldPascal, modelName),
+			[]string{msgName, modelName + "Info"})
+	}
+
+	// 6. Delete (only soft delete)
+	if hasSoftDelete {
+		addMsg("Delete"+modelName+"Req",
+			fmt.Sprintf("// 删除%s请求（支持批量）\n", modelName),
+			"  repeated uint64 ids = 1;\n",
+			[]protoFieldSig{{modifier: "repeated", typeName: "uint64", name: "ids", tag: 1}})
+		addRPC("Delete"+modelName, "Delete"+modelName+"Req", "Empty",
+			fmt.Sprintf("  // 删除%s\n", modelName),
+			[]string{"Delete" + modelName + "Req"})
+	}
+
+	// 7. List
+	addMsg("Get"+modelName+"ListReq",
+		fmt.Sprintf("// 获取%s列表请求\n", modelName),
+		"  uint64 page = 1;\n  uint64 page_size = 2;\n",
+		[]protoFieldSig{
+			{typeName: "uint64", name: "page", tag: 1},
+			{typeName: "uint64", name: "page_size", tag: 2},
+		})
+	addMsg("Get"+modelName+"ListResp",
+		fmt.Sprintf("// 获取%s列表响应\n", modelName),
+		fmt.Sprintf("  uint64 total = 1;\n  repeated %sInfo data = 2;\n", modelName),
+		[]protoFieldSig{
+			{typeName: "uint64", name: "total", tag: 1},
+			{modifier: "repeated", typeName: modelName + "Info", name: "data", tag: 2},
+		})
+	addRPC("Get"+modelName+"List", "Get"+modelName+"ListReq", "Get"+modelName+"ListResp",
+		fmt.Sprintf("  // 获取%s列表\n", modelName),
+		[]string{"Get" + modelName + "ListReq", "Get" + modelName + "ListResp", modelName + "Info"})
+
+	return out
+}
+
+// renderProtoFile 把一个 protoFilePlan 渲染成最终的 .proto 文件文本。
+// 调用方保证 fp.rpcs 非空（空文件已在 commit 阶段剪枝）。
+func renderProtoFile(g *GenContext, fp *protoFilePlan) string {
+	var b strings.Builder
+	b.WriteString("syntax = \"proto3\";\n\n")
+	// 不输出 import 语句：本仓库后续会通过 merge-proto 把 desc/ 下所有 .proto 合并成
+	// 根 cs-xxx-rpc.proto，跨文件 message 引用在合并后属同一文件，不需要 import。
+	// fp.imports 仅用于 PhaseB 一致性体检（已存在且一致的 message → 不在本文件重复定义）。
+	b.WriteString(fmt.Sprintf("// ──── %s module ────\n\n", fp.modelName))
+
+	// messages —— 按"是否是 Info / 是否 Req-Resp 配对"原样输出，与旧实现观感一致。
+	wroteRRHeader := false
+	for _, m := range fp.messages {
+		// 在第一个非 Info / 非 Resp 的 Req 出现前打一次 Request/Response 分隔注释，
+		// 与旧 genDescProto 的输出风格保持一致。判定规则：name 不以 "Info" 结尾时认为进入 R/R 段。
+		if !wroteRRHeader && !strings.HasSuffix(m.name, "Info") {
+			b.WriteString("// ──── Request / Response ────\n\n")
+			wroteRRHeader = true
+		}
+		b.WriteString(m.comment)
+		b.WriteString(fmt.Sprintf("message %s {\n%s}\n\n", m.name, m.body))
+	}
+
+	// service block
+	b.WriteString(fmt.Sprintf("// %s 管理服务\n", fp.modelName))
+	b.WriteString(fmt.Sprintf("service %s {\n", generator.GoPascal(g.ServiceName)))
+	for _, r := range fp.rpcs {
+		b.WriteString(r.comment)
+		b.WriteString(fmt.Sprintf("  rpc %s (%s) returns (%s);\n", r.method, r.req, r.resp))
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// ==================== Desc Scanner（PhaseB 一致性体检依赖） ====================
+//
+// scanDescDir 全量扫描 desc/ 下所有 .proto 文件，把：
+//   - 所有 service 的 rpc 名（按 service 维度分桶）→ rpcs 入参
+//   - 所有 top-level message 的字段签名（首遇优先）→ messages 入参
+//
+// 解析采用纯字符串扫描，足以覆盖本工程内 desc proto 的标准写法：
+//   service Foo { rpc Bar (BarReq) returns (BarResp); ... }
+//   message Foo { [optional|repeated] <type> <name> = <tag>; ... }
+//
+// 为简单可靠：忽略嵌套 message（本工程不会写嵌套）；忽略 enum；遇到不可解析行直接跳过。
+// desc/ 不存在时静默返回 nil，让首次跑也能过。
+func scanDescDir(descRoot string, rpcs map[string]map[string]bool, messages map[string]existingMessageInfo) error {
+	info, err := os.Stat(descRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	return filepath.Walk(descRoot, func(path string, fi os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if fi.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".proto") {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil // 单文件读失败不阻断整体扫描
+		}
+		rel, _ := filepath.Rel(descRoot, path)
+		rel = filepath.ToSlash(rel)
+		parseProtoFile(string(raw), rel, rpcs, messages)
+		return nil
+	})
+}
+
+// parseProtoFile 把单个 .proto 文件文本解析进 rpcs / messages 两份索引。
+// 详见 scanDescDir 注释里的语法子集。
+func parseProtoFile(text, relPath string, rpcs map[string]map[string]bool, messages map[string]existingMessageInfo) {
+	lines := strings.Split(stripBlockComments(text), "\n")
+	type frame struct {
+		kind string // "service" | "message"
+		name string
+		// for message: 累积字段
+		fields []protoFieldSig
+	}
+	var stack []*frame
+	currentService := ""
+
+	push := func(f *frame) { stack = append(stack, f) }
+	top := func() *frame {
+		if len(stack) == 0 {
+			return nil
+		}
+		return stack[len(stack)-1]
+	}
+	pop := func() {
+		if len(stack) == 0 {
+			return
+		}
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch f.kind {
+		case "service":
+			currentService = ""
+		case "message":
+			// 仅顶层 message（pop 后栈空）入索引；嵌套 message 忽略。
+			if len(stack) == 0 {
+				if _, exists := messages[f.name]; !exists {
+					sortFieldSigsByTag(f.fields)
+					messages[f.name] = existingMessageInfo{relPath: relPath, fields: f.fields}
+				}
+			}
+		}
+	}
+
+	for _, raw := range lines {
+		line := strings.TrimSpace(stripLineComment(raw))
+		if line == "" {
+			continue
+		}
+		// 处理形如 "} ... {" 的极少见同行混排，按 { } 拆分逐块处理。
+		// 简化：按字符级别推进。
+		i := 0
+		for i < len(line) {
+			c := line[i]
+			if c == '}' {
+				pop()
+				i++
+				continue
+			}
+			// 找 service / message / rpc 关键字（仅在合适层级匹配）
+			if strings.HasPrefix(line[i:], "service ") && top() == nil {
+				rest := strings.TrimSpace(line[i+len("service "):])
+				name, _ := splitIdent(rest)
+				if name != "" {
+					push(&frame{kind: "service", name: name})
+					currentService = name
+					if _, ok := rpcs[name]; !ok {
+						rpcs[name] = make(map[string]bool)
+					}
+				}
+				if idx := strings.Index(line[i:], "{"); idx >= 0 {
+					i += idx + 1
+				} else {
+					break
+				}
+				continue
+			}
+			if strings.HasPrefix(line[i:], "message ") {
+				rest := strings.TrimSpace(line[i+len("message "):])
+				name, _ := splitIdent(rest)
+				if name != "" {
+					push(&frame{kind: "message", name: name})
+				}
+				if idx := strings.Index(line[i:], "{"); idx >= 0 {
+					i += idx + 1
+				} else {
+					break
+				}
+				continue
+			}
+			// rpc 行：仅在 service frame 内
+			if currentService != "" && strings.HasPrefix(line[i:], "rpc ") {
+				rest := strings.TrimSpace(line[i+len("rpc "):])
+				name, _ := splitIdent(rest)
+				if name != "" {
+					rpcs[currentService][name] = true
+				}
+				// 跳过本行剩余
+				break
+			}
+			// message frame 内的字段行
+			if t := top(); t != nil && t.kind == "message" {
+				// 一行可能完整一条字段：[optional|repeated] type name = tag;
+				if sig, ok := parseProtoFieldLine(line[i:]); ok {
+					t.fields = append(t.fields, sig)
+				}
+				// 一行只支持解析一条字段（本工程 proto 风格统一），余下 i 直接跳到末尾
+				break
+			}
+			i++
+		}
+	}
+	// 防御：未闭合的 frame 全部丢弃（不写入 messages），避免脏数据。
+	_ = currentService
+}
+
+// stripBlockComments 去掉 /* ... */ 块注释（不递归 / 不处理字符串字面量内的伪注释，足够本工程使用）。
+func stripBlockComments(s string) string {
+	for {
+		start := strings.Index(s, "/*")
+		if start < 0 {
+			return s
+		}
+		end := strings.Index(s[start:], "*/")
+		if end < 0 {
+			return s[:start]
+		}
+		s = s[:start] + s[start+end+2:]
+	}
+}
+
+// stripLineComment 去掉 "//" 之后的行尾注释。
+func stripLineComment(s string) string {
+	if idx := strings.Index(s, "//"); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// splitIdent 从 s 头部抽出一个标识符（字母/数字/下划线），返回 ident 与剩余串。
+func splitIdent(s string) (string, string) {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			i++
+			continue
+		}
+		break
+	}
+	return s[:i], s[i:]
+}
+
+// parseProtoFieldLine 解析一行 message 字段。期望形如：
+//
+//	[optional|repeated] <type> <name> = <tag>[ ... ];
+//
+// 解析失败返回 ok=false。
+func parseProtoFieldLine(line string) (protoFieldSig, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return protoFieldSig{}, false
+	}
+	// 必须含 "=" 与 ";"，否则不是字段
+	if !strings.Contains(line, "=") || !strings.Contains(line, ";") {
+		return protoFieldSig{}, false
+	}
+	// 识别 modifier
+	modifier := ""
+	switch {
+	case strings.HasPrefix(line, "optional "):
+		modifier = "optional"
+		line = strings.TrimPrefix(line, "optional ")
+	case strings.HasPrefix(line, "repeated "):
+		modifier = "repeated"
+		line = strings.TrimPrefix(line, "repeated ")
+	case strings.HasPrefix(line, "required "):
+		modifier = "required"
+		line = strings.TrimPrefix(line, "required ")
+	}
+	line = strings.TrimSpace(line)
+
+	// type
+	typeName, rest := splitIdent(line)
+	if typeName == "" {
+		return protoFieldSig{}, false
+	}
+	rest = strings.TrimSpace(rest)
+
+	// name
+	fieldName, rest := splitIdent(rest)
+	if fieldName == "" {
+		return protoFieldSig{}, false
+	}
+	rest = strings.TrimSpace(rest)
+	if !strings.HasPrefix(rest, "=") {
+		return protoFieldSig{}, false
+	}
+	rest = strings.TrimSpace(rest[1:])
+
+	// tag（数字串到第一个非数字为止）
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	if j == 0 {
+		return protoFieldSig{}, false
+	}
+	tag := 0
+	for k := 0; k < j; k++ {
+		tag = tag*10 + int(rest[k]-'0')
+	}
+
+	return protoFieldSig{
+		modifier: modifier,
+		typeName: typeName,
+		name:     fieldName,
+		tag:      tag,
+	}, true
+}
+
+// sortFieldSigsByTag 按 tag 升序排序字段签名，便于一致性比对忽略源文件中的字段顺序。
+func sortFieldSigsByTag(fs []protoFieldSig) {
+	sort.SliceStable(fs, func(i, j int) bool { return fs[i].tag < fs[j].tag })
+}
+
+// messageFieldsEqual 在"忽略字段顺序、忽略注释、忽略 option"的前提下严格比对两组字段：
+//   - 字段数量必须一致
+//   - 按 tag 升序逐个比对：modifier / typeName / name / tag 必须 100% 相同
+func messageFieldsEqual(a, b []protoFieldSig) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aa := append([]protoFieldSig(nil), a...)
+	bb := append([]protoFieldSig(nil), b...)
+	sortFieldSigsByTag(aa)
+	sortFieldSigsByTag(bb)
+	for i := range aa {
+		if aa[i] != bb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isBaseProtoMessage 判定 message 名是否属于 base.proto 内置类型，这类 message 不参与跨文件一致性比对。
+func isBaseProtoMessage(name string) bool {
+	switch name {
+	case "Empty", "PageInfo", "BaseIDReq", "BaseUUIDReq":
+		return true
+	}
+	return false
 }
