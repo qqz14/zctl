@@ -1293,7 +1293,8 @@ gen-ddl: # Generate DDL diff (review-only, NOT executed) | 输出 ent schema 与
 .PHONY: gen-rpc-ent-logic
 gen-rpc-ent-logic: # Generate CRUD+DAO+proto+logic from Ent | 一键生成全套 (usage: make gen-rpc-ent-logic model=User)
 	zctl rpc ent --schema=./ent/schema --style=$(PROJECT_STYLE) --service_name=$(SERVICE) --model=$(model)
-	@echo "Generate successfully (includes merge-proto + protoc + logic/server)"
+	@$(MAKE) gen-rpc
+	@echo "Generate successfully (ent: dao + desc proto; gen-rpc: merge + protoc + logic/server)"
 
 .PHONY: gen-dao-sql
 gen-dao-sql: # Generate DAO method from SQL | 根据SQL生成DAO方法 (usage: make gen-dao-sql sql="SELECT ...")
@@ -2498,7 +2499,16 @@ func RefreshCommandsDoc(abs string) {
 // ==================== Module placeholder files from desc/ ====================
 
 // GenModuleFiles scans desc/ subdirectories and creates module placeholder files
-// (pkg/model/{module}.go, pkg/consts/{module}.go, pkg/errcode/{module}.go)
+// (pkg/model/{file}.go, pkg/consts/{file}.go, pkg/errcode/{file}.go)
+//
+// File-name rule (must align with DAO/schema naming):
+//   - desc/ subdirectory uses DirName (all-lowercase, no underscores) — e.g. "csuserprofile"
+//   - placeholder file names MUST use FileSnake (snake_case) — e.g. "cs_user_profile.go"
+//
+// Recovery strategy: scan ent/schema/*.go to build a {DirName: FileSnake} map.
+// When a desc/ subdirectory matches a schema's DirName, use that schema's
+// snake_case file name; otherwise (e.g. "user", "base") fall back to the
+// directory name itself (which is already a valid file name).
 func (g *Generator) GenModuleFiles(abs string) error {
 	descDir := filepath.Join(abs, "desc")
 	if _, err := os.Stat(descDir); os.IsNotExist(err) {
@@ -2510,34 +2520,55 @@ func (g *Generator) GenModuleFiles(abs string) error {
 		return nil
 	}
 
+	// Build {dirName -> snakeName} map from ent/schema/*.go
+	// e.g. "cs_user_profile.go" → {"csuserprofile": "cs_user_profile"}
+	dirToSnake := make(map[string]string)
+	schemaDir := filepath.Join(abs, "ent", "schema")
+	if schemaEntries, e := os.ReadDir(schemaDir); e == nil {
+		for _, se := range schemaEntries {
+			if se.IsDir() || !strings.HasSuffix(se.Name(), ".go") {
+				continue
+			}
+			snake := strings.TrimSuffix(se.Name(), ".go")
+			// derive dir name = snake without underscores
+			dir := strings.ReplaceAll(snake, "_", "")
+			dirToSnake[dir] = snake
+		}
+	}
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		module := entry.Name()
+		dir := entry.Name()
+		// Resolve file base name: prefer schema-derived snake_case, else fall back to dir name
+		fileBase := dir
+		if snake, ok := dirToSnake[dir]; ok {
+			fileBase = snake
+		}
 
-		// pkg/model/{module}.go
+		// pkg/model/{fileBase}.go
 		modelDir := filepath.Join(abs, "pkg", "model")
 		pathx.MkdirIfNotExist(modelDir)
-		modelFile := filepath.Join(modelDir, module+".go")
+		modelFile := filepath.Join(modelDir, fileBase+".go")
 		if !pathx.FileExists(modelFile) {
-			os.WriteFile(modelFile, []byte(fmt.Sprintf("package model\n\n// ──── %s module models ────\n", module)), 0644)
+			os.WriteFile(modelFile, []byte(fmt.Sprintf("package model\n\n// ──── %s module models ────\n", dir)), 0644)
 		}
 
-		// pkg/consts/{module}.go
+		// pkg/consts/{fileBase}.go
 		constsDir := filepath.Join(abs, "pkg", "consts")
 		pathx.MkdirIfNotExist(constsDir)
-		constsFile := filepath.Join(constsDir, module+".go")
+		constsFile := filepath.Join(constsDir, fileBase+".go")
 		if !pathx.FileExists(constsFile) {
-			os.WriteFile(constsFile, []byte(fmt.Sprintf("package consts\n\n// ──── %s module constants ────\n", module)), 0644)
+			os.WriteFile(constsFile, []byte(fmt.Sprintf("package consts\n\n// ──── %s module constants ────\n", dir)), 0644)
 		}
 
-		// pkg/errcode/{module}.go
+		// pkg/errcode/{fileBase}.go
 		errcodeDir := filepath.Join(abs, "pkg", "errcode")
 		pathx.MkdirIfNotExist(errcodeDir)
-		errcodeFile := filepath.Join(errcodeDir, module+".go")
+		errcodeFile := filepath.Join(errcodeDir, fileBase+".go")
 		if !pathx.FileExists(errcodeFile) {
-			os.WriteFile(errcodeFile, []byte(fmt.Sprintf("package errcode\n\n// ──── %s module error codes ────\n// Add constants here. Messages come from i18n.\n", module)), 0644)
+			os.WriteFile(errcodeFile, []byte(fmt.Sprintf("package errcode\n\n// ──── %s module error codes ────\n// Add constants here. Messages come from i18n.\n", dir)), 0644)
 		}
 	}
 
