@@ -1088,7 +1088,7 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, mo
 		fmt.Fprintf(b, "\t\tCount(ctx)\n")
 		fmt.Fprintf(b, "\tif err != nil {\n")
 		fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Count")
-		fmt.Fprintf(b, "\t\treturn 0, errcode.Wrapf(errcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "Count")
+		fmt.Fprintf(b, "\t\treturn 0, errcode.Newf(bizcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "Count")
 		fmt.Fprintf(b, "\t}\n")
 		fmt.Fprintf(b, "\treturn count, nil\n")
 		return
@@ -1105,7 +1105,7 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, mo
 		fmt.Fprintf(b, "\t\t\treturn nil, nil\n")
 		fmt.Fprintf(b, "\t\t}\n")
 		fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "GetBy")
-		fmt.Fprintf(b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "GetBy")
+		fmt.Fprintf(b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "GetBy")
 		fmt.Fprintf(b, "\t}\n")
 		fmt.Fprintf(b, "\treturn result, nil\n")
 		return
@@ -1135,7 +1135,7 @@ func buildSelectImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, mo
 
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Find")
-	fmt.Fprintf(b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "Find")
+	fmt.Fprintf(b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.%s: %%v\", err)\n", modelLower, "Find")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn list, nil\n")
 }
@@ -1154,7 +1154,7 @@ func buildUpdateImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName, mo
 	fmt.Fprintf(b, "\t\tSave(ctx)\n")
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Update")
-	fmt.Fprintf(b, "\t\treturn 0, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.%s: %%v\", err)\n", modelLower, "Update")
+	fmt.Fprintf(b, "\t\treturn 0, errcode.Newf(bizcode.DBUpdateFailed, \"%s.%s: %%v\", err)\n", modelLower, "Update")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn affected, nil\n")
 }
@@ -1167,7 +1167,7 @@ func buildDeleteImpl(b *strings.Builder, p *parsedSQL, modelName, entPkgName str
 	fmt.Fprintf(b, "\t\tExec(ctx)\n")
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Delete")
-	fmt.Fprintf(b, "\t\treturn 0, errcode.Wrapf(errcode.DBDeleteFailed, \"%s.%s: %%v\", err)\n", modelLower, "Delete")
+	fmt.Fprintf(b, "\t\treturn 0, errcode.Newf(bizcode.DBDeleteFailed, \"%s.%s: %%v\", err)\n", modelLower, "Delete")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn affected, nil\n")
 	_ = modelSnake
@@ -1185,7 +1185,7 @@ func buildInsertImpl(b *strings.Builder, p *parsedSQL, modelName, modelLower str
 	fmt.Fprintf(b, "\t\tSave(ctx)\n")
 	fmt.Fprintf(b, "\tif err != nil {\n")
 	fmt.Fprintf(b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.%s failed\", ctxutil.ErrField(err))\n", modelName, "Insert")
-	fmt.Fprintf(b, "\t\treturn 0, errcode.Wrapf(errcode.DBInsertFailed, \"%s.%s: %%v\", err)\n", modelLower, "Insert")
+	fmt.Fprintf(b, "\t\treturn 0, errcode.Newf(bizcode.DBInsertFailed, \"%s.%s: %%v\", err)\n", modelLower, "Insert")
 	fmt.Fprintf(b, "\t}\n")
 	fmt.Fprintf(b, "\treturn result.ID, nil\n")
 }
@@ -1459,8 +1459,33 @@ func appendToImpl(filePath, methodName, body string) {
 	if strings.Contains(body, "sql.OrderDesc()") {
 		ensureImport(filePath, "entgo.io/ent/dialect/sql")
 	}
+	// Ensure bizcode import exists if generated code references bizcode.* constants
+	// (errcode.Newf(bizcode.DBxxxFailed, ...)). Reuse the existing pkg/errcode
+	// import to derive the project module path so we can build pkg/bizcode.
+	if strings.Contains(body, "bizcode.") {
+		if mp := deriveModulePathFromErrcodeImport(filePath); mp != "" {
+			ensureImport(filePath, mp+"/pkg/bizcode")
+		}
+	}
 
 	fmt.Printf("  → Appended %s to %s\n", methodName, filePath)
+}
+
+// deriveModulePathFromErrcodeImport 读 filePath 文件，从已有的
+// "<modulePath>/pkg/errcode" import 行中反推出模块前缀 modulePath。
+// 当前 DAO impl 模板必然先于本函数注入了 errcode import，因此此方式可靠。
+// 若文件不存在 / 找不到匹配，则返回空字符串。
+func deriveModulePathFromErrcodeImport(filePath string) string {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return ""
+	}
+	re := regexp.MustCompile(`"([^"\s]+)/pkg/errcode"`)
+	m := re.FindStringSubmatch(string(data))
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // ────────────────────── Helpers ──────────────────────

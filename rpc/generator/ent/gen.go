@@ -196,6 +196,21 @@ func GenEntLogic(g *GenContext) error {
 		fmt.Printf("[zctl] Generated module: %s\n", p.schema.Name)
 	}
 
+	// ── 生成统一的 DAO bizcode 文件：pkg/bizcode/dao.go ──
+	// 与 PhaseA 强耦合（dao 实现引用 bizcode.<Model>NotFound / CreateFailed / UpdateFailed / DeleteFailed），
+	// 因此必须在新工作流里也跑，否则 `go build` 直接挂；与 protoc/PhaseC 零依赖，前置即可。
+	{
+		var allSchemaNames []string
+		for _, s := range schemas.Schemas {
+			allSchemaNames = append(allSchemaNames, s.Name)
+		}
+		if err := genDaoErrcodeAll(outputDir, allSchemaNames); err != nil {
+			fmt.Printf("[zctl] Warning: failed to generate dao bizcode: %v\n", err)
+		} else {
+			fmt.Printf("[zctl] Generated pkg/bizcode/dao.go (%d modules)\n", len(allSchemaNames))
+		}
+	}
+
 	// 默认到这里就结束：用户自己跑 `make gen-rpc` 完成 merge + protoc + logic/server。
 	if !enableLegacyLogicGen {
 		fmt.Println("[zctl] Done. Run `make gen-rpc` to generate logic/server from desc/.")
@@ -234,16 +249,7 @@ func GenEntLogic(g *GenContext) error {
 		}
 	}
 
-	// Generate unified DAO errcode file (all modules in one file, with unique code segments + i18n)
-	var allSchemaNames []string
-	for _, s := range schemas.Schemas {
-		allSchemaNames = append(allSchemaNames, s.Name)
-	}
-	if err := genDaoErrcodeAll(outputDir, allSchemaNames); err != nil {
-		fmt.Printf("[zctl] Warning: failed to generate dao errcode: %v\n", err)
-	} else {
-		fmt.Printf("[zctl] Generated pkg/errcode/dao.go (%d modules)\n", len(allSchemaNames))
-	}
+	// 注意：DAO 统一 bizcode 文件已在 PhaseB 之后、新/旧流程分叉处生成，此处不再重复。
 
 	// ── 尾部：enum + logic 文件（protoc 已成功，几乎不会失败） ──
 	if err := runPostProtoc(outputDir, g.Style); err != nil {
@@ -981,6 +987,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	fmt.Fprintf(&b, "\t\"%s/ent\"\n", modulePath)
 	fmt.Fprintf(&b, "\t\"%s/ent/%s\"\n", modulePath, entPkg)
 	fmt.Fprintf(&b, "\t\"%s/internal/dao\"\n", modulePath)
+	fmt.Fprintf(&b, "\t\"%s/pkg/bizcode\"\n", modulePath)
 	fmt.Fprintf(&b, "\t\"%s/pkg/ctxutil\"\n", modulePath)
 	fmt.Fprintf(&b, "\t\"%s/pkg/errcode\"\n", modulePath)
 	fmt.Fprintf(&b, "\t\"%s/pkg/model\"\n", modulePath)
@@ -1041,7 +1048,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "\t\tID(ctx)\n")
 		fmt.Fprintf(&b, "\tif err != nil {\n")
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBInsertFailed, \"%s.Create: %%v\", err)\n", modelName)
 		fmt.Fprintf(&b, "\t}\n")
 		fmt.Fprintf(&b, "\tdata.ID = id\n")
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(id))\n", modelName)
@@ -1051,7 +1058,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Create().\n%s\t\tSave(ctx)\n", createSetters.String())
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.Create failed\", ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBInsertFailed, \"%s.Create: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBInsertFailed, \"%s.Create: %%v\", err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.Create ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName)
 	}
 
@@ -1062,16 +1069,16 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	if hasSoftDelete {
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id %s) (*ent.%s, error) {\n", entPkg, idGoType, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.ID(id), %s.DeletedAtIsNil()).Only(ctx)\n", entPkg, entPkg)
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
 	} else {
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetByID(ctx context.Context, id %s) (*ent.%s, error) {\n", entPkg, idGoType, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, id)\n")
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.GetByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetByID ok\", ctxutil.IDField(id))\n\treturn result, nil\n}\n\n", modelName)
 	}
 
@@ -1085,9 +1092,9 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		} else {
 			fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
 		}
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetBy%s failed\", ctxutil.ErrField(err))\n", modelName, camel)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetBy%s %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.GetBy%s %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, camel)
 	}
 
@@ -1106,9 +1113,9 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		}
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) GetBy%s(ctx context.Context, %s) (*ent.%s, error) {\n", entPkg, methodName, strings.Join(params, ", "), modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Query().Where(%s).Only(ctx)\n", strings.Join(whereParts, ", "))
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found by composite key\")\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found by composite key\")\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.GetBy%s failed\", ctxutil.ErrField(err))\n", modelName, methodName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.GetBy%s: %%v\", err)\n\t}\n", modelName, methodName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.GetBy%s: %%v\", err)\n\t}\n", modelName, methodName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.GetBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, methodName)
 	}
 
@@ -1118,17 +1125,17 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
 		fmt.Fprintf(&b, "\taffected, err := d.cli.Update().\n\t\tWhere(%s.ID(data.ID), %s.DeletedAtIsNil()).\n%s\t\tSave(ctx)\n", entPkg, entPkg, updateSetters.String())
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateByID failed\", ctxutil.IDField(data.ID), ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
-		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.Get(ctx, data.ID)\n")
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.UpdateByID refetch: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.UpdateByID refetch: %%v\", err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateByID ok\", ctxutil.IDField(data.ID))\n\treturn result, nil\n}\n\n", modelName)
 	} else {
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) UpdateByID(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.UpdateOneID(data.ID).\n%s\t\tSave(ctx)\n", updateSetters.String())
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: id=%%d\", data.ID)\n\t\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateByID failed\", ctxutil.IDField(data.ID), ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBUpdateFailed, \"%s.UpdateByID: %%v\", err)\n\t}\n", modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateByID ok\", ctxutil.IDField(data.ID))\n\treturn result, nil\n}\n\n", modelName)
 	}
 
@@ -1142,12 +1149,12 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		} else {
 			fmt.Fprintf(&b, "\texisting, err := d.cli.Query().Where(%s.%sEQ(%s)).Only(ctx)\n", entPkg, camel, uf.Name)
 		}
-		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(errcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
+		fmt.Fprintf(&b, "\tif err != nil {\n\t\tif ent.IsNotFound(err) {\n\t\t\treturn nil, errcode.Newf(bizcode.%sNotFound, \"%s not found: %s=%%v\", %s)\n\t\t}\n", modelName, modelName, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateBy%s query failed\", ctxutil.ErrField(err))\n", modelName, camel)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBQueryFailed, \"%s.UpdateBy%s query %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBQueryFailed, \"%s.UpdateBy%s query %s=%%v: %%v\", %s, err)\n\t}\n", modelName, camel, uf.Name, uf.Name)
 		fmt.Fprintf(&b, "\tresult, err := d.cli.UpdateOneID(existing.ID).\n%s\t\tSave(ctx)\n", updateSetters.String())
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.UpdateBy%s failed\", ctxutil.ErrField(err))\n", modelName, camel)
-		fmt.Fprintf(&b, "\t\treturn nil, errcode.Wrapf(errcode.DBUpdateFailed, \"%s.UpdateBy%s: %%v\", err)\n\t}\n", modelName, camel)
+		fmt.Fprintf(&b, "\t\treturn nil, errcode.Newf(bizcode.DBUpdateFailed, \"%s.UpdateBy%s: %%v\", err)\n\t}\n", modelName, camel)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.UpdateBy%s ok\", ctxutil.IDField(result.ID))\n\treturn result, nil\n}\n\n", modelName, camel)
 	}
 
@@ -1158,8 +1165,8 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) DeleteByID(ctx context.Context, id %s) error {\n", entPkg, idGoType)
 		fmt.Fprintf(&b, "\taffected, err := d.cli.Update().\n\t\tWhere(%s.ID(id), %s.DeletedAtIsNil()).\n\t\tSetDeletedAt(time.Now()).\n\t\tSave(ctx)\n", entPkg, entPkg)
 		fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.DeleteByID failed\", ctxutil.IDField(id), ctxutil.ErrField(err))\n", modelName)
-		fmt.Fprintf(&b, "\t\treturn errcode.Wrapf(errcode.DBDeleteFailed, \"%s.DeleteByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
-		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn errcode.Newf(errcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t}\n", modelName, modelName)
+		fmt.Fprintf(&b, "\t\treturn errcode.Newf(bizcode.DBDeleteFailed, \"%s.DeleteByID id=%%d: %%v\", id, err)\n\t}\n", modelName)
+		fmt.Fprintf(&b, "\tif affected == 0 {\n\t\treturn errcode.Newf(bizcode.%sNotFound, \"%s not found: id=%%d\", id)\n\t}\n", modelName, modelName)
 		fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.DeleteByID ok\", ctxutil.IDField(id))\n\treturn nil\n}\n\n", modelName)
 	}
 
@@ -1180,13 +1187,13 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	fmt.Fprintf(&b, "\t}\n\n")
 	fmt.Fprintf(&b, "\ttotal, err := query.Clone().Count(ctx)\n")
 	fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.List count failed\", ctxutil.ErrField(err))\n", modelName)
-	fmt.Fprintf(&b, "\t\treturn nil, 0, errcode.Wrapf(errcode.DBQueryFailed, \"%s.List count: %%v\", err)\n\t}\n", modelName)
+	fmt.Fprintf(&b, "\t\treturn nil, 0, errcode.Newf(bizcode.DBQueryFailed, \"%s.List count: %%v\", err)\n\t}\n", modelName)
 	fmt.Fprintf(&b, "\tif total == 0 {\n\t\treturn nil, 0, nil\n\t}\n\n")
 	fmt.Fprintf(&b, "\t// Apply pagination only when page is not nil.\n")
 	fmt.Fprintf(&b, "\tif page != nil {\n\t\tquery = query.\n\t\t\tOffset((page.Page - 1) * page.PageSize).\n\t\t\tLimit(page.PageSize)\n\t}\n\n")
 	fmt.Fprintf(&b, "\tlist, err := query.\n\t\tOrder(%s.ByID()).\n\t\tAll(ctx)\n", entPkg)
 	fmt.Fprintf(&b, "\tif err != nil {\n\t\tctxutil.L(ctx).Errorw(\"dao.%s.List query failed\", ctxutil.ErrField(err))\n", modelName)
-	fmt.Fprintf(&b, "\t\treturn nil, 0, errcode.Wrapf(errcode.DBQueryFailed, \"%s.List: %%v\", err)\n\t}\n", modelName)
+	fmt.Fprintf(&b, "\t\treturn nil, 0, errcode.Newf(bizcode.DBQueryFailed, \"%s.List: %%v\", err)\n\t}\n", modelName)
 	fmt.Fprintf(&b, "\tctxutil.L(ctx).Debugw(\"dao.%s.List ok\", ctxutil.CountField(total))\n\treturn list, total, nil\n}\n", modelName)
 
 	return os.WriteFile(filePath, []byte(b.String()), 0644)
@@ -1256,7 +1263,7 @@ func genModuleErrcode(g *GenContext, outputDir, modulePath string, schema *load.
 	return nil // handled by genDaoErrcodeAll
 }
 
-// genDaoErrcodeAll generates a single pkg/errcode/dao.go containing error codes
+// genDaoErrcodeAll generates a single pkg/bizcode/dao.go containing error codes
 // for ALL ent schemas, with each module assigned a unique 100-code segment.
 // It also auto-appends empty i18n entries to locale JSON files.
 //
@@ -1268,7 +1275,7 @@ func genModuleErrcode(g *GenContext, outputDir, modulePath string, schema *load.
 //
 // Always overwrites to ensure consistency across all modules.
 func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
-	dir := filepath.Join(outputDir, "pkg", "errcode")
+	dir := filepath.Join(outputDir, "pkg", "bizcode")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
 	}
@@ -1277,10 +1284,10 @@ func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	const segmentSize = 100
 
 	var b strings.Builder
-	b.WriteString("package errcode\n\n")
+	b.WriteString("package bizcode\n\n")
 	b.WriteString("// Code generated by zctl. DO NOT EDIT.\n")
 	b.WriteString("// DAO module error codes — each module gets a 100-code segment.\n")
-	b.WriteString("// Messages come from i18n (pkg/i18n/locale/{lang}.json → key \"errcode.{code}\").\n\n")
+	b.WriteString("// Messages come from i18n (pkg/i18n/locale/{lang}.json → key \"bizcode.{code}\").\n\n")
 
 	// Collect all error code → empty string for i18n
 	var i18nCodes []int
@@ -1337,7 +1344,7 @@ func appendI18nEntries(outputDir string, codes []int) error {
 	return nil
 }
 
-// mergeI18nCodes reads a locale JSON file, adds missing errcode keys with empty
+// mergeI18nCodes reads a locale JSON file, adds missing bizcode keys with empty
 // values, and writes it back with stable formatting.
 func mergeI18nCodes(filePath string, codes []int) error {
 	data, err := os.ReadFile(filePath)
@@ -1345,17 +1352,17 @@ func mergeI18nCodes(filePath string, codes []int) error {
 		return err
 	}
 
-	// Simple JSON parse: we expect {"errcode": {"key": "val", ...}, ...}
+	// Simple JSON parse: we expect {"bizcode": {"key": "val", ...}, ...}
 	// Use encoding/json for safety
 	var root map[string]map[string]string
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil // malformed JSON, skip
 	}
 
-	errSection, ok := root["errcode"]
+	errSection, ok := root["bizcode"]
 	if !ok {
 		errSection = make(map[string]string)
-		root["errcode"] = errSection
+		root["bizcode"] = errSection
 	}
 
 	changed := false

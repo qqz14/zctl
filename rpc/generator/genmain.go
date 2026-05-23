@@ -84,5 +84,9 @@ func (g *Generator) GenMain(ctx DirContext, proto parser.Proto, cfg *conf.Config
 		"hasMiddleware": true,
 		"middlewarePkg": ctx.GetMain().Package + "/internal/middleware",
 		"i18nPkg":       ctx.GetMain().Package + "/pkg/i18n",
+		// domainName: 用于注册 DomainInterceptor 时标识本服务的 domain。
+		// 取 go-module 路径的最后一段（与 go.mod 中 module 名一致），
+		// e.g. "github.com/qqz14/passport" → "passport"。
+		"domainName": filepath.Base(ctx.GetMain().Package),
 	}, fileName, false)
 }

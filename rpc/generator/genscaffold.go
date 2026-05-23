@@ -16,8 +16,12 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 	modulePath := projectCtx.Path // e.g. "github.com/xxx/passport"
 	serviceName := filepath.Base(abs)
 
-	// pkg/errcode (unified: error type + codes + grpc transport)
+	// pkg/errcode (transport-agnostic business error SDK: *Err type + ParseErr + ToGRPCStatus)
 	if err := g.genPkgErrcode(abs, modulePath); err != nil {
+		return err
+	}
+	// pkg/bizcode (business error code constants only; messages live in i18n)
+	if err := g.genPkgBizcode(abs, modulePath); err != nil {
 		return err
 	}
 	// pkg/ctxutil
@@ -139,25 +143,116 @@ func (g *Generator) genPkgErrcode(abs, modulePath string) error {
 		return err
 	}
 
-	// errcode.go — unified error type with grpcCode for HTTP status control
-	if err := writeIfNotExist(filepath.Join(dir, "errcode.go"), `package errcode
+	// errcode.go — transport-agnostic business error SDK (Google API Design §144).
+	// 错误码常量本身放在 pkg/bizcode 包，本包仅承载错误类型与传输逻辑。
+	if err := writeIfNotExist(filepath.Join(dir, "errcode.go"), `// Package errcode is a transport-agnostic SDK for unified business error
+// handling across gRPC services. It carries (bizCode, msg, statusCode, domain)
+// over the wire using google.rpc.ErrorInfo (Google API Design Guide §144).
+//
+// Concepts:
+//   - bizCode    (int)        : business error code, owned by each service.
+//     Lives in ErrorInfo.Reason on the wire.
+//   - msg        (string)     : human-readable, possibly i18n-translated.
+//     Lives in status.Message.
+//   - statusCode (codes.Code) : gRPC transport status. Defaults to Unknown
+//     (i.e. "this is a business error, please look
+//     at bizCode"). Override with WithStatus() to
+//     mark transport-level errors (Unauthenticated,
+//     PermissionDenied, …) which map to HTTP 4xx/5xx.
+//   - domain     (string)     : producing service identifier ("passport",
+//     "cs-agent", …). Lives in ErrorInfo.Domain on
+//     the wire. Each *Err carries its own domain so
+//     that errors transited through multiple
+//     services preserve origin attribution.
+//
+// Typical use:
+//
+//	// in business logic
+//	return nil, errcode.Newf(bizcode.UserNotFound, "user %d not found", uid)
+//
+//	// to mark a transport-level error
+//	return nil, errcode.Newf(bizcode.TokenExpired, "token expired").
+//	                        WithStatus(codes.Unauthenticated)
+//
+//	// caller side
+//	statusCode, bizCode, msg := errcode.ParseErr(err)
+//	if errcode.IsBizErr(err) {
+//	    // business error path
+//	}
+package errcode
 
 import (
 	"fmt"
+	"strconv"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// Err is the business error, implements error interface.
-// By default, gRPC status code is OK (→ HTTP 200), business code carried in message.
-// Use WithGRPC() to override for 401/403 etc.
+// Err is a business error implementing the error interface.
+//
+// By default a freshly-created Err has statusCode == codes.Unknown, which
+// is the canonical "business error" carrier in our wire protocol. Use
+// WithStatus() to mark it as a transport-level error (e.g. Unauthenticated
+// → HTTP 401).
+//
+// Err implements the GRPCStatus() *status.Status method, so the gRPC
+// framework will automatically convert it into the proper wire format
+// without any server interceptor.
 type Err struct {
-	code     int        // business error code (e.g. 95001)
-	msg      string     // error message (may be i18n-translated)
-	origin   string     // original error message before i18n translation
-	grpcCode codes.Code // gRPC status code, default 0 = OK → HTTP 200
+	code       int        // business error code (e.g. 95001)
+	msg        string     // error message (may be i18n-translated)
+	origin     string     // original message before any i18n translation
+	domain     string     // producing service identifier (e.g. "passport")
+	statusCode codes.Code // gRPC transport status; Unknown = biz error
 }
+
+// ──── Constructor ────
+
+// Newf creates a business error. statusCode defaults to codes.Unknown
+// (i.e. "this is a business error"). origin is set to the formatted msg
+// so it survives later i18n translation done by interceptors.
+func Newf(code int, format string, args ...interface{}) *Err {
+	msg := fmt.Sprintf(format, args...)
+	return &Err{
+		code:       code,
+		msg:        msg,
+		origin:     msg,
+		statusCode: codes.Unknown,
+	}
+}
+
+// ──── Mutators (chainable) ────
+
+// WithStatus overrides the gRPC transport status, marking this as a
+// transport-level error (e.g. Unauthenticated → HTTP 401).
+func (e *Err) WithStatus(c codes.Code) *Err {
+	if e != nil {
+		e.statusCode = c
+	}
+	return e
+}
+
+// WithDomain sets the producing service identifier. Typically called by
+// a server interceptor at the local service boundary.
+func (e *Err) WithDomain(domain string) *Err {
+	if e != nil {
+		e.domain = domain
+	}
+	return e
+}
+
+// WithMsg overrides the error message (used by the i18n interceptor).
+// The original msg is preserved in origin.
+func (e *Err) WithMsg(msg string) *Err {
+	if e != nil {
+		e.msg = msg
+	}
+	return e
+}
+
+// ──── Getters ────
 
 func (e *Err) Error() string {
 	if e == nil {
@@ -166,7 +261,6 @@ func (e *Err) Error() string {
 	return fmt.Sprintf("[%d] %s", e.code, e.msg)
 }
 
-// Code returns the business error code.
 func (e *Err) Code() int {
 	if e == nil {
 		return 0
@@ -174,7 +268,6 @@ func (e *Err) Code() int {
 	return e.code
 }
 
-// Msg returns the error message.
 func (e *Err) Msg() string {
 	if e == nil {
 		return ""
@@ -182,16 +275,6 @@ func (e *Err) Msg() string {
 	return e.msg
 }
 
-// GRPCCode returns the gRPC status code (0 means OK).
-func (e *Err) GRPCCode() codes.Code {
-	if e == nil {
-		return codes.OK
-	}
-	return e.grpcCode
-}
-
-// Origin returns the original error message before i18n translation.
-// Returns empty string if not translated.
 func (e *Err) Origin() string {
 	if e == nil {
 		return ""
@@ -199,32 +282,21 @@ func (e *Err) Origin() string {
 	return e.origin
 }
 
-// WithGRPC sets the gRPC status code for HTTP status override.
-// Usage: errcode.Newf(95003, "token expired").WithGRPC(codes.Unauthenticated) → HTTP 401
-func (e *Err) WithGRPC(c codes.Code) *Err {
-	e.grpcCode = c
-	return e
+func (e *Err) Domain() string {
+	if e == nil {
+		return ""
+	}
+	return e.domain
 }
 
-// WithOrigin preserves the original error message before i18n translation.
-func (e *Err) WithOrigin(origin string) *Err {
-	e.origin = origin
-	return e
+func (e *Err) StatusCode() codes.Code {
+	if e == nil {
+		return codes.OK
+	}
+	return e.statusCode
 }
 
-// ──── Constructors ────
-
-// Newf creates a business error (gRPC OK → HTTP 200 by default).
-func Newf(code int, format string, args ...interface{}) *Err {
-	return &Err{code: code, msg: fmt.Sprintf(format, args...)}
-}
-
-// Wrapf creates a business error wrapping an internal cause.
-func Wrapf(code int, format string, args ...interface{}) *Err {
-	return &Err{code: code, msg: fmt.Sprintf(format, args...)}
-}
-
-// ──── Helpers ────
+// ──── gRPC integration ────
 
 // ExtractErr tries to extract *Err from any error.
 func ExtractErr(err error) (*Err, bool) {
@@ -237,111 +309,137 @@ func ExtractErr(err error) (*Err, bool) {
 	return nil, false
 }
 
-// ExtractCode extracts business code from any error.
-func ExtractCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	if e, ok := err.(*Err); ok {
-		return e.code
-	}
-	if s, ok := status.FromError(err); ok {
-		return int(s.Code())
-	}
-	return InternalError
-}
-
-// Is checks whether err matches the given business code.
-func Is(err error, code int) bool { return ExtractCode(err) == code }
-`); err != nil {
-		return err
-	}
-
-	// grpc.go — encode/decode for gRPC transport (JSON in status message)
-	if err := writeIfNotExist(filepath.Join(dir, "grpc.go"), `package errcode
-
-import (
-	"encoding/json"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-)
-
-// grpcPayload is the JSON structure encoded in gRPC status message.
-// Gateway (e.g. APISIX) reads this to build the final HTTP response body.
-type grpcPayload struct {
-	Code int    `+"`"+`json:"code"`+"`"+`
-	Msg  string `+"`"+`json:"msg"`+"`"+`
-}
-
-// ToGRPCStatus converts *Err to gRPC status for transport.
-//   - gRPC code: e.grpcCode (default OK → HTTP 200)
-//   - message:   JSON {"code":95001,"msg":"用户不存在"}
-//
-// Called by GRPCStatusInterceptor, NOT by business code.
-func ToGRPCStatus(e *Err) *status.Status {
-	payload, _ := json.Marshal(grpcPayload{Code: e.code, Msg: e.msg})
-	return status.New(e.grpcCode, string(payload))
-}
-
 // StatusError converts *Err to a gRPC error for transport.
-// NOTE: when grpcCode is OK, gRPC returns nil (by design). This is expected —
-// GRPCStatusInterceptor handles this case via grpc.SetTrailer.
 func StatusError(e *Err) error {
 	return ToGRPCStatus(e).Err()
 }
 
-// FromGRPCStatus decodes *Err from a gRPC status (for client-side or testing).
-func FromGRPCStatus(st *status.Status) (*Err, bool) {
-	if st == nil {
-		return nil, false
+// ToGRPCStatus converts *Err into a *status.Status carrying our
+// ErrorInfo detail. Exported because some callers (e.g. test helpers,
+// HTTP gateways) want the *status.Status directly without the error
+// indirection.
+func ToGRPCStatus(e *Err) *status.Status {
+	if e == nil {
+		return status.New(codes.OK, "")
 	}
-	var p grpcPayload
-	if err := json.Unmarshal([]byte(st.Message()), &p); err != nil {
-		return nil, false
+	st := status.New(e.statusCode, e.msg)
+	info := &errdetails.ErrorInfo{
+		Reason: strconv.Itoa(e.code),
+		Domain: e.domain,
 	}
-	return &Err{code: p.Code, msg: p.Msg, grpcCode: st.Code()}, true
+	if withDetail, derr := st.WithDetails(info); derr == nil {
+		return withDetail
+	}
+	return st
 }
 
-// FromGRPCError decodes *Err from a gRPC error.
-func FromGRPCError(err error) (*Err, bool) {
+// ──── Inspection helpers ────
+
+// ParseErr decodes any error into (statusCode, bizCode, msg).
+//
+//	err == nil                              → (OK,      0,        "")
+//	*Err   (local)                          → (e.statusCode(), e.Code(), e.Msg())
+//	gRPC error with ErrorInfo detail        → (st.Code(),      bizCode,  st.Message())
+//	gRPC error without ErrorInfo            → (st.Code(),      0,        st.Message())
+//	non-gRPC error (fallback)               → (Unknown,        0,        err.Error())
+func ParseErr(err error) (codes.Code, int, string) {
 	if err == nil {
-		return nil, false
+		return codes.OK, 0, ""
 	}
+
+	// 1) Local *Err — not yet sent over the wire.
+	if e, ok := err.(*Err); ok {
+		return e.StatusCode(), e.Code(), e.Msg()
+	}
+
+	// 2) gRPC status error.
 	st, ok := status.FromError(err)
 	if !ok {
-		return nil, false
+		return codes.Unknown, 0, err.Error()
 	}
-	return FromGRPCStatus(st)
+
+	// 2.1) Business detail attached.
+	if bizCode, _, ok := extractBizDetail(st); ok {
+		return st.Code(), bizCode, st.Message()
+	}
+
+	// 2.2) Plain transport / framework error — no biz detail attached.
+	return st.Code(), 0, st.Message()
 }
 
-// IsOKCode returns true if grpcCode is OK (business error, HTTP 200).
-func IsOKCode(c codes.Code) bool {
-	return c == codes.OK
+// IsBizErr reports whether err is a business error in the strict sense:
+// it carries a non-zero bizCode AND its statusCode is codes.Unknown
+// (i.e. the canonical "business error" carrier).
+//
+// Use this to decide log level / HTTP code mapping at gateways.
+func IsBizErr(err error) bool {
+	statusCode, bizCode, _ := ParseErr(err)
+	return bizCode != 0 && statusCode == codes.Unknown
+}
+
+// Is reports whether err carries the given business code.
+func Is(err error, code int) bool {
+	_, bizCode, _ := ParseErr(err)
+	return bizCode == code
+}
+
+// extractBizDetail pulls (bizCode, domain) out of a gRPC status if it
+// carries an ErrorInfo whose Reason parses as int.
+func extractBizDetail(st *status.Status) (int, string, bool) {
+	if st == nil {
+		return 0, "", false
+	}
+	for _, d := range st.Details() {
+		info, ok := d.(*errdetails.ErrorInfo)
+		if !ok || info == nil {
+			continue
+		}
+		c, err := strconv.Atoi(info.Reason)
+		if err != nil {
+			continue
+		}
+		return c, info.Domain, true
+	}
+	return 0, "", false
 }
 `); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// ==================== pkg/bizcode ====================
+//
+// pkg/bizcode 仅放业务错误码常量（int），消息文案统一交给 pkg/i18n
+// （locale/{lang}.json → key "bizcode.{code}"）。
+// 业务侧通过 errcode.Newf(bizcode.XXX, "...") 构造业务错误。
+
+func (g *Generator) genPkgBizcode(abs, modulePath string) error {
+	dir := filepath.Join(abs, "pkg", "bizcode")
+	if err := pathx.MkdirIfNotExist(dir); err != nil {
+		return err
+	}
+
 	// common.go — only int constants, no *Err variables
-	content := `package errcode
+	content := `package bizcode
 
 // ──── Common error codes ────
-// Codes only. Messages come from i18n (pkg/i18n/locale/{lang}.json → key "errcode.{code}").
+// Codes only. Messages come from i18n (pkg/i18n/locale/{lang}.json → key "bizcode.{code}").
 const (
-	OK             = 0
-	InternalError  = 95000
-	InvalidParam   = 95001
-	NotFound       = 95002
-	Unauthorized   = 95003
-	Forbidden      = 95004
+	OK            = 0
+	InternalError = 95000
+	InvalidParam  = 95001
+	NotFound      = 95002
+	Unauthorized  = 95003
+	Forbidden     = 95004
 	// ContractViolation indicates the caller did not honor the declared proto constraints
 	// (buf.validate.field rules). This is a CALLER BUG — distinct from InvalidParam which
 	// represents legitimate business-level parameter validation failures.
 	// gRPC code: InvalidArgument (HTTP 400).
 	ContractViolation = 95005
 
-	// DB error codes (used by DAO layer via errcode.Wrapf)
+	// DB error codes (used by DAO layer via errcode.Newf)
 	DBQueryFailed  = 10006
 	DBInsertFailed = 10007
 	DBUpdateFailed = 10008
@@ -744,7 +842,7 @@ func (g *Generator) genMiddleware(abs, modulePath string) error {
 		return err
 	}
 
-	// log_module.go
+	// log_module.go — ModuleInterceptor: extract module name from gRPC FullMethod into ctx.
 	logModule := fmt.Sprintf(`package middleware
 
 import (
@@ -779,14 +877,55 @@ func extractModule(fullMethod string) string {
 		return err
 	}
 
-	// i18n_interceptor.go — translates error messages, returns *errcode.Err (no status conversion)
+	// domain_interceptor.go — stamps local service domain on outgoing *errcode.Err
+	// 这样跨服务转递错误时，最先产生该业务错的服务的 domain 永远保留。
+	domainInterceptor := fmt.Sprintf(`// Package middleware …
+//
+// DomainInterceptor injects the local service domain into every *errcode.Err
+// produced by this server, so that the wire ErrorInfo.Domain accurately
+// attributes the error to the producing service.
+//
+// Behavior:
+//   - Only writes Domain when the *Err has none. This preserves the original
+//     domain on errors transited from downstream services.
+//   - Non-*Err returns are left untouched (LogInterceptor enforces *Err).
+package middleware
+
+import (
+	"context"
+
+	"google.golang.org/grpc"
+
+	"%s/pkg/errcode"
+)
+
+// DomainInterceptor returns an interceptor that stamps the local domain
+// onto outgoing *errcode.Err values that have not yet been attributed.
+func DomainInterceptor(localDomain string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+		if e, ok := errcode.ExtractErr(err); ok && e.Domain() == "" {
+			_ = e.WithDomain(localDomain)
+		}
+		return resp, err
+	}
+}
+`, modulePath)
+	if err := writeIfNotExist(filepath.Join(dir, "domain_interceptor.go"), domainInterceptor); err != nil {
+		return err
+	}
+
+	// i18n_interceptor.go — translates business error messages, returns *errcode.Err.
+	// 方案 A（极简版）：只处理业务错（bizCode != 0）的 msg 翻译，其他原样透传。
 	i18nInterceptor := fmt.Sprintf(`package middleware
 
 import (
 	"context"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 
 	"%s/pkg/errcode"
@@ -794,11 +933,12 @@ import (
 )
 
 // I18nInterceptor translates business error messages to the client's language.
-// Input and output are both *errcode.Err — it only replaces the msg field.
-// The original msg is preserved via WithOrigin() for logging purposes.
 //
-// For non-errcode errors (should not happen if LogInterceptor enforces),
-// wraps as InternalError with translated message.
+// Scope (方案 A，极简版):
+//   - 只处理 *errcode.Err 且业务错误码非 0（即业务错）的 msg 翻译
+//   - 状态错（statusCode != Unknown）/ 非 errcode 错误 / bizCode == 0 一律原样透传，不动
+//   - 找到 i18n key → 用翻译过的 msg 替换 e.msg（origin 由 Newf 自动保留构造时原文）
+//   - 找不到 i18n key → 透传原 msg（兼容下游服务已翻译的场景）
 func I18nInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
@@ -806,22 +946,24 @@ func I18nInterceptor() grpc.UnaryServerInterceptor {
 			return resp, nil
 		}
 
-		lang := extractLang(ctx)
-
-		// *errcode.Err → translate msg, return *errcode.Err
-		if e, ok := errcode.ExtractErr(err); ok {
-			if msg := i18n.TranslateErrcode(lang, e.Code()); msg != "" {
-				return nil, errcode.Newf(e.Code(), msg).WithGRPC(e.GRPCCode()).WithOrigin(e.Msg())
-			}
+		e, ok := errcode.ExtractErr(err)
+		if !ok {
 			return nil, err
 		}
 
-		// Non-errcode error → wrap as InternalError
-		msg := "internal error"
-		if translated := i18n.TranslateErrcode(lang, errcode.InternalError); translated != "" {
-			msg = translated
+		// 仅业务错（bizCode != 0）才走翻译；状态错或 bizCode == 0 透传
+		if e.Code() == 0 {
+			return nil, err
 		}
-		return nil, errcode.Newf(errcode.InternalError, msg).WithGRPC(codes.Internal)
+
+		lang := extractLang(ctx)
+		translated := i18n.TranslateErrcode(lang, e.Code())
+		if translated == "" {
+			// 找不到翻译 → 透传原 msg（可能下游已翻译）
+			return nil, err
+		}
+
+		return nil, e.WithMsg(translated)
 	}
 }
 
@@ -841,7 +983,7 @@ func extractLang(ctx context.Context) string {
 		return err
 	}
 
-	// log_interceptor.go — logs all RPC calls (success + biz error + status error) with enforcement
+	// log_interceptor.go — logs all RPC calls with biz/status differentiation + non-errcode panic enforcement.
 	logInterceptor := fmt.Sprintf(`package middleware
 
 import (
@@ -858,18 +1000,21 @@ import (
 
 	"%s/pkg/ctxutil"
 	"%s/pkg/errcode"
-	"%s/pkg/i18n"
 )
 
 const maxLogBodyLen = 1024 // truncate request body in log if too long
 
-// LogInterceptor logs all RPC calls: success (Info) and errors (Error/Info).
-// At this point the error msg is already translated by I18nInterceptor,
+// LogInterceptor logs all RPC calls: success (Info) and errors (Error/Warn).
+// At this point the error msg may have been translated by I18nInterceptor
+// (when an i18n key exists; otherwise origin msg is preserved as-is),
 // and ctx already contains module name from ModuleInterceptor.
 //
 // Enforcement rules (fail-fast in dev):
 //  1. Every error MUST be *errcode.Err — non-errcode errors → panic.
-//  2. Business errors (grpcCode == OK) MUST have i18n translation → panic if missing.
+//
+// Note: i18n translation is best-effort (方案 A) — missing translations are
+// passed through silently to support cross-service msg propagation, so we
+// no longer panic on missing i18n keys here.
 func LogInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		start := time.Now()
@@ -897,67 +1042,42 @@ func LogInterceptor() grpc.UnaryServerInterceptor {
 		if !ok {
 			logx.Severef(
 				"[FATAL] %%s returned non-errcode error: %%v — "+
-					"wrap it with errcode.Newf/Wrapf in your logic",
+					"wrap it with errcode in your logic",
 				info.FullMethod, err,
 			)
 			panic(fmt.Sprintf(
 				"[errcode enforcement] %%s returned a raw error instead of *errcode.Err: %%v\n"+
-					"Fix: use errcode.Newf(code, msg) or errcode.Wrapf(code, msg) in your logic layer.",
+					"Fix: use errcode.Newf(code, msg) in your logic layer.",
 				info.FullMethod, err,
 			))
 		}
 
-		// ── Rule 2: business error (HTTP 200) MUST have i18n msg ──
-		grpcCode := e.GRPCCode()
-		bizCode := e.Code()
-		if errcode.IsOKCode(grpcCode) && bizCode != errcode.OK {
-			if msg := i18n.TranslateErrcode("en", bizCode); msg == "" {
-				logx.Severef(
-					"[FATAL] %%s returned errcode %%d with no i18n translation — "+
-						"add key \"errcode.%%d\" to pkg/i18n/locale/*.json",
-					info.FullMethod, bizCode, bizCode,
-				)
-				panic(fmt.Sprintf(
-					"[i18n enforcement] %%s: errcode %%d has no i18n translation.\n"+
-						"Fix: add \"errcode\".\""+fmt.Sprintf("%%d", bizCode)+"\" to all locale JSON files.",
-					info.FullMethod, bizCode,
-				))
-			}
-		}
-
 		// ── Log: business error vs status error ──
+		bizCode := e.Code()
+		statusCode := e.StatusCode()
 		origin := e.Origin() // original error msg before i18n translation
 
-		if errcode.IsOKCode(grpcCode) {
-			payload, _ := json.Marshal(struct {
-				Code int    `+"`"+`json:"code"`+"`"+`
-				Msg  string `+"`"+`json:"msg"`+"`"+`
-			}{Code: bizCode, Msg: e.Msg()})
-			fields := []logx.LogField{
-				logx.Field("method", info.FullMethod),
-				logx.Field("error", string(payload)),
-				logx.Field("cost(ms)", duration.Milliseconds()),
-				logx.Field("client_ip", clientIP),
-				logx.Field("request", reqStr),
-			}
-			if origin != "" {
-				fields = append(fields, logx.Field("origin", origin))
-			}
+		payload, _ := json.Marshal(struct {
+			Code int    `+"`"+`json:"code"`+"`"+`
+			Msg  string `+"`"+`json:"msg"`+"`"+`
+		}{Code: bizCode, Msg: e.Msg()})
+
+		fields := []logx.LogField{
+			logx.Field("method", info.FullMethod),
+			logx.Field("payload", string(payload)),
+			logx.Field("error", origin),
+			logx.Field("cost(ms)", duration.Milliseconds()),
+			logx.Field("client_ip", clientIP),
+			logx.Field("lang", lang),
+			logx.Field("request", reqStr),
+		}
+
+		if errcode.IsBizErr(err) {
+			// Business error (HTTP 200): Info level
 			logx.WithContext(ctx).Infow("rpc biz_error", fields...)
 		} else {
-			fields := []logx.LogField{
-				logx.Field("method", info.FullMethod),
-				logx.Field("code", bizCode),
-				logx.Field("grpc_code", grpcCode.String()),
-				logx.Field("error", e.Msg()),
-				logx.Field("cost(ms)", duration.Milliseconds()),
-				logx.Field("client_ip", clientIP),
-				logx.Field("lang", lang),
-				logx.Field("request", reqStr),
-			}
-			if origin != "" {
-				fields = append(fields, logx.Field("origin", origin))
-			}
+			// Status / transport error (HTTP 4xx/5xx): include status code, Error level
+			fields = append(fields, logx.Field("status_code", statusCode.String()))
 			logx.WithContext(ctx).Errorw("rpc status_error", fields...)
 		}
 
@@ -977,19 +1097,19 @@ func marshalRequest(req interface{}) string {
 	}
 	return reqStr
 }
-`, modulePath, modulePath, modulePath)
+`, modulePath, modulePath)
 	if err := writeIfNotExist(filepath.Join(dir, "log_interceptor.go"), logInterceptor); err != nil {
 		return err
 	}
 
-	// grpc_status_interceptor.go — converts *errcode.Err into gRPC transport format (outermost)
+	// grpc_status_interceptor.go — converts *errcode.Err into gRPC transport format (outermost).
+	// 由于 *errcode.Err 自带 GRPCStatus()，此拦截器可选；保留以便统一兜底/便于未来扩展。
 	grpcStatusInterceptor := fmt.Sprintf(`package middleware
 
 import (
 	"context"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 
 	"%s/pkg/errcode"
 )
@@ -997,13 +1117,15 @@ import (
 // GRPCStatusInterceptor converts *errcode.Err into gRPC transport format.
 // This is the last interceptor to touch the response before gRPC framework sends it.
 //
-// For status errors (grpcCode != OK, e.g. 401/403/500):
-//   Returns standard gRPC error → gateway maps to corresponding HTTP status.
+// Transport rules (status.Details based, Google API Design Guide):
 //
-// For business errors (grpcCode == OK, HTTP 200):
-//   gRPC status.New(OK, msg).Err() returns nil by design.
-//   We encode the JSON payload into grpc trailer "x-biz-error" so gateway
-//   can read it, and return (resp, nil) as a successful gRPC response.
+//   - status.Code:    e.statusCode (Unknown 用于承载业务错；其他为协议/状态错)
+//   - status.Message: 已 i18n 翻译的可读 msg
+//   - status.Details: errdetails.ErrorInfo{Reason:"<bizCode>", Domain:"<service>"}
+//
+// 调用方 / 网关侧统一通过 errcode.ParseErr(err) 解出 (grpcCode, bizCode, msg)：
+//   - bizCode != 0 且 grpcCode == Unknown → 业务错（HTTP 200 + body.code = bizCode）
+//   - grpcCode != Unknown 且 bizCode == 0 → 协议/状态错（HTTP 4xx/5xx）
 func GRPCStatusInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
@@ -1013,18 +1135,12 @@ func GRPCStatusInterceptor() grpc.UnaryServerInterceptor {
 
 		e, ok := errcode.ExtractErr(err)
 		if !ok {
+			// Should not happen — LogInterceptor enforces *errcode.Err.
+			// Pass through as-is; gRPC framework will treat it as Unknown.
 			return nil, err
 		}
 
-		// Status error (401/403/500): standard gRPC error
-		if !errcode.IsOKCode(e.GRPCCode()) {
-			return nil, errcode.StatusError(e)
-		}
-
-		// Business error (HTTP 200): encode JSON into trailer, return success
-		st := errcode.ToGRPCStatus(e)
-		grpc.SetTrailer(ctx, metadata.Pairs("x-biz-error", st.Message()))
-		return resp, nil
+		return nil, errcode.StatusError(e)
 	}
 }
 `, modulePath)
@@ -1032,7 +1148,7 @@ func GRPCStatusInterceptor() grpc.UnaryServerInterceptor {
 		return err
 	}
 
-	// metrics_interceptor.go — auto-report success/fail + status errors + biz errors
+	// metrics_interceptor.go — RPC counters (success/fail + status errors + biz errors).
 	metricsInterceptor := fmt.Sprintf(`package middleware
 
 import (
@@ -1047,8 +1163,9 @@ import (
 
 // MetricsInterceptor records per-RPC success/failure counters.
 //
-// At this point err is still the original *errcode.Err (already translated),
-// so we can distinguish status errors vs biz errors.
+// At this point err is still the original *errcode.Err — the gRPC framework
+// only converts it to wire format after all interceptors run, so we can
+// faithfully distinguish biz vs status errors here.
 //
 // Metrics reported:
 //
@@ -1056,11 +1173,11 @@ import (
 //     - result="success" on nil error
 //     - result="fail"    on any error
 //
-//  2. rpc_server_status_errors_total{method, grpc_code}
-//     - Only for status errors: grpcCode != OK (maps to HTTP 4xx/5xx)
+//  2. rpc_server_status_errors_total{method, status_code}
+//     - For transport-level errors (statusCode != Unknown OR no bizCode).
 //
 //  3. rpc_server_biz_errors_total{method, biz_code}
-//     - Only for business errors: grpcCode == OK (HTTP 200) but code != 0
+//     - For business errors (bizCode != 0 AND statusCode == Unknown).
 func MetricsInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
@@ -1074,21 +1191,17 @@ func MetricsInterceptor() grpc.UnaryServerInterceptor {
 
 		metrics.RPCTotal.Inc(method, "fail")
 
-		e, ok := errcode.ExtractErr(err)
-		if !ok {
-			metrics.RPCStatusTotal.Inc(method, "Internal")
+		if errcode.IsBizErr(err) {
+			_, bizCode, _ := errcode.ParseErr(err)
+			metrics.RPCBizErrorTotal.Inc(method, strconv.Itoa(bizCode))
 			return nil, err
 		}
 
-		grpcCode := e.GRPCCode()
-		bizCode := e.Code()
-
-		if errcode.IsOKCode(grpcCode) {
-			metrics.RPCBizErrorTotal.Inc(method, strconv.Itoa(bizCode))
-		} else {
-			metrics.RPCStatusTotal.Inc(method, grpcCode.String())
+		// Status / transport error — including non-*Err raw errors.
+		statusCode, _, _ := errcode.ParseErr(err)
+		if statusCode > 0 {
+			metrics.RPCStatusTotal.Inc(method, statusCode.String())
 		}
-
 		return nil, err
 	}
 }
@@ -1097,10 +1210,7 @@ func MetricsInterceptor() grpc.UnaryServerInterceptor {
 		return err
 	}
 
-	// validate_interceptor.go — uses buf.build/go/protovalidate to enforce
-	// (buf.validate.field) constraints declared in *.proto files at runtime via
-	// protoreflect, without any codegen step. Modules `go mod tidy` will pull
-	// `buf.build/go/protovalidate` automatically on first build.
+	// validate_interceptor.go — buf.build/go/protovalidate based contract validation.
 	validateInterceptor := fmt.Sprintf(`package middleware
 
 import (
@@ -1112,6 +1222,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 
+	"%s/pkg/bizcode"
 	"%s/pkg/errcode"
 )
 
@@ -1134,36 +1245,33 @@ func init() {
 // protoreflect, no codegen required.
 //
 // On validation failure, returns *errcode.Err with:
-//   - code     = errcode.ContractViolation (95005), a dedicated code for
+//   - bizCode    = bizcode.ContractViolation (95005), a dedicated code for
 //     "caller did not honor the proto-declared constraints" — semantically
 //     distinct from InvalidParam (95001) which is for legitimate business
 //     parameter validation. This is treated as a CALLER BUG.
-//   - grpcCode = codes.InvalidArgument (HTTP 400), so the gateway / client
+//   - statusCode = codes.InvalidArgument (HTTP 400), so the gateway / client
 //     can clearly tell apart "caller violated contract" (4xx) from
 //     "business rejected the request" (200 + biz code).
 //
-// The detailed protovalidate field-level error is logged here for engineers
-// to locate which field violated which rule. The msg returned to the client
-// will be replaced by I18nInterceptor with the localized text declared at
-// i18n key "errcode.95005".
+// The detailed protovalidate field-level error is logged here; the msg returned
+// to the client will be replaced by I18nInterceptor with the localized text
+// declared at i18n key "bizcode.95005".
 func ValidateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if msg, ok := req.(proto.Message); ok {
 			if err := validator.Validate(msg); err != nil {
-				// Detailed field-level violation goes to log only — clients receive
-				// the unified i18n text, not internal field details.
 				logx.WithContext(ctx).Errorw("rpc contract_violation",
 					logx.Field("method", info.FullMethod),
 					logx.Field("detail", err.Error()),
 				)
-				return nil, errcode.Newf(errcode.ContractViolation, err.Error()).
-					WithGRPC(codes.InvalidArgument)
+				return nil, errcode.Newf(bizcode.ContractViolation, err.Error()).
+					WithStatus(codes.InvalidArgument)
 			}
 		}
 		return handler(ctx, req)
 	}
 }
-`, modulePath)
+`, modulePath, modulePath)
 	return writeIfNotExist(filepath.Join(dir, "validate_interceptor.go"), validateInterceptor)
 }
 
@@ -1507,27 +1615,22 @@ exec "$BINARY" -f "$CONFIG_FILE" "$@"
 
 func (g *Generator) genEtcTemplate(abs, serviceName string, zctx *ZRpcContext) error {
 	svcLower := strings.ToLower(serviceName)
-	port := 8080
-	if zctx != nil && zctx.Port > 0 {
-		port = zctx.Port
-	}
-	portStr := fmt.Sprintf("%d", port)
 	upperSvc := strings.ToUpper(serviceName)
 
 	content := fmt.Sprintf(`Name: %s.rpc
-ListenOn: 0.0.0.0:${%s_RPC_PORT:-%s}
+ListenOn: 0.0.0.0:${%s_RPC_PORT}
 
 # Environment: dev | stage | uat | prod
 # Only dev/stage allow auto-migrate (create tables automatically)
-Env: ${ENV:-dev}
+Env: ${ENV}
 
 DatabaseConf:
   Type: mysql
-  Host: ${DB_HOST:-127.0.0.1}
-  Port: ${DB_PORT:-3306}
-  DBName: ${DB_NAME:-%s}
-  Username: ${DB_USER:-root}
-  Password: "${DB_PASSWORD:-password}"
+  Host: ${DB_HOST}
+  Port: ${DB_PORT}
+  DBName: ${DB_NAME}
+  Username: ${DB_USER}
+  Password: "${DB_PASSWORD}"
   MaxOpenConn: 50
   SSLMode: disable
   CacheTime: 5
@@ -1535,17 +1638,17 @@ DatabaseConf:
 Log:
   ServiceName: %sLogger
   Mode: console
-  Level: ${LOG_LEVEL:-info}
+  Level: ${LOG_LEVEL}
   Encoding: plain
   StackCoolDownMillis: 100
 
 RedisConf:
-  Host: ${REDIS_HOST:-127.0.0.1:6379}
+  Host: ${REDIS_HOST}
   Db: 0
 
 Prometheus:
   Host: 0.0.0.0
-  Port: ${PROMETHEUS_PORT:-4000}
+  Port: ${PROMETHEUS_PORT}
   Path: /metrics
 
 #Telemetry:
@@ -1553,7 +1656,7 @@ Prometheus:
 #  Endpoint: localhost:4317
 #  Sampler: 1.0
 #  Batcher: otlpgrpc
-`, svcLower, upperSvc, portStr, svcLower, svcLower, svcLower)
+`, svcLower, upperSvc, svcLower, svcLower)
 
 	dir := filepath.Join(abs, "etc")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
@@ -2129,7 +2232,7 @@ type UserDao interface {
 - 文件已存在时**不会覆盖**（除非加 ~--overwrite~），只创建缺失文件。
 - ~group~ 名称默认取 schema 小写名（~user~），决定 ~desc/{group}/~ 和 ~logic/{group}/~ 路径。
 - 生成后务必运行 ~make gen-rpc~ 来合并新的 proto 并重新生成 pb 文件。
-- DAO impl 使用 ~ctxutil.L(ctx)~ 打日志，~errcode.Wrapf~ 包装错误。
+- DAO impl 使用 ~ctxutil.L(ctx)~ 打日志，~errcode.Newf(bizcode.XXX, ...)~ 包装错误。
 
 **完整流程示例**：
 ~~~bash
@@ -2563,12 +2666,12 @@ func (g *Generator) GenModuleFiles(abs string) error {
 			os.WriteFile(constsFile, []byte(fmt.Sprintf("package consts\n\n// ──── %s module constants ────\n", dir)), 0644)
 		}
 
-		// pkg/errcode/{fileBase}.go
-		errcodeDir := filepath.Join(abs, "pkg", "errcode")
-		pathx.MkdirIfNotExist(errcodeDir)
-		errcodeFile := filepath.Join(errcodeDir, fileBase+".go")
-		if !pathx.FileExists(errcodeFile) {
-			os.WriteFile(errcodeFile, []byte(fmt.Sprintf("package errcode\n\n// ──── %s module error codes ────\n// Add constants here. Messages come from i18n.\n", dir)), 0644)
+		// pkg/bizcode/{fileBase}.go — 业务错误码常量占位文件（消息走 i18n）
+		bizcodeDir := filepath.Join(abs, "pkg", "bizcode")
+		pathx.MkdirIfNotExist(bizcodeDir)
+		bizcodeFile := filepath.Join(bizcodeDir, fileBase+".go")
+		if !pathx.FileExists(bizcodeFile) {
+			os.WriteFile(bizcodeFile, []byte(fmt.Sprintf("package bizcode\n\n// ──── %s module error codes ────\n// Add constants here. Messages come from i18n.\n", dir)), 0644)
 		}
 	}
 
