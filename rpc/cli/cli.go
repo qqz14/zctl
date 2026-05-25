@@ -94,9 +94,10 @@ func RPCNew(_ *cobra.Command, args []string) error {
 	}
 
 	// 2. Generate desc/base/ping.proto (common messages + Ping rpc)
-	// Use generator.GoPascal so dashed names like "cs-agent-rpc" become a valid PascalCase
-	// proto3 ident ("CsAgentRpc"), matching what MergeDescProtos emits later.
-	serviceName := generator.GoPascal(rpcname)
+	// Use ServiceGoIdent so dashed/underscored/PascalCase names all collapse to the
+	// same canonical PascalCase ident ("cs-agent-rpc" → "CsAgentRpc"), matching what
+	// MergeDescProtos emits later (single source of truth).
+	serviceName := generator.ServiceGoIdent(rpcname)
 	pingDirRel := filepath.Join(descDir, "ping")
 	pingDirAbs, err := filepath.Abs(pingDirRel)
 	if err != nil {

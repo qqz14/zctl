@@ -9,9 +9,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
-	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/pathx"
-	"github.com/qqz14/zctl/util/stringx"
 )
 
 //go:embed main.tpl
@@ -27,10 +25,15 @@ type MainServiceTemplateData struct {
 // GenMain generates the main file of the rpc service, which is an rpc service program call entry
 func (g *Generator) GenMain(ctx DirContext, proto parser.Proto, cfg *conf.Config,
 	c *ZRpcContext) error {
-	mainFilename, err := format.FileNamingFormat(cfg.NamingFormat, ctx.GetServiceName().Source())
-	if err != nil {
-		return err
-	}
+	// File-name policy (see naming-spec.md):
+	//   • The root main file ({input}.go) and the etc/{input}.yaml path must
+	//     mirror the **user's raw input** verbatim.
+	//   • The project root directory was created from that raw input by
+	//     `zctl rpc new <name>`, so filepath.Base(WorkDir) recovers it.
+	//   • cfg.NamingFormat (e.g. "go_zero") would re-snake-case the proto
+	//     package ident and thus differ from the user input — we therefore
+	//     ignore it for these two file names only.
+	mainFilename := filepath.Base(ctx.GetMain().Filename)
 
 	fileName := filepath.Join(ctx.GetMain().Filename, fmt.Sprintf("%v.go", mainFilename))
 	imports := make([]string, 0)
@@ -58,9 +61,16 @@ func (g *Generator) GenMain(ctx DirContext, proto parser.Proto, cfg *conf.Config
 			remoteImport = fmt.Sprintf(`%s "%v"`, serverPkg, childPkg)
 		}
 		imports = append(imports, remoteImport)
+		// Normalize the service ident through ServiceGoIdent so that even when the
+		// proto we read carries a stale "CsAgentRPC"-style name (e.g. produced by
+		// an older zctl, or hand-written by the user with strcase initialism),
+		// the symbols we reference here (`Register{X}Server` / `New{X}Server`)
+		// always match what the current protoc-gen-go-grpc emits — i.e. "Rpc"
+		// is **not** treated as an acronym.
+		svcIdent := ServiceGoIdent(e.Name)
 		serviceNames = append(serviceNames, MainServiceTemplateData{
-			GRPCService: parser.CamelCase(e.Name),
-			Service:     stringx.From(e.Name).ToCamel(),
+			GRPCService: svcIdent,
+			Service:     svcIdent,
 			ServerPkg:   serverPkg,
 			Pkg:         proto.PbPackage,
 		})
@@ -71,10 +81,8 @@ func (g *Generator) GenMain(ctx DirContext, proto parser.Proto, cfg *conf.Config
 		return err
 	}
 
-	etcFileName, err := format.FileNamingFormat(cfg.NamingFormat, ctx.GetServiceName().Source())
-	if err != nil {
-		return err
-	}
+	// etc/{input}.yaml — same raw-input rule as above.
+	etcFileName := mainFilename
 
 	return util.With("main").GoFmt(true).Parse(text).SaveTo(map[string]any{
 		"serviceName":   etcFileName,

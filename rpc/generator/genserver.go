@@ -7,13 +7,13 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/zeromicro/go-zero/core/collection"
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
 	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
+	"github.com/zeromicro/go-zero/core/collection"
 )
 
 const functionTemplate = `
@@ -94,11 +94,18 @@ func (g *Generator) genServerGroup(ctx DirContext, proto parser.Proto, cfg *conf
 			}
 		}
 
+		// Normalize the service ident through ServiceGoIdent so that the symbols
+		// we reference (`type {X}Server`, `New{X}Server`, `Unimplemented{X}Server`)
+		// always match what the current protoc-gen-go-grpc emits — i.e. "Rpc" is
+		// **not** treated as an acronym, even when proto.Service[0].Name is a stale
+		// "CsAgentRPC" produced by an older zctl.
+		svcIdent := ServiceGoIdent(service.Name)
+
 		if err = util.With("server").GoFmt(true).Parse(text).SaveTo(map[string]any{
 			"head": head,
 			"unimplementedServer": fmt.Sprintf("%s.Unimplemented%sServer", proto.PbPackage,
-				parser.CamelCase(service.Name)),
-			"server":    stringx.From(service.Name).ToCamel(),
+				svcIdent),
+			"server":    svcIdent,
 			"imports":   strings.Join(imports.Keys(), pathx.NL),
 			"funcs":     strings.Join(funcList, pathx.NL),
 			"notStream": notStream,
@@ -168,10 +175,12 @@ func (g *Generator) genServerInCompatibility(ctx DirContext, proto parser.Proto,
 	pkgMap := parser.BuildProtoPackageMap(proto.ImportedProtos)
 	head := util.GetHead(proto.Name)
 	service := proto.Service[0]
-	serverFilename, err := format.FileNamingFormat(cfg.NamingFormat, service.Name+"_server")
-	if err != nil {
-		return err
-	}
+	// File-name policy (single-service compat mode only):
+	//   internal/server/{input}_server.go — mirror the user's raw input verbatim,
+	//   matching the root {input}.go / {input}.proto convention.
+	//   See naming-spec.md.
+	serverFilename := filepath.Base(ctx.GetMain().Filename) + "_server"
+	_ = cfg // cfg.NamingFormat intentionally ignored here
 
 	serverFile := filepath.Join(dir.Filename, serverFilename+".go")
 	funcList, extraImportPaths, err := g.genFunctionsWithGroup(proto.PbPackage, proto.GoPackage, service, pkgMap, rpcGroupMap, aliasMap)
@@ -195,11 +204,14 @@ func (g *Generator) genServerInCompatibility(ctx DirContext, proto parser.Proto,
 		}
 	}
 
+	// Normalize the service ident — see comment in genServerGroup above.
+	svcIdent := ServiceGoIdent(service.Name)
+
 	return util.With("server").GoFmt(true).Parse(text).SaveTo(map[string]any{
 		"head": head,
 		"unimplementedServer": fmt.Sprintf("%s.Unimplemented%sServer", proto.PbPackage,
-			parser.CamelCase(service.Name)),
-		"server":    stringx.From(service.Name).ToCamel(),
+			svcIdent),
+		"server":    svcIdent,
 		"imports":   strings.Join(imports.Keys(), pathx.NL),
 		"funcs":     strings.Join(funcList, pathx.NL),
 		"notStream": notStream,
@@ -230,7 +242,12 @@ func (g *Generator) genFunctions(goPackage, mainGoPackage string, service parser
 		}
 
 		comment := parser.GetComment(rpc.Doc())
-		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, parser.CamelCase(service.Name),
+		// `streamServer` references the protoc-gen-go-grpc emitted symbol
+		// `{Service}_{Method}Server`; normalize the service ident through
+		// ServiceGoIdent so it matches what protoc actually emits even when
+		// service.Name is a stale "CsAgentRPC".
+		svcIdent := ServiceGoIdent(service.Name)
+		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Server")
 
 		reqRef := resolveRPCTypeRef(rpc.RequestType, goPackage, mainGoPackage, pkgMap)
@@ -243,7 +260,7 @@ func (g *Generator) genFunctions(goPackage, mainGoPackage string, service parser
 		}
 
 		buffer, err := util.With("func").Parse(text).Execute(map[string]any{
-			"server":     stringx.From(service.Name).ToCamel(),
+			"server":     svcIdent,
 			"logicName":  logicName,
 			"method":     parser.CamelCase(rpc.Name),
 			"request":    "*" + reqRef.GoRef,
@@ -291,7 +308,12 @@ func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, servi
 		}
 
 		comment := parser.GetComment(rpc.Doc())
-		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, parser.CamelCase(service.Name),
+		// `streamServer` references the protoc-gen-go-grpc emitted symbol
+		// `{Service}_{Method}Server`; normalize the service ident through
+		// ServiceGoIdent so it matches what protoc actually emits even when
+		// service.Name is a stale "CsAgentRPC".
+		svcIdent := ServiceGoIdent(service.Name)
+		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Server")
 
 		reqRef := resolveRPCTypeRef(rpc.RequestType, goPackage, mainGoPackage, pkgMap)
@@ -304,7 +326,7 @@ func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, servi
 		}
 
 		buffer, err := util.With("func").Parse(text).Execute(map[string]any{
-			"server":     stringx.From(service.Name).ToCamel(),
+			"server":     svcIdent,
 			"logicName":  logicName,
 			"method":     parser.CamelCase(rpc.Name),
 			"request":    "*" + reqRef.GoRef,

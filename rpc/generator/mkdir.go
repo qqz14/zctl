@@ -7,7 +7,6 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util/ctx"
-	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
 )
@@ -92,11 +91,13 @@ func mkdir(ctx *ctx.ProjectContext, proto parser.Proto, conf *conf.Config, c *ZR
 		callDir := filepath.Join(ctx.WorkDir,
 			strings.ToLower(stringx.From(proto.Service[0].Name).ToCamel()))
 		if strings.EqualFold(proto.Service[0].Name, filepath.Base(proto.GoPackage)) {
-			var err error
-			clientDir, err = format.FileNamingFormat(conf.NamingFormat, proto.Service[0].Name+"_client")
-			if err != nil {
-				return nil, err
-			}
+			// Client directory follows the **directory naming rule**: a single
+			// all-lowercase no-separator token + "_client" suffix.
+			// e.g. service "CsAgentRpc" / proto pkg "csagentrpc" → "csagentrpc_client/"
+			// This matches naming-spec.md (rule #2: directories are always
+			// the canonical lower-no-sep form, regardless of how the user
+			// spelled the service name on the CLI).
+			clientDir = ProtoPkg(proto.Service[0].Name) + "_client"
 			callDir = filepath.Join(ctx.WorkDir, clientDir)
 		}
 		callClientDir = callDir

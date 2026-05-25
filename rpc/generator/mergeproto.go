@@ -43,7 +43,7 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 	//   - svcGo    : PascalCase Go-style service identifier                  "cs-agent-rpc" → "CsAgentRpc"
 	// Both inputs `cs-agent-rpc` / `cs_agent_rpc` / `csAgentRpc` map to the same outputs.
 	protoPkg := ProtoPkg(serviceName)
-	svcGo := GoPascal(serviceName)
+	svcGo := ServiceGoIdent(serviceName)
 
 	var messageLines strings.Builder // all message/enum definitions
 	var rpcLines strings.Builder     // all rpc method lines

@@ -8,13 +8,13 @@ import (
 	"strings"
 
 	"github.com/emicklei/proto"
-	"github.com/zeromicro/go-zero/core/collection"
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
 	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
+	"github.com/zeromicro/go-zero/core/collection"
 )
 
 const (
@@ -64,7 +64,12 @@ func (g *Generator) genCallGroup(ctx DirContext, proto parser.Proto, cfg *conf.C
 		isCallPkgSameToPbPkg := childDir == ctx.GetProtoGo().Filename
 		isCallPkgSameToGrpcPkg := childDir == ctx.GetProtoGo().Filename
 
-		serviceName := stringx.From(service.Name).ToCamel()
+		// Normalize through ServiceGoIdent so the symbols we emit (e.g.
+		// `New{X}Client`, `default{X}` receiver) line up with what
+		// protoc-gen-go-grpc actually generated, even if service.Name carries a
+		// stale "CsAgentRPC" from an older zctl.
+		svcIdent := ServiceGoIdent(service.Name)
+		serviceName := svcIdent
 
 		// Collect only the message types actually used by this service's RPCs,
 		// so that each client file only aliases its own request/response types.
@@ -143,12 +148,16 @@ func (g *Generator) genCallInCompatibility(ctx DirContext, proto parser.Proto,
 	isCallPkgSameToPbPkg := ctx.GetCall().Filename == ctx.GetPb().Filename
 	isCallPkgSameToGrpcPkg := ctx.GetCall().Filename == ctx.GetProtoGo().Filename
 
-	callFilename, err := format.FileNamingFormat(cfg.NamingFormat, service.Name)
-	if err != nil {
-		return err
-	}
+	// File-name policy (single-service mode):
+	//   {client_dir}/{input}.go — mirror the user's raw project-root name verbatim,
+	//   so the client SDK file name stays in lock-step with the root {input}.go /
+	//   {input}.proto convention. See naming-spec.md.
+	callFilename := filepath.Base(ctx.GetMain().Filename)
+	_ = cfg // cfg.NamingFormat intentionally ignored for this file name
 
-	serviceName := stringx.From(service.Name).ToCamel()
+	// Normalize through ServiceGoIdent — see comment in genCallGroup above.
+	svcIdent := ServiceGoIdent(service.Name)
+	serviceName := svcIdent
 	alias := collection.NewSet[string]()
 	var hasSameNameBetweenMessageAndService bool
 	for _, item := range proto.Message {
@@ -241,10 +250,13 @@ func (g *Generator) genFunction(goPackage, mainGoPackage, serviceName string, se
 		}
 
 		comment := parser.GetComment(rpc.Doc())
-		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, parser.CamelCase(service.Name),
+		// `New{X}Client` and `{X}_{Method}Client` are protoc-gen-go-grpc symbols;
+		// normalize through ServiceGoIdent to keep "Rpc" out of acronym mode.
+		svcIdent := ServiceGoIdent(service.Name)
+		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Client")
 		if isCallPkgSameToGrpcPkg {
-			streamServer = fmt.Sprintf("%s_%s%s", parser.CamelCase(service.Name),
+			streamServer = fmt.Sprintf("%s_%s%s", svcIdent,
 				parser.CamelCase(rpc.Name), "Client")
 		}
 
@@ -265,7 +277,7 @@ func (g *Generator) genFunction(goPackage, mainGoPackage, serviceName string, se
 
 		buffer, err := util.With("sharedFn").Parse(text).Execute(map[string]any{
 			"serviceName":            serviceName,
-			"rpcServiceName":         parser.CamelCase(service.Name),
+			"rpcServiceName":         svcIdent,
 			"method":                 parser.CamelCase(rpc.Name),
 			"package":                goPackage,
 			"pbRequest":              reqName,
@@ -300,10 +312,12 @@ func (g *Generator) getInterfaceFuncs(goPackage, mainGoPackage string, service p
 		}
 
 		comment := parser.GetComment(rpc.Doc())
-		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, parser.CamelCase(service.Name),
+		// Same normalization rationale as in genFunction above.
+		svcIdent := ServiceGoIdent(service.Name)
+		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Client")
 		if isCallPkgSameToGrpcPkg {
-			streamServer = fmt.Sprintf("%s_%s%s", parser.CamelCase(service.Name),
+			streamServer = fmt.Sprintf("%s_%s%s", svcIdent,
 				parser.CamelCase(rpc.Name), "Client")
 		}
 
@@ -340,14 +354,14 @@ func (g *Generator) getInterfaceFuncs(goPackage, mainGoPackage string, service p
 // buildExtraImportLines converts a set of import paths into quoted import lines
 // for use in the call.tpl {{.extraImports}} placeholder.
 func buildExtraImportLines(extraImports *collection.Set[string]) string {
-if extraImports.Count() == 0 {
-return ""
-}
-keys := extraImports.Keys()
-sort.Strings(keys)
-lines := make([]string, 0, len(keys))
-for _, k := range keys {
-lines = append(lines, fmt.Sprintf(`"%s"`, k))
-}
-return strings.Join(lines, "\n\t")
+	if extraImports.Count() == 0 {
+		return ""
+	}
+	keys := extraImports.Keys()
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, k := range keys {
+		lines = append(lines, fmt.Sprintf(`"%s"`, k))
+	}
+	return strings.Join(lines, "\n\t")
 }

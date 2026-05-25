@@ -69,17 +69,23 @@ func LowerCamel(s string) string {
 	return strings.ToLower(s[:1]) + s[1:]
 }
 
-// ProtoPkg converts an arbitrary service name to a **proto package identifier**.
-// proto3 only accepts ident chars [A-Za-z0-9_]; dashes are illegal. Service names
-// like "cs-agent-rpc" must be normalized before being written into
-// `package xxx;` / `option go_package = "./xxx";`.
+// ProtoPkg converts an arbitrary service name to the canonical "directory /
+// proto-package" identifier — a single all-lowercase token with no separators.
 //
-// Rules: drop everything that is not [A-Za-z0-9_], then ToLower.
+// This is the single source of truth for both:
+//   - proto3 `package xxx;` / `option go_package = "./xxx";`
+//   - all generated directory names that derive from the service name
+//     (e.g. types/{xxx}/, {xxx}_client/)
+//
+// Rules: drop everything that is not [A-Za-z0-9], then ToLower. We drop "_" as
+// well so the three accepted user input styles collapse to the same token,
+// matching the agreed convention "directory name = csagentrpc, regardless of
+// whether the user typed cs-agent-rpc / cs_agent_rpc / CsAgentRpc".
 //
 //	"cs-agent-rpc" → "csagentrpc"
-//	"cs_agent_rpc" → "cs_agent_rpc"
-//	"Passport"     → "passport"
-//	"My-Svc_v2"    → "mysvc_v2"
+//	"cs_agent_rpc" → "csagentrpc"
+//	"CsAgentRpc"   → "csagentrpc"
+//	"My-Svc_v2"    → "mysvcv2"
 func ProtoPkg(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -87,10 +93,138 @@ func ProtoPkg(s string) string {
 		switch {
 		case r >= 'A' && r <= 'Z':
 			b.WriteRune(r + ('a' - 'A'))
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
-			// every other char (incl. '-') is dropped
+			// every other char (incl. '-' and '_') is dropped
 		}
 	}
 	return b.String()
+}
+
+// ServiceGoIdent converts an arbitrary service name to the canonical PascalCase
+// Go identifier used as the proto `service Xxx` name and Go struct receiver.
+//
+// Unlike GoPascal (which leans on strcase's Go-style initialism table and turns
+// "rpc"/"api"/"id" into "RPC"/"API"/"ID"), this function intentionally does NOT
+// expand initialisms — every word is Title-cased only. This keeps the user's
+// service name predictable and round-trip stable across the three accepted input
+// styles.
+//
+//	"cs-agent-rpc" → "CsAgentRpc"
+//	"cs_agent_rpc" → "CsAgentRpc"
+//	"CsAgentRpc"   → "CsAgentRpc"
+//	"my-svc_v2"    → "MySvcV2"
+func ServiceGoIdent(s string) string {
+	if s == "" {
+		return s
+	}
+	// Split on any non-letter / non-digit boundary, plus the lower→upper boundary
+	// inside camelCase / PascalCase input.
+	var (
+		words   []string
+		current strings.Builder
+	)
+	flush := func() {
+		if current.Len() > 0 {
+			words = append(words, current.String())
+			current.Reset()
+		}
+	}
+	runes := []rune(s)
+	for i, r := range runes {
+		switch {
+		case r == '-' || r == '_' || r == ' ' || r == '.':
+			flush()
+		case r >= 'A' && r <= 'Z':
+			// Treat lower→Upper as a word boundary so that "csAgentRpc"
+			// → ["cs","Agent","Rpc"] and "CsAgentRpc" → ["Cs","Agent","Rpc"].
+			if i > 0 {
+				prev := runes[i-1]
+				if prev >= 'a' && prev <= 'z' {
+					flush()
+				}
+			}
+			current.WriteRune(r)
+		default:
+			current.WriteRune(r)
+		}
+	}
+	flush()
+
+	var b strings.Builder
+	for _, w := range words {
+		if w == "" {
+			continue
+		}
+		// Title-case the word: first rune Upper, rest lowered.
+		first := []rune(w)[0]
+		if first >= 'a' && first <= 'z' {
+			first = first - ('a' - 'A')
+		}
+		b.WriteRune(first)
+		for _, r := range []rune(w)[1:] {
+			if r >= 'A' && r <= 'Z' {
+				r = r + ('a' - 'A')
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// DashName converts an arbitrary service name to dash form, which is what we
+// emit as the Docker image tag (Makefile's `SERVICE_DASH`).
+//
+//	"cs-agent-rpc" → "cs-agent-rpc"
+//	"cs_agent_rpc" → "cs-agent-rpc"
+//	"CsAgentRpc"   → "cs-agent-rpc"
+//	"csAgentRpc"   → "cs-agent-rpc"
+//	"My-Svc_v2"    → "my-svc-v2"
+//
+// Rules:
+//  1. lower→Upper boundary inside camelCase becomes "-"
+//  2. "_" and " " become "-"
+//  3. result is lower-cased
+//  4. consecutive dashes are collapsed
+func DashName(s string) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	runes := []rune(s)
+	for i, r := range runes {
+		switch {
+		case r == '-' || r == '_' || r == ' ' || r == '.':
+			b.WriteRune('-')
+		case r >= 'A' && r <= 'Z':
+			if i > 0 {
+				prev := runes[i-1]
+				if prev >= 'a' && prev <= 'z' {
+					b.WriteRune('-')
+				}
+			}
+			b.WriteRune(r + ('a' - 'A'))
+		default:
+			b.WriteRune(r)
+		}
+	}
+	// Collapse repeated dashes and trim edges.
+	out := b.String()
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-")
+	return out
+}
+
+// EnvVarName converts an arbitrary service name to an UPPER_SNAKE_CASE token
+// suitable for embedding in shell environment variable names (e.g. used in
+// `etc/{name}.yaml.template` to build `${CS_AGENT_RPC_RPC_PORT}`).
+//
+//	"cs-agent-rpc" → "CS_AGENT_RPC"
+//	"cs_agent_rpc" → "CS_AGENT_RPC"
+//	"CsAgentRpc"   → "CS_AGENT_RPC"
+func EnvVarName(s string) string {
+	dash := DashName(s)
+	return strings.ToUpper(strings.ReplaceAll(dash, "-", "_"))
 }

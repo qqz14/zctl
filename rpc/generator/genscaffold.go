@@ -1282,19 +1282,25 @@ func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) erro
 	if zctx != nil && zctx.Port > 0 {
 		port = zctx.Port
 	}
-	svcLower := strings.ToLower(serviceName)
-	// Use GoPascal so dashed names like "cs-agent-rpc" become "CsAgentRpc" (a valid Go identifier),
-	// matching the service ident emitted by mergeproto.go (single source of truth).
-	svcCamel := GoPascal(serviceName)
+	// Three derived forms — the canonical naming scheme for everything Makefile
+	// downstream needs to talk about this service. See doc: naming-spec.md.
+	//   - SERVICE      = PascalCase Go ident   (no initialism expansion)   "CsAgentRpc"
+	//   - SERVICE_STYLE= raw user input        (preserved verbatim)        "cs-agent-rpc" / "cs_agent_rpc" / "CsAgentRpc"
+	//   - SERVICE_DIR  = lower no-separator    (proto pkg / dir name)      "csagentrpc"
+	//   - SERVICE_DASH = dash form             (Docker tag etc.)           "cs-agent-rpc"
+	svcCamel := ServiceGoIdent(serviceName)
+	svcStyle := serviceName
+	svcDir := ProtoPkg(serviceName)
+	svcDash := DashName(serviceName)
 
 	content := fmt.Sprintf(`# Custom configuration | 独立配置
-# Service name | 项目名称
+# Service name | 项目名称 (PascalCase Go 标识符)
 SERVICE=%s
-# Service name in specific style | 项目经过style格式化的名称
+# Service name in specific style | 用户原样输入的服务名 (用于文件名)
 SERVICE_STYLE=%s
-# Service name in lowercase | 项目名称全小写格式
-SERVICE_LOWER=%s
-# Service name in dash format | 项目名称短杠格式
+# Service directory name | 服务的目录形式 (全小写、无分隔符)
+SERVICE_DIR=%s
+# Service name in dash format | 项目名称短杠格式 (Docker 镜像 tag)
 SERVICE_DASH=%s
 
 # The project version, if you don't use git, you should set it manually | 项目版本
@@ -1516,7 +1522,7 @@ grpc-list: # List all gRPC services | 列出所有 gRPC 服务
 .PHONY: help
 help: # Show help | 显示帮助
 	@grep -E '^[a-zA-Z0-9 -]+:.*#'  Makefile | sort | while read -r l; do printf "\033[1;32m$$(echo $$l | cut -f 1 -d':')\\033[00m:$$(echo $$l | cut -f 2- -d'#')\\n"; done
-`, svcCamel, svcLower, svcLower, svcLower, port)
+`, svcCamel, svcStyle, svcDir, svcDash, port)
 
 	return writeIfNotExist(filepath.Join(abs, "Makefile"), content)
 }
@@ -1524,7 +1530,13 @@ help: # Show help | 显示帮助
 // ==================== Dockerfile ====================
 
 func (g *Generator) genDockerfile(abs, serviceName string) error {
-	svcLower := strings.ToLower(serviceName)
+	// All filenames inside the Dockerfile must mirror what the host project
+	// actually produces — that is, **the user's raw input**:
+	//   • the build output binary             → ./{input}
+	//   • the main entrypoint .go             → ./{input}.go
+	//   • the rendered yaml.template path     → ./etc/{input}.yaml.template
+	// So we use serviceName verbatim here (no ToLower / no normalization).
+	svcStyle := serviceName
 	content := fmt.Sprintf(`# ==========================================
 # Stage 1: Build
 # ==========================================
@@ -1567,7 +1579,7 @@ COPY ./etc/%s.yaml.template ./etc/%s.yaml.template
 COPY --from=builder /build/pkg/i18n/locale ./pkg/i18n/locale
 
 ENTRYPOINT ["./entrypoint.sh"]
-`, svcLower, svcLower, svcLower, svcLower, svcLower, svcLower)
+`, svcStyle, svcStyle, svcStyle, svcStyle, svcStyle, svcStyle)
 
 	return writeIfNotExist(filepath.Join(abs, "Dockerfile"), content)
 }
@@ -1614,8 +1626,18 @@ exec "$BINARY" -f "$CONFIG_FILE" "$@"
 // ==================== etc/xxx.yaml.template ====================
 
 func (g *Generator) genEtcTemplate(abs, serviceName string, zctx *ZRpcContext) error {
-	svcLower := strings.ToLower(serviceName)
-	upperSvc := strings.ToUpper(serviceName)
+	// File-name + payload identifiers, all derived from the same single input:
+	//   svcStyle  → preserved verbatim (used for the file name)
+	//   svcDir    → all-lowercase no-separator (used for the gRPC `Name` field
+	//               which must match the proto package name)
+	//   svcCamel  → PascalCase Go ident (used for log ServiceName)
+	//   svcEnv    → UPPER_SNAKE_CASE prefix used in shell-style env var names
+	//   svcDash   → dash form (used in the OTel service name comment)
+	svcStyle := serviceName
+	svcDir := ProtoPkg(serviceName)
+	svcCamel := ServiceGoIdent(serviceName)
+	svcEnv := EnvVarName(serviceName)
+	svcDash := DashName(serviceName)
 
 	content := fmt.Sprintf(`Name: %s.rpc
 ListenOn: 0.0.0.0:${%s_RPC_PORT}
@@ -1652,17 +1674,17 @@ Prometheus:
   Path: /metrics
 
 #Telemetry:
-#  Name: %s-rpc
+#  Name: %s
 #  Endpoint: localhost:4317
 #  Sampler: 1.0
 #  Batcher: otlpgrpc
-`, svcLower, upperSvc, svcLower, svcLower)
+`, svcDir, svcEnv, svcCamel, svcDash)
 
 	dir := filepath.Join(abs, "etc")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
 		return err
 	}
-	return writeIfNotExist(filepath.Join(dir, svcLower+".yaml.template"), content)
+	return writeIfNotExist(filepath.Join(dir, svcStyle+".yaml.template"), content)
 }
 
 // ==================== .gitignore ====================
@@ -1709,7 +1731,12 @@ etc/*.yaml
 // ==================== README.md ====================
 
 func (g *Generator) genProjectReadme(abs, serviceName string, zctx *ZRpcContext) error {
-	svcLower := strings.ToLower(serviceName)
+	// Each placeholder in the template below references one of the four
+	// canonical naming forms — see naming-spec.md.
+	svcStyle := serviceName               // raw user input (file names)
+	svcDir := ProtoPkg(serviceName)       // proto pkg / dir name
+	svcCamel := ServiceGoIdent(serviceName) // PascalCase Go ident
+	svcDash := DashName(serviceName)      // dash form (K8s svc, docker tag)
 	port := 8080
 	if zctx != nil && zctx.Port > 0 {
 		port = zctx.Port
@@ -1971,14 +1998,14 @@ make gen-ddl name=add_role_cid_to_user_role  # 推荐：语义化命名
 └── %s_client/             # RPC 客户端 SDK
 `+"```"+`
 `, serviceName,
-		svcLower, svcLower,
-		svcLower, svcLower, svcLower,
-		svcLower, svcLower,
-		svcLower, serviceName,
-		svcLower, svcLower, port,
-		svcLower, port,
-		svcLower, svcLower, svcLower,
-		svcLower)
+		svcDir, svcDir,                       // remote-repo subdir paths
+		svcStyle, svcDir, svcDir,             // local-path + remote-subdir + commit-scope
+		svcStyle, svcDir,                     // CI: %s.proto + %s_client/
+		svcDir, svcCamel,                     // grpc-test method = {protoPkg}.{ServiceIdent}/Ping
+		svcCamel, svcDash, port,              // K8s discovery cfg
+		svcCamel, port,                       // direct discovery cfg
+		svcStyle, svcStyle, svcStyle,         // project tree: root dir, root .go, root .proto
+		svcDir)                               // {svcDir}_client/
 
 	return writeIfNotExist(filepath.Join(abs, "README.md"), content)
 }
@@ -1992,7 +2019,11 @@ func (g *Generator) genCommandsDoc(abs, serviceName string) error {
 // GenCommandsDoc generates/overwrites zctl-commands.md documentation.
 // Exported so that every subcommand (ent, dao, merge-proto, enum) can refresh it.
 func GenCommandsDoc(abs, serviceName string) error {
-	svcLower := strings.ToLower(serviceName)
+	// Two distinct placeholder substitutions — see naming-spec.md.
+	//   {{SVC_STYLE}} → preserved verbatim, used for file names    "cs-agent-rpc.proto"
+	//   {{SVC_DIR}}   → all-lowercase no-separator, used for dirs   "types/csagentrpc/"
+	svcStyle := serviceName
+	svcDir := ProtoPkg(serviceName)
 
 	content := strings.ReplaceAll(`# zctl 桩命令使用说明
 
@@ -2028,18 +2059,18 @@ make gen-rpc
 ~~~
 
 **内部调用链**：
-1. ~zctl rpc merge-proto~ → 扫描 ~desc/**/*.proto~ → 合并到 ~{{SERVICE}}.proto~
+1. ~zctl rpc merge-proto~ → 扫描 ~desc/**/*.proto~ → 合并到 ~{{SVC_STYLE}}.proto~
 2. 自动扫描 ~desc/~ 中的 ~enum~ → 生成 ~pkg/enums/{snake_name}.go~
-3. ~zctl rpc protoc {{SERVICE}}.proto~ → protoc → ~types/{package}/~
+3. ~zctl rpc protoc {{SVC_STYLE}}.proto~ → protoc → ~types/{package}/~
 4. 扫描 ~desc/~ 子目录 → 生成 ~pkg/model/~、~pkg/consts/~、~pkg/errcode/~ 模块占位文件
 
 **生成/修改的文件**：
 
 | 文件路径 | 操作 | 说明 |
 |----------|------|------|
-| ~{{SERVICE}}.proto~ | 覆盖 | 合并后的根 proto（只读，不要手动编辑） |
-| ~types/{{SERVICE}}/*.pb.go~ | 覆盖 | protoc 生成的 Go pb 文件 |
-| ~types/{{SERVICE}}/*_grpc.pb.go~ | 覆盖 | protoc 生成的 gRPC 桩代码 |
+| ~{{SVC_STYLE}}.proto~ | 覆盖 | 合并后的根 proto（只读，不要手动编辑） |
+| ~types/{{SVC_DIR}}/*.pb.go~ | 覆盖 | protoc 生成的 Go pb 文件 |
+| ~types/{{SVC_DIR}}/*_grpc.pb.go~ | 覆盖 | protoc 生成的 gRPC 桩代码 |
 | ~internal/server/*_server.go~ | 新建/跳过已有 | gRPC server 实现（按 service 分包） |
 | ~internal/logic/**/*_logic.go~ | 新建/跳过已有 | Logic 层（层级对齐 desc/ 目录） |
 | ~pkg/enums/{snake_name}.go~ | 覆盖 | proto enum → Go 枚举助手 |
@@ -2058,7 +2089,7 @@ make gen-rpc
 无需手动传递 module 参数，按 ~module=User~ 即可过滤某模块的所有日志。
 
 **注意事项**：
-- ~{{SERVICE}}.proto~ 是合并生成的，**设为只读（0444）权限**，所有 proto 修改都应在 ~desc/~ 子目录下进行。
+- ~{{SVC_STYLE}}.proto~ 是合并生成的，**设为只读（0444）权限**，所有 proto 修改都应在 ~desc/~ 子目录下进行。
 - ~internal/logic/~ 和 ~internal/server/~ 下已有文件不会被覆盖，只新增缺失的。
 - proto 中的 ~enum~ 命名需遵循 ~ENUM_NAME_VALUE~ 格式（如 ~USER_STATUS_NORMAL~），才能被自动扫描。
 
@@ -2444,7 +2475,7 @@ func (e OrderStatus) Int32() int32 { ... }
 
 ## 7. ~zctl rpc merge-proto~
 
-**做什么**：扫描 ~desc/**/*.proto~ 所有子文件，合并 message/enum/service 定义到根 ~{{SERVICE}}.proto~。通常不需要单独调用，~make gen-rpc~ 会自动调用。
+**做什么**：扫描 ~desc/**/*.proto~ 所有子文件，合并 message/enum/service 定义到根 ~{{SVC_STYLE}}.proto~。通常不需要单独调用，~make gen-rpc~ 会自动调用。
 
 **执行命令**：
 ~~~bash
@@ -2457,7 +2488,7 @@ make gen-rpc  # 内部会先调用 merge-proto
 
 | 文件路径 | 操作 | 说明 |
 |----------|------|------|
-| ~{{SERVICE}}.proto~ | 覆盖 | 合并后的根 proto 文件 |
+| ~{{SVC_STYLE}}.proto~ | 覆盖 | 合并后的根 proto 文件 |
 
 **合并规则**：
 1. ~desc/base.proto~ 中读取 ~package~ 和 ~go_package~ 作为根 proto 头部。
@@ -2468,16 +2499,16 @@ make gen-rpc  # 内部会先调用 merge-proto
 **注意事项**：
 - ~desc/base.proto~ 必须存在，它定义了 ~package~ 和 ~go_package~。
 - 每个 ~desc/{group}/{model}.proto~ 文件中不要写 ~syntax~, ~option go_package~ 等头部（合并时会自动去除，但建议保持简洁）。
-- 根 proto 文件（~{{SERVICE}}.proto~）是自动生成的，**不要手动编辑**。
+- 根 proto 文件（~{{SVC_STYLE}}.proto~）是自动生成的，**不要手动编辑**。
 
 ---
 
 ## 项目目录结构
 
 ~~~
-{{SERVICE}}/
-├── {{SERVICE}}.go              # 主入口
-├── {{SERVICE}}.proto           # 合并后的 proto（自动生成，勿编辑）
+{{SVC_STYLE}}/
+├── {{SVC_STYLE}}.go              # 主入口
+├── {{SVC_STYLE}}.proto           # 合并后的 proto（自动生成，勿编辑）
 ├── Makefile
 ├── Dockerfile
 ├── entrypoint.sh
@@ -2490,8 +2521,8 @@ make gen-rpc  # 内部会先调用 merge-proto
 ├── ent/
 │   └── schema/                 # entgo 表结构定义（手动编辑）
 ├── etc/                        # 配置
-│   ├── {{SERVICE}}.yaml        # 运行时配置（.gitignore 忽略）
-│   └── {{SERVICE}}.yaml.template  # 配置模板（提交到 git）
+│   ├── {{SVC_STYLE}}.yaml        # 运行时配置（.gitignore 忽略）
+│   └── {{SVC_STYLE}}.yaml.template  # 配置模板（提交到 git）
 ├── internal/
 │   ├── config/                 # 配置结构体
 │   ├── svc/                    # ServiceContext（DAO 实例注入）
@@ -2516,7 +2547,7 @@ make gen-rpc  # 内部会先调用 merge-proto
 │   ├── i18n/                   # 国际化
 │   └── entlog/                 # ent SQL 日志
 ├── zctl-commands.md            # 桩命令使用说明（自动生成）
-└── {{SERVICE}}client/          # RPC 客户端 SDK
+└── {{SVC_DIR}}_client/          # RPC 客户端 SDK
 ~~~
 
 ---
@@ -2573,7 +2604,8 @@ make run
 | ~make help~ | 显示所有命令 |
 `, "~", "`")
 
-	content = strings.ReplaceAll(content, "{{SERVICE}}", svcLower)
+	content = strings.ReplaceAll(content, "{{SVC_STYLE}}", svcStyle)
+	content = strings.ReplaceAll(content, "{{SVC_DIR}}", svcDir)
 	content = strings.ReplaceAll(content, "~~~", "```")
 
 	// Always overwrite: this is auto-generated documentation that should stay in sync with the tool version.
@@ -2689,8 +2721,8 @@ func (g *Generator) genDescDir(abs, serviceName string) error {
 }
 
 func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
-	svcLower := strings.ToLower(serviceName) // raw lower (may contain '-')
-	protoPkg := ProtoPkg(serviceName)        // valid proto3 ident (no '-'/space)
+	svcStyle := serviceName          // file name = user input verbatim
+	protoPkg := ProtoPkg(serviceName) // valid proto3 ident (no '-'/'_'/space)
 
 	content := fmt.Sprintf(`#!/bin/bash
 # merge_proto.sh — Merge all desc/**/*.proto into root %s.proto
@@ -2699,8 +2731,9 @@ func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
 set -e
 
 SERVICE="%s"
-# PROTO_PKG: proto3 package identifier (only [A-Za-z0-9_]). Service names with
-# dashes (e.g. "cs-agent-rpc") are normalized to "csagentrpc" by zctl at scaffold time.
+# PROTO_PKG: proto3 package identifier (only [A-Za-z0-9]). Service names with
+# dashes/underscores (e.g. "cs-agent-rpc") are normalized to "csagentrpc" by zctl
+# at scaffold time.
 PROTO_PKG="%s"
 ROOT_PROTO="./${SERVICE}.proto"
 DESC_DIR="./desc"
@@ -2738,7 +2771,7 @@ for f in $FILES; do
 done
 
 echo "[merge_proto] Generated ${ROOT_PROTO} from $(echo $FILES | wc -w | tr -d ' ') proto files"
-`, svcLower, svcLower, protoPkg)
+`, svcStyle, svcStyle, protoPkg)
 
 	scriptPath := filepath.Join(abs, "merge_proto.sh")
 	if err := writeIfNotExist(scriptPath, content); err != nil {
@@ -2837,22 +2870,23 @@ func EnsureGoogleAPIProtoIfReferenced(abs, rootProto string) error {
 // genCmdMigrateDDL writes cmd/migrate-ddl/main.go — an offline DDL diff tool.
 //
 // 设计要点：
-//   - 工具读取 etc/{svcLower}.yaml 的 DatabaseConf 拼 DSN 连 DB（与服务运行同源配置）；
+//   - 工具读取 etc/{svcStyle}.yaml 的 DatabaseConf 拼 DSN 连 DB（与服务运行同源配置）；
 //   - 用 ent client.Schema.WriteTo(file, WithDropColumn, WithDropIndex) 把
 //     "ent/schema 真相 vs DB 现状" 的差量 DDL 写到 migrations/{stamp}_{name}.sql，
 //     底层走 schema.WriteDriver，io.Writer 透传 SQL，物理上不会写到 DB；
 //   - 显式开启 WithDropColumn / WithDropIndex：否则只能输出 ADD，重命名 / 唯一键调整等
 //     需要 DROP+ADD 的场景会丢 DROP，DBA 拿到的脚本不完整。
 //
-// 模板渲染：用 strings.ReplaceAll 替换 __SVC_LOWER__ / __MODULE_PATH__ 两个占位符；
+// 模板渲染：用 strings.ReplaceAll 替换 __SVC_STYLE__ / __MODULE_PATH__ 两个占位符；
 // 不用 fmt.Sprintf 是因为模板里大量 % 字符（%q/%v/%-30s 等）转义后极易出错。
 func (g *Generator) genCmdMigrateDDL(abs, serviceName, modulePath string) error {
-	svcLower := strings.ToLower(serviceName)
+	// yaml file name = user input verbatim (matches what genEtcTemplate writes).
+	svcStyle := serviceName
 
 	tmpl := `// Package main 提供一个【纯输出】DDL 的离线命令：
 //
 //	它会：
-//	  1) 读取 etc/__SVC_LOWER__.yaml 中的 DatabaseConf（与服务运行使用同一份配置，避免环境漂移）；
+//	  1) 读取 etc/__SVC_STYLE__.yaml 中的 DatabaseConf（与服务运行使用同一份配置，避免环境漂移）；
 //	  2) 用 entClient.Schema.WriteTo(file, WithDropColumn, WithDropIndex)
 //	     把 "ent schema 真相 vs 数据库当前状态" 的差量 DDL 写到一个 .sql 文件里；
 //	  3) 输出文件命名为 migrations/{YYYYMMDD_HHMMSS}_{name}.sql。
@@ -2905,7 +2939,7 @@ type migrateConfig struct {
 
 func main() {
 	var (
-		cfgPath = flag.String("f", "etc/__SVC_LOWER__.yaml", "service config file (DatabaseConf is read from here)")
+		cfgPath = flag.String("f", "etc/__SVC_STYLE__.yaml", "service config file (DatabaseConf is read from here)")
 		outDir  = flag.String("dir", "migrations", "output directory for generated .sql")
 		name    = flag.String("name", "auto", "short kebab/snake description (e.g. add_xxx_to_yyy); default: auto")
 	)
@@ -2992,7 +3026,7 @@ func main() {
 var nameRe = regexp.MustCompile(` + "`" + `^[a-z0-9_-]+$` + "`" + `)
 `
 
-	content := strings.ReplaceAll(tmpl, "__SVC_LOWER__", svcLower)
+	content := strings.ReplaceAll(tmpl, "__SVC_STYLE__", svcStyle)
 	content = strings.ReplaceAll(content, "__MODULE_PATH__", modulePath)
 
 	dir := filepath.Join(abs, "cmd", "migrate-ddl")
