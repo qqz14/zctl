@@ -14,6 +14,7 @@ import (
 	"github.com/qqz14/zctl/rpc/generator"
 	entgen "github.com/qqz14/zctl/rpc/generator/ent"
 	"github.com/qqz14/zctl/util/ctx"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/spf13/cobra"
 )
@@ -1491,11 +1492,11 @@ func deriveModulePathFromErrcodeImport(filePath string) string {
 // ────────────────────── Helpers ──────────────────────
 
 func toCamelCase(s string) string {
-	return generator.GoPascal(s)
+	return name.GoPascal(s)
 }
 
 func toSnakeCase(s string) string {
-	return generator.FileSnake(s)
+	return name.FileSnake(s)
 }
 
 func isBaseField(name string) bool {

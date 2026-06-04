@@ -6,11 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/qqz14/zctl/rpc/generator"
 	"github.com/qqz14/zctl/util/ctx"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/pathx"
 
@@ -126,11 +129,11 @@ func GenEntLogic(g *GenContext) error {
 
 		genCtx := *g
 		if g.ModelName == "all" {
-			genCtx.GroupName = generator.DirName(s.Name)
+			genCtx.GroupName = name.DirName(s.Name)
 			genCtx.ModelName = s.Name
 		}
 		if genCtx.GroupName == "" {
-			genCtx.GroupName = generator.DirName(s.Name)
+			genCtx.GroupName = name.DirName(s.Name)
 		}
 
 		fieldMap := buildFieldMap(nodeMap[s.Name])
@@ -302,7 +305,7 @@ func generateForSchema(g *GenContext, projectCtx *ctx.ProjectContext, outputDir 
 // 与原 generateForSchema 中的语义保持一致。
 func generateSchemaPhaseA(g *GenContext, projectCtx *ctx.ProjectContext, outputDir string, schema *load.Schema, fieldMap map[string]string) (daoPreExisted bool, err error) {
 	modulePath := projectCtx.Path
-	modelSnake := generator.FileSnake(schema.Name)
+	modelSnake := name.FileSnake(schema.Name)
 
 	// ── 先看后做：在生成 DAO 之前，记住 DAO 文件是否已经存在 ──
 	daoFilePath := filepath.Join(outputDir, "internal", "dao", modelSnake+"_dao.go")
@@ -373,7 +376,7 @@ func genDaoInterface(g *GenContext, outputDir, modulePath string, schema *load.S
 	}
 
 	// Use snake_case: user_info_dao.go
-	filename := generator.FileSnake(schema.Name) + "_dao"
+	filename := name.FileSnake(schema.Name) + "_dao"
 	filePath := filepath.Join(dir, filename+".go")
 	if pathx.FileExists(filePath) && !g.Overwrite {
 		return nil
@@ -527,7 +530,7 @@ func genDaoMock(g *GenContext, outputDir, modulePath string, schema *load.Schema
 	}
 
 	modelName := schema.Name
-	modelSnake := generator.FileSnake(modelName)
+	modelSnake := name.FileSnake(modelName)
 	daoName := modelName + "Dao"
 	mockName := "Mock" + daoName
 
@@ -919,14 +922,14 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 	}
 
 	// Use snake_case: user_info_oceanbase.go
-	filename := generator.FileSnake(schema.Name) + "_oceanbase"
+	filename := name.FileSnake(schema.Name) + "_oceanbase"
 	filePath := filepath.Join(dir, filename+".go")
 	if pathx.FileExists(filePath) && !g.Overwrite {
 		return nil
 	}
 
 	modelName := schema.Name
-	entPkg := generator.EntPkg(schema.Name)
+	entPkg := name.EntPkg(schema.Name)
 	uniqueFields := collectUniqueFields(schema)
 	compositeIndexes := collectCompositeUniqueIndexes(schema)
 	indexedFields := collectIndexedFields(schema)
@@ -1013,7 +1016,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 		fmt.Fprintf(&b, "//\n")
 		fmt.Fprintf(&b, "// IO 路径（恒 1 次，由 dialect 翻译为 UPSERT）：\n")
 		fmt.Fprintf(&b, "//\n")
-		fmt.Fprintf(&b, "//\tINSERT INTO %s(...) VALUES (...)\n", generator.FileSnake(schema.Name))
+		fmt.Fprintf(&b, "//\tINSERT INTO %s(...) VALUES (...)\n", name.FileSnake(schema.Name))
 		if hasUpdatedAt {
 			fmt.Fprintf(&b, "//\tON DUPLICATE KEY UPDATE deleted_at=NULL, updated_at=NOW()\n")
 		} else {
@@ -1211,7 +1214,7 @@ func genDaoHook(g *GenContext, outputDir, modulePath string, schema *load.Schema
 	}
 
 	modelName := schema.Name
-	modelSnake := generator.FileSnake(modelName)
+	modelSnake := name.FileSnake(modelName)
 	filePath := filepath.Join(dir, modelSnake+"_hook.go")
 	if pathx.FileExists(filePath) {
 		return nil // never overwrite — user may have added hooks
@@ -1273,7 +1276,9 @@ func genModuleErrcode(g *GenContext, outputDir, modulePath string, schema *load.
 //	Module 1: 11200 ~ 11299
 //	...
 //
-// Always overwrites to ensure consistency across all modules.
+// IMPORTANT: existing module → segment assignments are NEVER changed.
+// New modules are appended after the current highest segment.
+// This prevents re-ordering of schemaNames from stealing already-assigned codes.
 func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	dir := filepath.Join(outputDir, "pkg", "bizcode")
 	if err := pathx.MkdirIfNotExist(dir); err != nil {
@@ -1283,6 +1288,54 @@ func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	const segmentBase = 11000
 	const segmentSize = 100
 
+	// ── Step 1: 读取已有 dao.go，解析 模块名 → base 的已分配映射 ──
+	// 格式示例：// ──── IamUser: 11900 ~ 11999 ────
+	existingBase := make(map[string]int) // moduleName → base
+	filePath := filepath.Join(dir, "dao.go")
+	if existing, err := os.ReadFile(filePath); err == nil {
+		// 逐行扫描注释行，提取已分配号段
+		segmentHeaderRe := regexp.MustCompile(`//\s*────\s+(\w+):\s+(\d+)\s*~`)
+		for _, line := range strings.Split(string(existing), "\n") {
+			if m := segmentHeaderRe.FindStringSubmatch(line); m != nil {
+				base, _ := strconv.Atoi(m[2])
+				existingBase[m[1]] = base
+			}
+		}
+	}
+
+	// ── Step 2: 计算当前已分配的最大 base，新模块从此往后累加 ──
+	maxBase := segmentBase
+	for _, base := range existingBase {
+		if base > maxBase {
+			maxBase = base
+		}
+	}
+
+	// ── Step 3: 为每个 schema 确定 base（已有保持不变，新增往后累加）──
+	// 保持输出顺序：先按已有 base 排序的旧模块，再按首次出现顺序的新模块
+	type moduleEntry struct {
+		name string
+		base int
+	}
+	var entries []moduleEntry
+	for _, name := range schemaNames {
+		if base, ok := existingBase[name]; ok {
+			entries = append(entries, moduleEntry{name, base})
+		} else {
+			// 新模块：分配下一个号段
+			maxBase += segmentSize
+			entries = append(entries, moduleEntry{name, maxBase})
+			fmt.Printf("[zctl] Assigned new bizcode segment %d~%d to module %s\n",
+				maxBase, maxBase+segmentSize-1, name)
+		}
+	}
+
+	// 按 base 升序排列，保证文件内容稳定有序
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].base < entries[j].base
+	})
+
+	// ── Step 4: 生成文件内容 ──
 	var b strings.Builder
 	b.WriteString("package bizcode\n\n")
 	b.WriteString("// Code generated by zctl. DO NOT EDIT.\n")
@@ -1292,25 +1345,24 @@ func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	// Collect all error code → empty string for i18n
 	var i18nCodes []int
 
-	for i, name := range schemaNames {
-		base := segmentBase + (i+1)*segmentSize // 11100, 11200, 11300, ...
+	for _, e := range entries {
+		base := e.base
 		notFound := base + 1
 		createFailed := base + 2
 		updateFailed := base + 3
 		deleteFailed := base + 4
 
-		b.WriteString(fmt.Sprintf("// ──── %s: %d ~ %d ────\n", name, base, base+segmentSize-1))
+		b.WriteString(fmt.Sprintf("// ──── %s: %d ~ %d ────\n", e.name, base, base+segmentSize-1))
 		b.WriteString("const (\n")
-		b.WriteString(fmt.Sprintf("\t%sNotFound     = %d\n", name, notFound))
-		b.WriteString(fmt.Sprintf("\t%sCreateFailed = %d\n", name, createFailed))
-		b.WriteString(fmt.Sprintf("\t%sUpdateFailed = %d\n", name, updateFailed))
-		b.WriteString(fmt.Sprintf("\t%sDeleteFailed = %d\n", name, deleteFailed))
+		b.WriteString(fmt.Sprintf("\t%sNotFound     = %d\n", e.name, notFound))
+		b.WriteString(fmt.Sprintf("\t%sCreateFailed = %d\n", e.name, createFailed))
+		b.WriteString(fmt.Sprintf("\t%sUpdateFailed = %d\n", e.name, updateFailed))
+		b.WriteString(fmt.Sprintf("\t%sDeleteFailed = %d\n", e.name, deleteFailed))
 		b.WriteString(")\n\n")
 
 		i18nCodes = append(i18nCodes, notFound, createFailed, updateFailed, deleteFailed)
 	}
 
-	filePath := filepath.Join(dir, "dao.go")
 	if err := os.WriteFile(filePath, []byte(b.String()), 0644); err != nil {
 		return err
 	}
@@ -1394,7 +1446,7 @@ func genModuleModel(g *GenContext, outputDir string, schema *load.Schema) error 
 		return err
 	}
 
-	filename := generator.FileSnake(schema.Name)
+	filename := name.FileSnake(schema.Name)
 	filePath := filepath.Join(dir, filename+".go")
 	if pathx.FileExists(filePath) {
 		return nil // don't overwrite model files
@@ -1417,7 +1469,7 @@ func genModuleConst(g *GenContext, outputDir string, schema *load.Schema) error 
 		return err
 	}
 
-	filename := generator.FileSnake(schema.Name)
+	filename := name.FileSnake(schema.Name)
 	filePath := filepath.Join(dir, filename+".go")
 	if pathx.FileExists(filePath) {
 		return nil // don't overwrite const files
@@ -1435,7 +1487,7 @@ func genModuleConst(g *GenContext, outputDir string, schema *load.Schema) error 
 // ==================== Test Skeleton ====================
 
 func genTestSkeleton(g *GenContext, outputDir, modulePath string, schema *load.Schema) error {
-	modelDir := generator.DirName(schema.Name)
+	modelDir := name.DirName(schema.Name)
 	// Test file goes to logic/{group}/{model}/ (same directory as logic files generated by gen-rpc)
 	testDir := filepath.Join(outputDir, "internal", "logic", g.GroupName, modelDir)
 	if err := pathx.MkdirIfNotExist(testDir); err != nil {
@@ -1444,7 +1496,7 @@ func genTestSkeleton(g *GenContext, outputDir, modulePath string, schema *load.S
 
 	modelName := schema.Name
 	modelLower := strings.ToLower(modelName)
-	pkgName := generator.PkgName(modelName) // package name matches ent convention: all lowercase
+	pkgName := name.PkgName(modelName) // package name matches ent convention: all lowercase
 
 	filename, err := format.FileNamingFormat(g.Style, modelLower+"_test")
 	if err != nil {
@@ -1780,7 +1832,7 @@ func isBaseField(name string) bool {
 }
 
 func toCamelCase(s string) string {
-	return generator.GoPascal(s)
+	return name.GoPascal(s)
 }
 
 // buildFieldMap creates a mapping from snake_case field name to Go PascalCase struct field name
@@ -1803,7 +1855,7 @@ func entFieldName(fieldMap map[string]string, snakeName string) string {
 	if v, ok := fieldMap[snakeName]; ok {
 		return v
 	}
-	return generator.GoPascal(snakeName)
+	return name.GoPascal(snakeName)
 }
 
 // ==================== Desc Proto Generation ====================
@@ -2096,7 +2148,7 @@ func newDescPlan(g *GenContext, outputDir string) (*descPlan, error) {
 // "message/rpc 重名" 而报错并回滚 PhaseB —— 用户显式删除冲突 proto 后再跑即可。
 func (p *descPlan) addSchema(genCtx *GenContext, schema *load.Schema, targetGroup string, daoPreExisted bool) {
 	modelName := schema.Name
-	modelSnake := generator.FileSnake(modelName)
+	modelSnake := name.FileSnake(modelName)
 	fileName := modelSnake + ".proto"
 
 	dirAbs := filepath.Join(p.descRoot, targetGroup)
@@ -2121,7 +2173,7 @@ func (p *descPlan) addSchema(genCtx *GenContext, schema *load.Schema, targetGrou
 		return
 	}
 
-	serviceName := generator.GoPascal(genCtx.ServiceName)
+	serviceName := name.GoPascal(genCtx.ServiceName)
 	existingRPCs := p.existingRPCsByService[serviceName]
 
 	// 索引：本 schema 全集 message → 字段签名（用于一致性比对 / 落盘剪枝）。
@@ -2367,7 +2419,7 @@ func buildFullProtoEntries(g *GenContext, schema *load.Schema) fullProtoSet {
 
 	// 3. GetByUnique
 	for _, uf := range uniqueFields {
-		fieldPascal := generator.GoPascal(uf.Name)
+		fieldPascal := name.GoPascal(uf.Name)
 		protoType := goTypeToProtoType(uf.TypeName)
 		msgName := fmt.Sprintf("Get%sBy%sReq", modelName, fieldPascal)
 		addMsg(msgName,
@@ -2390,7 +2442,7 @@ func buildFullProtoEntries(g *GenContext, schema *load.Schema) fullProtoSet {
 
 	// 5. UpdateByUnique
 	for _, uf := range uniqueFields {
-		fieldPascal := generator.GoPascal(uf.Name)
+		fieldPascal := name.GoPascal(uf.Name)
 		protoType := goTypeToProtoType(uf.TypeName)
 		msgName := fmt.Sprintf("Update%sBy%sReq", modelName, fieldPascal)
 		addMsg(msgName,
@@ -2463,7 +2515,7 @@ func renderProtoFile(g *GenContext, fp *protoFilePlan) string {
 
 	// service block
 	b.WriteString(fmt.Sprintf("// %s 管理服务\n", fp.modelName))
-	b.WriteString(fmt.Sprintf("service %s {\n", generator.GoPascal(g.ServiceName)))
+	b.WriteString(fmt.Sprintf("service %s {\n", name.GoPascal(g.ServiceName)))
 	for _, r := range fp.rpcs {
 		b.WriteString(r.comment)
 		b.WriteString(fmt.Sprintf("  rpc %s (%s) returns (%s);\n", r.method, r.req, r.resp))

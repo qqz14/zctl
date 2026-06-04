@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/qqz14/zctl/util/ctx"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 )
 
@@ -1288,10 +1289,10 @@ func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) erro
 	//   - SERVICE_STYLE= raw user input        (preserved verbatim)        "cs-agent-rpc" / "cs_agent_rpc" / "CsAgentRpc"
 	//   - SERVICE_DIR  = lower no-separator    (proto pkg / dir name)      "csagentrpc"
 	//   - SERVICE_DASH = dash form             (Docker tag etc.)           "cs-agent-rpc"
-	svcCamel := ServiceGoIdent(serviceName)
+	svcCamel := name.ServiceGoIdent(serviceName)
 	svcStyle := serviceName
-	svcDir := ProtoPkg(serviceName)
-	svcDash := DashName(serviceName)
+	svcDir := name.ProtoPkg(serviceName)
+	svcDash := name.DashName(serviceName)
 
 	content := fmt.Sprintf(`# Custom configuration | 独立配置
 # Service name | 项目名称 (PascalCase Go 标识符)
@@ -1634,10 +1635,10 @@ func (g *Generator) genEtcTemplate(abs, serviceName string, zctx *ZRpcContext) e
 	//   svcEnv    → UPPER_SNAKE_CASE prefix used in shell-style env var names
 	//   svcDash   → dash form (used in the OTel service name comment)
 	svcStyle := serviceName
-	svcDir := ProtoPkg(serviceName)
-	svcCamel := ServiceGoIdent(serviceName)
-	svcEnv := EnvVarName(serviceName)
-	svcDash := DashName(serviceName)
+	svcDir := name.ProtoPkg(serviceName)
+	svcCamel := name.ServiceGoIdent(serviceName)
+	svcEnv := name.EnvVarName(serviceName)
+	svcDash := name.DashName(serviceName)
 
 	content := fmt.Sprintf(`Name: %s.rpc
 ListenOn: 0.0.0.0:${%s_RPC_PORT}
@@ -1734,9 +1735,9 @@ func (g *Generator) genProjectReadme(abs, serviceName string, zctx *ZRpcContext)
 	// Each placeholder in the template below references one of the four
 	// canonical naming forms — see naming-spec.md.
 	svcStyle := serviceName               // raw user input (file names)
-	svcDir := ProtoPkg(serviceName)       // proto pkg / dir name
-	svcCamel := ServiceGoIdent(serviceName) // PascalCase Go ident
-	svcDash := DashName(serviceName)      // dash form (K8s svc, docker tag)
+	svcDir := name.ProtoPkg(serviceName)       // proto pkg / dir name
+	svcCamel := name.ServiceGoIdent(serviceName) // PascalCase Go ident
+	svcDash := name.DashName(serviceName)      // dash form (K8s svc, docker tag)
 	port := 8080
 	if zctx != nil && zctx.Port > 0 {
 		port = zctx.Port
@@ -2023,7 +2024,7 @@ func GenCommandsDoc(abs, serviceName string) error {
 	//   {{SVC_STYLE}} → preserved verbatim, used for file names    "cs-agent-rpc.proto"
 	//   {{SVC_DIR}}   → all-lowercase no-separator, used for dirs   "types/csagentrpc/"
 	svcStyle := serviceName
-	svcDir := ProtoPkg(serviceName)
+	svcDir := name.ProtoPkg(serviceName)
 
 	content := strings.ReplaceAll(`# zctl 桩命令使用说明
 
@@ -2722,7 +2723,7 @@ func (g *Generator) genDescDir(abs, serviceName string) error {
 
 func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
 	svcStyle := serviceName          // file name = user input verbatim
-	protoPkg := ProtoPkg(serviceName) // valid proto3 ident (no '-'/'_'/space)
+	protoPkg := name.ProtoPkg(serviceName) // valid proto3 ident (no '-'/'_'/space)
 
 	content := fmt.Sprintf(`#!/bin/bash
 # merge_proto.sh — Merge all desc/**/*.proto into root %s.proto

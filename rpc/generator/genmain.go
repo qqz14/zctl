@@ -9,6 +9,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 )
 
@@ -67,7 +68,7 @@ func (g *Generator) GenMain(ctx DirContext, proto parser.Proto, cfg *conf.Config
 		// the symbols we reference here (`Register{X}Server` / `New{X}Server`)
 		// always match what the current protoc-gen-go-grpc emits — i.e. "Rpc"
 		// is **not** treated as an acronym.
-		svcIdent := ServiceGoIdent(e.Name)
+		svcIdent := name.ServiceGoIdent(e.Name)
 		serviceNames = append(serviceNames, MainServiceTemplateData{
 			GRPCService: svcIdent,
 			Service:     svcIdent,

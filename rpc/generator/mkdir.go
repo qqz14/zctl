@@ -7,6 +7,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util/ctx"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
 )
@@ -97,7 +98,7 @@ func mkdir(ctx *ctx.ProjectContext, proto parser.Proto, conf *conf.Config, c *ZR
 			// This matches naming-spec.md (rule #2: directories are always
 			// the canonical lower-no-sep form, regardless of how the user
 			// spelled the service name on the CLI).
-			clientDir = ProtoPkg(proto.Service[0].Name) + "_client"
+			clientDir = name.ProtoPkg(proto.Service[0].Name) + "_client"
 			callDir = filepath.Join(ctx.WorkDir, clientDir)
 		}
 		callClientDir = callDir

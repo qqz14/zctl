@@ -1,10 +1,11 @@
 package format
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/qqz14/zctl/util/name"
 )
 
 const (
@@ -37,7 +38,9 @@ type (
 // format as go_zero, and the camel case format as goZero. You can even specify the split
 // character, such as go#Zero, theoretically any combination can be used, but the prerequisite
 // must meet the naming conventions of each operating system file name.
-// Note: Formatting is based on snake or camel string
+// Note: Formatting is based on snake or camel string.
+//
+// 内部实现委托给 util/name.FileSnake（snake 场景）或逐 token 转换（其他场景）。
 func FileNamingFormat(format, content string) (string, error) {
 	upperFormat := strings.ToUpper(format)
 	indexGo := strings.Index(upperFormat, flagGo)
@@ -47,46 +50,51 @@ func FileNamingFormat(format, content string) (string, error) {
 	}
 	var (
 		before, through, after string
-		flagGo, flagZero       string
+		flagGoStr, flagZeroStr string
 		goStyle, zeroStyle     style
 		err                    error
 	)
 	before = format[:indexGo]
-	flagGo = format[indexGo : indexGo+2]
+	flagGoStr = format[indexGo : indexGo+2]
 	through = format[indexGo+2 : indexZero]
-	flagZero = format[indexZero : indexZero+4]
+	flagZeroStr = format[indexZero : indexZero+4]
 	after = format[indexZero+4:]
 
-	goStyle, err = getStyle(flagGo)
+	goStyle, err = getStyle(flagGoStr)
+	if err != nil {
+		return "", err
+	}
+	zeroStyle, err = getStyle(flagZeroStr)
 	if err != nil {
 		return "", err
 	}
 
-	zeroStyle, err = getStyle(flagZero)
-	if err != nil {
-		return "", err
+	// 快速路径：go_zero（最常用的 snake_case 格式）直接委托给 naming.FileSnake，
+	// 它正确处理缩写词复数（CIDs/IDs/URLs）等三方库无法处理的场景。
+	if goStyle == lower && zeroStyle == lower && through == "_" && before == "" && after == "" {
+		return name.FileSnake(content), nil
 	}
-	var formatStyle styleFormat
-	formatStyle.goStyle = goStyle
-	formatStyle.zeroStyle = zeroStyle
-	formatStyle.before = before
-	formatStyle.through = through
-	formatStyle.after = after
-	return doFormat(formatStyle, content)
+
+	// 通用路径：其他格式（goZero、Go_Zero 等）走逐 token 转换。
+	return doFormat(styleFormat{
+		goStyle:   goStyle,
+		zeroStyle: zeroStyle,
+		before:    before,
+		through:   through,
+		after:     after,
+	}, content)
 }
 
 func doFormat(f styleFormat, content string) (string, error) {
-	splits, err := split(content)
-	if err != nil {
-		return "", err
-	}
+	// 使用 naming 包的分词引擎，保证与 FileSnake 行为一致。
+	tokens := name.SplitIdent(content)
 	var join []string
-	for index, split := range splits {
+	for index, tok := range tokens {
 		if index == 0 {
-			join = append(join, transferTo(split, f.goStyle))
+			join = append(join, transferTo(tok, f.goStyle))
 			continue
 		}
-		join = append(join, transferTo(split, f.zeroStyle))
+		join = append(join, transferTo(tok, f.zeroStyle))
 	}
 	joined := strings.Join(join, f.through)
 	return f.before + joined + f.after, nil
@@ -99,57 +107,10 @@ func transferTo(in string, style style) string {
 	case lower:
 		return strings.ToLower(in)
 	case title:
-		return strings.Title(in)
+		return strings.Title(in) //nolint:staticcheck
 	default:
 		return in
 	}
-}
-
-func split(content string) ([]string, error) {
-	runes := []rune(content)
-	var (
-		list   []string
-		buffer = bytes.NewBuffer(nil)
-	)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		if r == '_' {
-			if buffer.Len() > 0 {
-				list = append(list, buffer.String())
-			}
-			buffer.Reset()
-			continue
-		}
-
-		if r >= 'A' && r <= 'Z' {
-			// Determine if we should start a new word.
-			// We do NOT split when the previous char is also uppercase
-			// AND the current char is NOT the start of a camelCase word
-			// (i.e., next char is also uppercase or end of string).
-			// This keeps acronyms like "CID", "HTTP", "API" together.
-			if buffer.Len() > 0 {
-				prevRune := runes[i-1]
-				if prevRune >= 'a' && prevRune <= 'z' {
-					// lowercase→uppercase boundary: "get|C", "detail|L"
-					list = append(list, buffer.String())
-					buffer.Reset()
-				} else if prevRune >= 'A' && prevRune <= 'Z' {
-					// uppercase→uppercase: check if next is lowercase (acronym end)
-					// e.g. "CID|App" — at 'A' prev='D'(upper), next='p'(lower) → split before 'A'
-					if i+1 < len(runes) && runes[i+1] >= 'a' && runes[i+1] <= 'z' {
-						list = append(list, buffer.String())
-						buffer.Reset()
-					}
-					// else: still in acronym run, don't split
-				}
-			}
-		}
-		buffer.WriteRune(r)
-	}
-	if buffer.Len() > 0 {
-		list = append(list, buffer.String())
-	}
-	return list, nil
 }
 
 func getStyle(flag string) (style, error) {
@@ -159,7 +120,7 @@ func getStyle(flag string) (style, error) {
 		return lower, nil
 	case strings.ToUpper(compare):
 		return upper, nil
-	case strings.Title(compare):
+	case strings.Title(compare): //nolint:staticcheck
 		return title, nil
 	default:
 		return unknown, fmt.Errorf("unexpected format: %s", flag)

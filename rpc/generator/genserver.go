@@ -10,7 +10,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
-	"github.com/qqz14/zctl/util/format"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
 	"github.com/zeromicro/go-zero/core/collection"
@@ -46,10 +46,7 @@ func (g *Generator) genServerGroup(ctx DirContext, proto parser.Proto, cfg *conf
 			logicImport string
 		)
 
-		serverFilename, err := format.FileNamingFormat(cfg.NamingFormat, service.Name+"_server")
-		if err != nil {
-			return err
-		}
+		serverFilename := name.RpcServerFileName(service.Name)
 
 		serverChildPkg, err := dir.GetChildPackage(service.Name)
 		if err != nil {
@@ -99,7 +96,7 @@ func (g *Generator) genServerGroup(ctx DirContext, proto parser.Proto, cfg *conf
 		// always match what the current protoc-gen-go-grpc emits — i.e. "Rpc" is
 		// **not** treated as an acronym, even when proto.Service[0].Name is a stale
 		// "CsAgentRPC" produced by an older zctl.
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 
 		if err = util.With("server").GoFmt(true).Parse(text).SaveTo(map[string]any{
 			"head": head,
@@ -205,7 +202,7 @@ func (g *Generator) genServerInCompatibility(ctx DirContext, proto parser.Proto,
 	}
 
 	// Normalize the service ident — see comment in genServerGroup above.
-	svcIdent := ServiceGoIdent(service.Name)
+	svcIdent := name.ServiceGoIdent(service.Name)
 
 	return util.With("server").GoFmt(true).Parse(text).SaveTo(map[string]any{
 		"head": head,
@@ -246,7 +243,7 @@ func (g *Generator) genFunctions(goPackage, mainGoPackage string, service parser
 		// `{Service}_{Method}Server`; normalize the service ident through
 		// ServiceGoIdent so it matches what protoc actually emits even when
 		// service.Name is a stale "CsAgentRPC".
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Server")
 
@@ -312,7 +309,7 @@ func (g *Generator) genFunctionsWithGroup(goPackage, mainGoPackage string, servi
 		// `{Service}_{Method}Server`; normalize the service ident through
 		// ServiceGoIdent so it matches what protoc actually emits even when
 		// service.Name is a stale "CsAgentRPC".
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Server")
 

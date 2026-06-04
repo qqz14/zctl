@@ -11,7 +11,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
-	"github.com/qqz14/zctl/util/format"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
 	"github.com/zeromicro/go-zero/core/collection"
@@ -54,10 +54,7 @@ func (g *Generator) genCallGroup(ctx DirContext, proto parser.Proto, cfg *conf.C
 			return err
 		}
 
-		callFilename, err := format.FileNamingFormat(cfg.NamingFormat, service.Name)
-		if err != nil {
-			return err
-		}
+		callFilename := name.RpcCallFileName(service.Name)
 
 		childDir := filepath.Base(childPkg)
 		filename := filepath.Join(dir.Filename, childDir, fmt.Sprintf("%s.go", callFilename))
@@ -68,7 +65,7 @@ func (g *Generator) genCallGroup(ctx DirContext, proto parser.Proto, cfg *conf.C
 		// `New{X}Client`, `default{X}` receiver) line up with what
 		// protoc-gen-go-grpc actually generated, even if service.Name carries a
 		// stale "CsAgentRPC" from an older zctl.
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 		serviceName := svcIdent
 
 		// Collect only the message types actually used by this service's RPCs,
@@ -156,7 +153,7 @@ func (g *Generator) genCallInCompatibility(ctx DirContext, proto parser.Proto,
 	_ = cfg // cfg.NamingFormat intentionally ignored for this file name
 
 	// Normalize through ServiceGoIdent — see comment in genCallGroup above.
-	svcIdent := ServiceGoIdent(service.Name)
+	svcIdent := name.ServiceGoIdent(service.Name)
 	serviceName := svcIdent
 	alias := collection.NewSet[string]()
 	var hasSameNameBetweenMessageAndService bool
@@ -252,7 +249,7 @@ func (g *Generator) genFunction(goPackage, mainGoPackage, serviceName string, se
 		comment := parser.GetComment(rpc.Doc())
 		// `New{X}Client` and `{X}_{Method}Client` are protoc-gen-go-grpc symbols;
 		// normalize through ServiceGoIdent to keep "Rpc" out of acronym mode.
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Client")
 		if isCallPkgSameToGrpcPkg {
@@ -313,7 +310,7 @@ func (g *Generator) getInterfaceFuncs(goPackage, mainGoPackage string, service p
 
 		comment := parser.GetComment(rpc.Doc())
 		// Same normalization rationale as in genFunction above.
-		svcIdent := ServiceGoIdent(service.Name)
+		svcIdent := name.ServiceGoIdent(service.Name)
 		streamServer := fmt.Sprintf("%s.%s_%s%s", goPackage, svcIdent,
 			parser.CamelCase(rpc.Name), "Client")
 		if isCallPkgSameToGrpcPkg {

@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/qqz14/zctl/util/name"
 )
 
 // MergeDescProtos scans descDir recursively for .proto files,
@@ -42,8 +44,8 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 	//   - protoPkg : proto3 package identifier (no dashes, lower)            "cs-agent-rpc" → "csagentrpc"
 	//   - svcGo    : PascalCase Go-style service identifier                  "cs-agent-rpc" → "CsAgentRpc"
 	// Both inputs `cs-agent-rpc` / `cs_agent_rpc` / `csAgentRpc` map to the same outputs.
-	protoPkg := ProtoPkg(serviceName)
-	svcGo := ServiceGoIdent(serviceName)
+	protoPkg := name.ProtoPkg(serviceName)
+	svcGo := name.ServiceGoIdent(serviceName)
 
 	var messageLines strings.Builder // all message/enum definitions
 	var rpcLines strings.Builder     // all rpc method lines

@@ -6,12 +6,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/zeromicro/go-zero/core/collection"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
-	"github.com/qqz14/zctl/util/format"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
+	"github.com/zeromicro/go-zero/core/collection"
 )
 
 // GenLogicFiles is the SINGLE entry point for generating logic files.
@@ -61,10 +61,7 @@ func GenLogicFiles(abs, style string, overwrite bool) error {
 	for _, rpc := range service.RPC {
 		logicName := fmt.Sprintf("%sLogic", stringx.From(rpc.Name).ToCamel())
 
-		logicFilename, err := format.FileNamingFormat(style, rpc.Name+"_logic")
-		if err != nil {
-			return err
-		}
+		logicFilename := name.RpcLogicFileName(rpc.Name)
 
 		// Determine path: logic/{group}/{model}/
 		gm := rpcGroupMap[rpc.Name]

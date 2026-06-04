@@ -18,9 +18,25 @@ import (
 var etcTemplate string
 
 // GenEtc generates the yaml configuration file of the rpc service.
+//
+// File-name source-of-truth: the project directory name (e.g. "cs-agent-rpc"),
+// NOT the proto package name (which is forced to lower-no-sep, e.g. "csagentrpc",
+// because proto package syntax forbids '-'). This matches the dash form used by
+// genEtcTemplate (etc/<svc>.yaml.template) and Makefile/Dockerfile, so all four
+// init-time artefacts agree on one canonical service identifier.
 func (g *Generator) GenEtc(ctx DirContext, _ parser.Proto, cfg *conf.Config, zctx *ZRpcContext) error {
 	dir := ctx.GetEtc()
-	etcFilename, err := format.FileNamingFormat(cfg.NamingFormat, ctx.GetServiceName().Source())
+
+	// Prefer project dir name (preserves dashes); fall back to the (sanitised)
+	// proto-package-derived service name only when zctx/Output is unavailable.
+	baseName := ctx.GetServiceName().Source()
+	if zctx != nil && len(zctx.Output) > 0 {
+		if abs, err := filepath.Abs(zctx.Output); err == nil {
+			baseName = filepath.Base(abs)
+		}
+	}
+
+	etcFilename, err := format.FileNamingFormat(cfg.NamingFormat, baseName)
 	if err != nil {
 		return err
 	}

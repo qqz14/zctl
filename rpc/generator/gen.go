@@ -43,6 +43,10 @@ type ZRpcContext struct {
 	I18n bool
 	// Port is the service port
 	Port int
+	// IsNew indicates this is the `zctl rpc new` (project init) command,
+	// not the day-to-day `zctl rpc protoc` (a.k.a. `make gen-rpc`) command.
+	// One-shot init artifacts (e.g. etc/<svc>.yaml) are only emitted when true.
+	IsNew bool
 }
 
 // Generate generates a rpc service, through the proto file,
@@ -91,9 +95,16 @@ func (g *Generator) Generate(zctx *ZRpcContext) error {
 		return err
 	}
 
-	err = g.GenEtc(dirCtx, proto, g.cfg, zctx)
-	if err != nil {
-		return err
+	// etc/<svc>.yaml is a project init-only artifact (one-shot, env-specific
+	// runtime config). Day-to-day `zctl rpc protoc` (= `make gen-rpc`) MUST NOT
+	// re-create or touch this file — only `zctl rpc new` does.
+	// The user-facing template `etc/<svc>.yaml.template` is still produced by
+	// GenScaffold idempotently and is safe to re-run.
+	if zctx != nil && zctx.IsNew {
+		err = g.GenEtc(dirCtx, proto, g.cfg, zctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Generate validate.proto before protoc so imports can resolve

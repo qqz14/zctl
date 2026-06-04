@@ -10,6 +10,7 @@ import (
 	"github.com/qqz14/zctl/rpc/generator"
 	"github.com/qqz14/zctl/util"
 	"github.com/qqz14/zctl/util/console"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/spf13/cobra"
 )
@@ -97,7 +98,7 @@ func RPCNew(_ *cobra.Command, args []string) error {
 	// Use ServiceGoIdent so dashed/underscored/PascalCase names all collapse to the
 	// same canonical PascalCase ident ("cs-agent-rpc" → "CsAgentRpc"), matching what
 	// MergeDescProtos emits later (single source of truth).
-	serviceName := generator.ServiceGoIdent(rpcname)
+	serviceName := name.ServiceGoIdent(rpcname)
 	pingDirRel := filepath.Join(descDir, "ping")
 	pingDirAbs, err := filepath.Abs(pingDirRel)
 	if err != nil {
@@ -165,6 +166,7 @@ service %s {
 	ctx.NameFromFilename = VarBoolNameFromFilename
 	ctx.ProtoPaths = []string{projectDirAbs, protoDepDir}
 	ctx.Port = VarIntPort
+	ctx.IsNew = true // project init: emit one-shot artifacts like etc/<svc>.yaml
 
 	grpcOptList := VarStringSliceGoGRPCOpt
 	if len(grpcOptList) > 0 {

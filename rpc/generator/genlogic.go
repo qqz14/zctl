@@ -11,7 +11,7 @@ import (
 	conf "github.com/qqz14/zctl/config"
 	"github.com/qqz14/zctl/rpc/parser"
 	"github.com/qqz14/zctl/util"
-	"github.com/qqz14/zctl/util/format"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 	"github.com/qqz14/zctl/util/stringx"
 )
@@ -120,10 +120,7 @@ func (g *Generator) genLogicGroup(ctx DirContext, proto parser.Proto, cfg *conf.
 			serviceDir := filepath.Base(childPkg)
 			nameJoin := fmt.Sprintf("%s_logic", serviceName)
 			packageName = strings.ToLower(stringx.From(nameJoin).ToCamel())
-			logicFilename, err = format.FileNamingFormat(cfg.NamingFormat, rpc.Name+"_logic")
-			if err != nil {
-				return err
-			}
+			logicFilename = name.RpcLogicFileName(rpc.Name)
 
 			filename = filepath.Join(dir.Filename, serviceDir, logicFilename+".go")
 			functions, err := g.genLogicFunction(serviceName, proto.PbPackage, proto.GoPackage, logicName, rpc, pkgMap)
