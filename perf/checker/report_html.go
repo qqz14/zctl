@@ -626,26 +626,20 @@ func buildGroups(
 	}
 
 	// ════════════════════════════════════════════════════════
-	// 🔍 Module 6: 接口逻辑总览 (Logic Review) — standalone module
+	// 🔍 Module 6: 代码逻辑审查 (Logic Review) — standalone module
+	// No level badge, no count — this is a code review aid, not a problem list.
 	// ════════════════════════════════════════════════════════
 	logicReviewInline := renderLogicReviewInline(lastLogicReviewResult)
-	logicReviewLevel := results["logic-review"].safeLevel()
-	totalIOCount := 0
-	if lastLogicReviewResult != nil {
-		for _, m := range lastLogicReviewResult.Methods {
-			totalIOCount += len(m.Ops)
-		}
-	}
 	logicReviewItem := NavItem{
 		ID:         "review-logic",
-		Label:      "接口存储追踪",
-		Level:      logicReviewLevel,
+		Label:      "存储调用分析",
+		Level:      LevelInfo,
 		InlineHTML: logicReviewInline,
-		Count:      totalIOCount,
+		Count:      0, // no count in nav badge
 	}
 	logicReviewGroup := NavGroup{
 		Icon:  "🔍",
-		Label: "接口逻辑总览",
+		Label: "代码逻辑审查",
 		Items: []NavItem{logicReviewItem},
 	}
 
@@ -898,133 +892,209 @@ func htmlEsc(s string) string {
 	return s
 }
 
-// ── Logic IO inline renderer ──────────────────────────────────────────────────
+// ── Logic Review inline renderer ─────────────────────────────────────────────
+//
+// Layout:
+//   Top tabs  = first-level subdir under logic/ (e.g. user, oauth, permission)
+//   Tab body  = second-level subdir groups (e.g. list, register, auth)
+//   Each interface = one collapsible card, expanded by default
+//   Card body = numbered IO steps: SQL (dark) / Redis (dark red)
+//               + call chain shown inline after each step
 
 func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 	if r == nil || len(r.Methods) == 0 {
-		return template.HTML(`<div style="padding:32px;text-align:center;color:#666;font-size:.95rem">ℹ️ 未发现接口存储操作（call graph 可能未加载）</div>`)
+		return template.HTML(`<div style="padding:40px;text-align:center;color:#888;font-size:.93rem">
+			ℹ️ 暂无数据（call graph 构建失败，或项目无 Logic 层存储调用）</div>`)
 	}
 
-	// Group methods by Module (first subdir under logic/)
-	type modGroup struct {
+	// Group methods: module → subModule → []LogicReviewMethod
+	type subGroup struct {
 		Name    string
 		Methods []LogicReviewMethod
 	}
-	modMap := make(map[string]*modGroup)
-	var modOrder []string
+	type topGroup struct {
+		Name   string
+		Subs   []*subGroup
+		subMap map[string]*subGroup
+	}
+	topMap := make(map[string]*topGroup)
+	var topOrder []string
 	for _, m := range r.Methods {
 		mod := m.Module
 		if mod == "" {
 			mod = "root"
 		}
-		if _, ok := modMap[mod]; !ok {
-			modMap[mod] = &modGroup{Name: mod}
-			modOrder = append(modOrder, mod)
+		sub := m.SubModule
+		if sub == "" {
+			sub = mod
 		}
-		modMap[mod].Methods = append(modMap[mod].Methods, m)
+		if _, ok := topMap[mod]; !ok {
+			topMap[mod] = &topGroup{Name: mod, subMap: map[string]*subGroup{}}
+			topOrder = append(topOrder, mod)
+		}
+		tg := topMap[mod]
+		if _, ok := tg.subMap[sub]; !ok {
+			sg := &subGroup{Name: sub}
+			tg.subMap[sub] = sg
+			tg.Subs = append(tg.Subs, sg)
+		}
+		tg.subMap[sub].Methods = append(tg.subMap[sub].Methods, m)
 	}
 
 	var sb strings.Builder
+
+	// ── CSS ──
 	sb.WriteString(`<style>
-.lio-mod{margin-bottom:28px}
-.lio-mod-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#3a4a7a;padding:6px 0 8px;border-bottom:2px solid #e5e8ee;margin-bottom:12px}
-.lio-card{background:#fff;border-radius:8px;border:1px solid #e0e3ea;margin-bottom:12px;overflow:hidden}
-.lio-hdr{padding:10px 16px;background:#f7f8fc;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
-.lio-hdr:hover{background:#f0f2f8}
-.lio-title{font-weight:700;font-size:.9rem;flex:1}
-.lio-badges{display:flex;gap:6px;flex-shrink:0}
-.lio-badge{font-size:.7rem;padding:2px 8px;border-radius:10px;font-weight:700}
-.lio-db{background:#e8f0fe;color:#1a56cc}
-.lio-redis{background:#fce8e6;color:#c5221f}
-.lio-loc{font-size:.75rem;color:#888;font-family:monospace}
-.lio-body{padding:14px 16px;display:none}
-.lio-body.open{display:block}
-.lio-op{margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #f0f0f0}
-.lio-op:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
-.lio-op-hdr{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:.84rem}
-.lio-kind-db{color:#1a56cc;font-weight:700;font-size:.72rem;background:#e8f0fe;padding:1px 6px;border-radius:4px}
-.lio-kind-redis{color:#c5221f;font-weight:700;font-size:.72rem;background:#fce8e6;padding:1px 6px;border-radius:4px}
-.lio-recv{font-family:monospace;color:#444;font-size:.82rem}
-.lio-exact{font-size:.68rem;color:#888;background:#f0f0f0;padding:1px 5px;border-radius:3px}
-.lio-sql{background:#1e1e1e;border-radius:5px;padding:7px 12px;font-family:monospace;color:#d4d4d4;font-size:.81rem;white-space:pre;overflow-x:auto}
-.lio-redis-cmd{background:#2a1818;border-radius:5px;padding:7px 12px;font-family:monospace;color:#ffb3b0;font-size:.81rem;white-space:pre;overflow-x:auto}
-.lio-snip{margin-top:6px}
-.lio-code{background:#1e1e1e;border-radius:4px;overflow:auto;font-size:.78rem}
-.lio-code table{border-collapse:collapse;width:100%}
-.lio-code td{padding:1px 0}
-.lio-lnum{color:#555;text-align:right;padding:0 10px 0 8px;font-family:monospace;white-space:nowrap;width:40px;border-right:1px solid #333;user-select:none}
-.lio-lcode{color:#d4d4d4;font-family:monospace;padding:0 10px;white-space:pre}
-.lio-hl{background:#2a2000}
-.lio-hl .lio-lnum{color:#f90;border-right-color:#f90}
-.lio-hl .lio-lcode{color:#ffd080}
+/* top-level module tabs */
+.lr-tabs{display:flex;border-bottom:2px solid #e0e3ea;margin-bottom:0;background:#fff;position:sticky;top:0;z-index:10}
+.lr-tab-btn{padding:10px 20px;font-size:.88rem;font-weight:600;cursor:pointer;border:none;background:none;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .13s;text-transform:capitalize}
+.lr-tab-btn:hover{color:#333;background:#f5f6fa}
+.lr-tab-btn.active{color:#141422;border-bottom-color:#141422}
+.lr-tab-panel{display:none;padding:20px 0 4px}
+.lr-tab-panel.active{display:block}
+/* submodule section */
+.lr-sub{margin-bottom:24px}
+.lr-sub-title{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#7a8aaa;padding:4px 0 8px;border-bottom:1px solid #eef0f5;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+/* interface card */
+.lr-card{background:#fff;border:1px solid #e0e3ea;border-radius:8px;margin-bottom:10px;overflow:hidden}
+.lr-card-hdr{padding:10px 16px;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;background:#f8f9fc}
+.lr-card-hdr:hover{background:#f0f2f8}
+.lr-card-fn{font-weight:700;font-size:.88rem;font-family:monospace;flex:1;color:#1a1a3a}
+.lr-card-badges{display:flex;gap:5px;flex-shrink:0}
+.lr-badge-db{font-size:.68rem;padding:1px 7px;border-radius:8px;background:#e8f0fe;color:#1a56cc;font-weight:700}
+.lr-badge-redis{font-size:.68rem;padding:1px 7px;border-radius:8px;background:#fce8e6;color:#c5221f;font-weight:700}
+.lr-card-arrow{color:#bbb;font-size:.8rem;transition:transform .15s;flex-shrink:0}
+.lr-card-body{display:none;padding:14px 16px 16px;border-top:1px solid #eef0f5}
+.lr-card-body.open{display:block}
+/* IO step */
+.lr-step{display:flex;gap:0;margin-bottom:10px}
+.lr-step:last-child{margin-bottom:0}
+.lr-step-num{width:26px;flex-shrink:0;padding-top:5px;color:#ccc;font-size:.72rem;text-align:right;padding-right:8px}
+.lr-step-body{flex:1;min-width:0}
+.lr-step-meta{display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap}
+.lr-kind-sql{font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:3px;background:#e8f0fe;color:#1a56cc;flex-shrink:0}
+.lr-kind-redis{font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:3px;background:#2a1818;color:#ffb3b0;flex-shrink:0}
+.lr-dao{font-family:monospace;font-size:.8rem;color:#555}
+.lr-dao strong{color:#333}
+.lr-inferred{font-size:.65rem;color:#aaa;background:#f5f5f5;padding:1px 5px;border-radius:3px}
+.lr-chain{font-size:.68rem;color:#aaa;font-style:italic;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
+.lr-sql{background:#1a1a2e;border-radius:5px;padding:6px 12px;font-family:monospace;color:#a8d8a8;font-size:.8rem;white-space:pre;overflow-x:auto;margin-top:2px;border-left:3px solid #2e7d32}
+.lr-redis{background:#1a0a0a;border-radius:5px;padding:6px 12px;font-family:monospace;color:#ffb3b0;font-size:.8rem;white-space:pre;overflow-x:auto;margin-top:2px;border-left:3px solid #c5221f}
 </style>
 `)
 
-	for _, modName := range modOrder {
-		grp := modMap[modName]
-		fmt.Fprintf(&sb, `<div class="lio-mod"><div class="lio-mod-title">📂 %s</div>`, htmlEsc(modName))
-		for i, m := range grp.Methods {
-			cardID := fmt.Sprintf("lio-%s-%d", strings.ReplaceAll(modName, "/", "-"), i)
-			fmt.Fprintf(&sb,
-				`<div class="lio-card"><div class="lio-hdr" onclick="lioToggle('%s')">`,
-				cardID)
-			subLabel := m.SubModule
-			if subLabel == "" {
-				subLabel = m.TypeName
-			}
-			fmt.Fprintf(&sb, `<div class="lio-title"><span style="color:#888;font-weight:400;font-size:.82rem">%s / </span>%s()</div>`,
-				htmlEsc(subLabel), htmlEsc(m.Method))
-			sb.WriteString(`<div class="lio-badges">`)
-			if m.DBCount > 0 {
-				fmt.Fprintf(&sb, `<span class="lio-badge lio-db">DB × %d</span>`, m.DBCount)
-			}
-			if m.RedisCount > 0 {
-				fmt.Fprintf(&sb, `<span class="lio-badge lio-redis">Redis × %d</span>`, m.RedisCount)
-			}
-			sb.WriteString(`</div>`)
-			fmt.Fprintf(&sb, `<div class="lio-loc">%s</div>`, htmlEsc(m.PkgPath))
-			sb.WriteString(`</div>`) // hdr
-			fmt.Fprintf(&sb, `<div id="%s" class="lio-body">`, cardID)
-			for idx, op := range m.Ops {
-				sb.WriteString(`<div class="lio-op">`)
-				// Step number + call chain
-				chain := strings.Join(op.CallChain, " → ")
-				fmt.Fprintf(&sb,
-					`<div class="lio-op-hdr"><span style="color:#aaa;font-size:.72rem;margin-right:4px">%d.</span>`,
-					idx+1)
-				if op.Kind == IOKindDB {
-					sb.WriteString(`<span class="lio-kind-db">SQL</span>`)
-				} else {
-					sb.WriteString(`<span class="lio-kind-redis">Redis</span>`)
-				}
-				fmt.Fprintf(&sb, `<span class="lio-recv">%s.<strong>%s</strong>()</span>`,
-					htmlEsc(op.Receiver), htmlEsc(op.Method))
-				if op.Kind == IOKindDB && !op.SQLExact {
-					sb.WriteString(`<span class="lio-exact">推断</span>`)
-				}
-				if chain != "" {
-					fmt.Fprintf(&sb, `<span style="font-size:.68rem;color:#999;margin-left:auto">via %s</span>`,
-						htmlEsc(chain))
-				}
-				sb.WriteString(`</div>`) // op-hdr
-				if op.Kind == IOKindDB {
-					fmt.Fprintf(&sb, `<div class="lio-sql">%s</div>`, htmlEsc(op.SQL))
-				} else {
-					fmt.Fprintf(&sb, `<div class="lio-redis-cmd">%s</div>`, htmlEsc(op.RedisCmd))
-				}
-				sb.WriteString(`</div>`) // op
-			}
-			sb.WriteString(`</div>`) // body
-			sb.WriteString(`</div>`) // card
+	// Unique prefix to avoid ID collisions when embedded in report.html
+	pfx := "lr"
+
+	// Render top-level module tabs
+	sb.WriteString(fmt.Sprintf(`<div class="lr-tabs" id="%s-tabs">`, pfx))
+	for i, modName := range topOrder {
+		activeCls := ""
+		if i == 0 {
+			activeCls = " active"
 		}
-		sb.WriteString(`</div>`) // mod
+		fmt.Fprintf(&sb,
+			`<button class="lr-tab-btn%s" onclick="lrTab('%s','%s-%s',this)">%s</button>`,
+			activeCls, pfx, pfx, strings.ReplaceAll(modName, "/", "-"), htmlEsc(modName))
+	}
+	sb.WriteString(`</div>`)
+
+	// Render tab panels
+	for i, modName := range topOrder {
+		tg := topMap[modName]
+		tabID := fmt.Sprintf("%s-%s", pfx, strings.ReplaceAll(modName, "/", "-"))
+		activeCls := ""
+		if i == 0 {
+			activeCls = " active"
+		}
+		fmt.Fprintf(&sb, `<div id="%s" class="lr-tab-panel%s">`, tabID, activeCls)
+
+		for _, sg := range tg.Subs {
+			// Sub-module section header
+			fmt.Fprintf(&sb, `<div class="lr-sub"><div class="lr-sub-title">📁 %s</div>`,
+				htmlEsc(sg.Name))
+
+			for mi, m := range sg.Methods {
+				cardID := fmt.Sprintf("%s-%s-%s-%d", pfx,
+					strings.ReplaceAll(modName, "/", "-"),
+					strings.ReplaceAll(sg.Name, "/", "-"), mi)
+
+				// Card header
+				fmt.Fprintf(&sb,
+					`<div class="lr-card"><div class="lr-card-hdr" onclick="lrToggle('%s')">`,
+					cardID)
+				fmt.Fprintf(&sb, `<span class="lr-card-fn">%s()</span>`, htmlEsc(m.Method))
+				sb.WriteString(`<div class="lr-card-badges">`)
+				if m.DBCount > 0 {
+					fmt.Fprintf(&sb, `<span class="lr-badge-db">SQL×%d</span>`, m.DBCount)
+				}
+				if m.RedisCount > 0 {
+					fmt.Fprintf(&sb, `<span class="lr-badge-redis">Redis×%d</span>`, m.RedisCount)
+				}
+				sb.WriteString(`</div>`)
+				sb.WriteString(`<span class="lr-card-arrow" id="arr-` + cardID + `">▶</span>`)
+				sb.WriteString(`</div>`) // hdr
+
+				// Card body — open by default
+				fmt.Fprintf(&sb, `<div id="%s" class="lr-card-body open">`, cardID)
+
+				if len(m.Ops) == 0 {
+					sb.WriteString(`<div style="color:#aaa;font-size:.82rem;padding:4px 0">无存储调用</div>`)
+				}
+				for si, op := range m.Ops {
+					fmt.Fprintf(&sb, `<div class="lr-step"><div class="lr-step-num">%d</div><div class="lr-step-body">`, si+1)
+
+					// Meta line: kind badge + dao.method + inferred? + call chain
+					sb.WriteString(`<div class="lr-step-meta">`)
+					if op.Kind == IOKindDB {
+						sb.WriteString(`<span class="lr-kind-sql">SQL</span>`)
+					} else {
+						sb.WriteString(`<span class="lr-kind-redis">Redis</span>`)
+					}
+					fmt.Fprintf(&sb, `<span class="lr-dao">%s.<strong>%s</strong>()</span>`,
+						htmlEsc(op.Receiver), htmlEsc(op.Method))
+					if op.Kind == IOKindDB && !op.SQLExact {
+						sb.WriteString(`<span class="lr-inferred">推断</span>`)
+					}
+					// Show call chain (skip first entry = the Logic method itself)
+					if len(op.CallChain) > 1 {
+						chainStr := strings.Join(op.CallChain[1:], " → ")
+						fmt.Fprintf(&sb, `<span class="lr-chain" title="%s">via %s</span>`,
+							htmlEsc(chainStr), htmlEsc(chainStr))
+					}
+					sb.WriteString(`</div>`) // meta
+
+					// SQL or Redis command
+					if op.Kind == IOKindDB {
+						fmt.Fprintf(&sb, `<div class="lr-sql">%s</div>`, htmlEsc(op.SQL))
+					} else {
+						fmt.Fprintf(&sb, `<div class="lr-redis">%s</div>`, htmlEsc(op.RedisCmd))
+					}
+
+					sb.WriteString(`</div></div>`) // step-body + step
+				}
+				sb.WriteString(`</div>`) // card-body
+				sb.WriteString(`</div>`) // card
+			}
+			sb.WriteString(`</div>`) // sub
+		}
+		sb.WriteString(`</div>`) // tab-panel
 	}
 
-	sb.WriteString(`<script>
-function lioToggle(id){
-  var el=document.getElementById(id);
-  if(!el) return;
-  el.classList.toggle('open');
+	// Script
+	fmt.Fprintf(&sb, `<script>
+function lrTab(pfx, panelId, btn) {
+  document.getElementById(pfx+'-tabs').querySelectorAll('.lr-tab-btn').forEach(function(b){b.classList.remove('active');});
+  document.querySelectorAll('[id^="'+pfx+'-"]').forEach(function(p){if(p.classList.contains('lr-tab-panel'))p.classList.remove('active');});
+  document.getElementById(panelId).classList.add('active');
+  btn.classList.add('active');
+}
+function lrToggle(id) {
+  var body = document.getElementById(id);
+  if (!body) return;
+  body.classList.toggle('open');
+  var arr = document.getElementById('arr-'+id);
+  if (arr) arr.textContent = body.classList.contains('open') ? '▼' : '▶';
 }
 </script>`)
 	return template.HTML(sb.String())

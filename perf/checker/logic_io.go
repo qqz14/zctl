@@ -12,6 +12,10 @@ package checker
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -68,33 +72,34 @@ type LogicReviewResult struct {
 
 var lastLogicReviewResult *LogicReviewResult
 
-// RunLogicReview uses the pre-built call graph to trace IO ops for all Logic methods.
+// RunLogicReview reads pre-computed IO subgraphs from the call graph cache.
+// All heavy work was done in BuildCallGraph; this is just a map read + formatting pass.
 func RunLogicReview(cgCache *CallGraphCache) *Result {
 	if cgCache == nil {
 		return Skip("call graph not available (build failed or skipped)")
 	}
 
-	entries := cgCache.AllLogicFuncs()
+	entries := cgCache.AllLogicEntries()
 	if len(entries) == 0 {
-		return Pass("no Logic methods found")
+		return Pass("no Logic methods found in call graph")
 	}
 
 	result := &LogicReviewResult{}
 	totalDB, totalRedis := 0, 0
 
 	for _, e := range entries {
-		ops := cgCache.ReachableIO(e.Func, 8)
+		ops := cgCache.IOForLogic(IOKey(e)) // O(1) map lookup
 		if len(ops) == 0 {
 			continue
 		}
 		mod, sub := splitLogicPath(e.PkgPath)
 		lm := LogicReviewMethod{
-			PkgPath:   e.PkgPath,
-			TypeName:  e.TypeName,
-			Method:    e.Method,
-			Module:    mod,
-			SubModule: sub,
-			Ops:       ops,
+			PkgPath:    e.PkgPath,
+			TypeName:   e.TypeName,
+			Method:     e.Method,
+			Module:     mod,
+			SubModule:  sub,
+			Ops:        ops,
 		}
 		for _, op := range ops {
 			if op.Kind == IOKindDB {
@@ -122,7 +127,7 @@ func RunLogicReview(cgCache *CallGraphCache) *Result {
 
 	return &Result{
 		Level: LevelInfo,
-		Summary: fmt.Sprintf("logic review: %d methods traced, DB×%d Redis×%d",
+		Summary: fmt.Sprintf("logic review: %d methods, DB×%d Redis×%d",
 			len(result.Methods), totalDB, totalRedis),
 		Issues: issues,
 	}
@@ -157,13 +162,57 @@ func isIOVerb(method string) bool {
 	return false
 }
 
-// implStructToTable converts "iamuserroleOceanBaseDao" → "iam_user_role"
+// implStructToTable converts an impl struct name to a table name.
+// It first tries to extract from the impl file name (most accurate for ent projects),
+// then falls back to converting the struct name.
+//
+// e.g. struct "iamuserroleOceanBaseDao", file "iam_user_role_oceanbase.go"
+//      → file stem "iam_user_role_oceanbase" → strip "_oceanbase" → "iam_user_role"
 func implStructToTable(structName string) string {
+	return implStructToTableWithFile(structName, "")
+}
+
+func implStructToTableWithFile(structName, filePath string) string {
+	// Try file-based extraction first (reliable: ent generates deterministic filenames)
+	if filePath != "" {
+		base := filepath.Base(filePath)
+		// Remove .go extension
+		stem := strings.TrimSuffix(base, ".go")
+		// Strip common db suffixes: _oceanbase, _mysql, _postgres, _sqlite, _impl
+		for _, sfx := range []string{"_oceanbase", "_mysql", "_postgres", "_sqlite", "_impl", "_dao"} {
+			stem = strings.TrimSuffix(stem, sfx)
+		}
+		if stem != "" && stem != "." {
+			return stem // already snake_case from filename
+		}
+	}
+	// Fallback: strip Dao suffix from struct name, then convert camel → snake
 	s := structName
 	for _, suffix := range []string{"OceanBaseDao", "MysqlDao", "PostgresDao", "SqliteDao", "Dao"} {
-		s = strings.TrimSuffix(s, suffix)
+		if strings.HasSuffix(s, suffix) {
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
 	}
-	return toSnake(s)
+	return camelToSnake(s)
+}
+
+// camelToSnake converts a CamelCase string to snake_case, handling consecutive capitals.
+// "IamUserRole" → "iam_user_role"
+// "iamuserrole" → "iamuserrole" (no capitals to split on — limitation of all-lowercase)
+func camelToSnake(s string) string {
+	if s == "" {
+		return s
+	}
+	var out []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			out = append(out, '_')
+		}
+		out = append(out, c|0x20)
+	}
+	return string(out)
 }
 
 // daoNameToTable converts "IamUserRoleDao" → "iam_user_role"
@@ -175,15 +224,132 @@ func daoNameToTable(daoName string) string {
 
 // toSnake converts CamelCase → snake_case
 func toSnake(s string) string {
-	var out []byte
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if i > 0 && c >= 'A' && c <= 'Z' {
-			out = append(out, '_')
+	return camelToSnake(s)
+}
+
+// ── ent schema table map ──────────────────────────────────────────────────────
+
+// buildEntSchemaTableMap parses ent/schema/*.go and returns a map of
+// Go type name → actual table name.
+//
+// For each schema type it checks:
+//  1. entsql.Annotation{Table: "xxx"} in Annotations() → use that table name
+//  2. No annotation → use default: toSnake(TypeName)
+//
+// e.g. "IamUserRole" → "iam_user_role"
+//      "IamUserRole" with Table:"custom" → "custom"
+func buildEntSchemaTableMap(dir string) map[string]string {
+	schemaDir := filepath.Join(dir, "ent", "schema")
+	tableMap := make(map[string]string)
+
+	fset := token.NewFileSet()
+	_ = filepath.WalkDir(schemaDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
 		}
-		out = append(out, c|0x20)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		f, err := parseWithGoParser(fset, path, src)
+		if err != nil {
+			return nil
+		}
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				ts, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				typeName := ts.Name.Name
+				// Default table name: snake_case of type name
+				defaultTable := camelToSnake(typeName)
+				// Try to find entsql.Annotation{Table: "..."} in Annotations()
+				table := findAnnotationTable(f, typeName)
+				if table == "" {
+					table = defaultTable
+				}
+				tableMap[typeName] = table
+			}
+		}
+		return nil
+	})
+	return tableMap
+}
+
+// findAnnotationTable searches for entsql.Annotation{Table: "..."} in the
+// Annotations() method of a given type in the file.
+func findAnnotationTable(f *ast.File, typeName string) string {
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Recv == nil || fd.Name.Name != "Annotations" || fd.Body == nil {
+			continue
+		}
+		// Check receiver is typeName
+		if len(fd.Recv.List) == 0 {
+			continue
+		}
+		recv := fd.Recv.List[0]
+		recvName := ""
+		switch t := recv.Type.(type) {
+		case *ast.Ident:
+			recvName = t.Name
+		case *ast.StarExpr:
+			if id, ok := t.X.(*ast.Ident); ok {
+				recvName = id.Name
+			}
+		}
+		if recvName != typeName {
+			continue
+		}
+		// Found Annotations() for this type — scan body for entsql.Annotation{Table: "..."}
+		var table string
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if table != "" {
+				return false
+			}
+			cl, ok := n.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			// Check if it's entsql.Annotation or Annotation
+			isAnnotation := false
+			switch t := cl.Type.(type) {
+			case *ast.SelectorExpr:
+				isAnnotation = t.Sel.Name == "Annotation"
+			case *ast.Ident:
+				isAnnotation = t.Name == "Annotation"
+			}
+			if !isAnnotation {
+				return true
+			}
+			for _, elt := range cl.Elts {
+				kv, ok := elt.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok || key.Name != "Table" {
+					continue
+				}
+				lit, ok := kv.Value.(*ast.BasicLit)
+				if !ok {
+					continue
+				}
+				// Strip surrounding quotes
+				table = strings.Trim(lit.Value, `"`)
+			}
+			return true
+		})
+		if table != "" {
+			return table
+		}
 	}
-	return string(out)
+	return ""
 }
 
 // entTerminalToSQL converts a confirmed ent terminal + method name to a SQL pattern.

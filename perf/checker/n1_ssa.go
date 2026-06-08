@@ -122,52 +122,23 @@ func traceWithSSA(dir string, fset *token.FileSet, candidates []Candidate, cgCac
 	return findings
 }
 
-// traceWithCallGraph resolves N+1 candidates using the call graph's impl index.
+// traceWithCallGraph resolves N+1 candidates using the pre-computed DAO impl index.
 //
-// Strategy: for each candidate call (recv.Method in loop), look up all CHA callees
-// of that method name in the call graph, then use implIndex AST scan to confirm
-// whether the callee body reaches an ent terminal.
+// For each candidate (recv.Method called inside a loop), we look up all concrete DAO
+// implementations of that method via cgCache.DAOImplsForMethod (O(1) map lookup),
+// then confirm ent terminal via implIdx AST scan.
 //
-// This is equivalent to the original resolveCandidate path but uses the call graph's
-// type information to correctly resolve interface → concrete impl, avoiding the
-// unreliable name-based fallback.
+// This avoids scanning all call graph nodes and is reliable because:
+//  - DAOImplsForMethod was built during BuildCallGraph's single traversal
+//  - implIdx AST scan is stable (uses go/parser, not SSA fset)
 func traceWithCallGraph(candidates []Candidate, cgCache *CallGraphCache, fset *token.FileSet) []N1Finding {
-	// Build a lookup: methodName → []SSA functions in call graph that are concrete impls
-	// (i.e., their receiver type ends in "Dao" or similar)
-	type implFunc struct {
-		fn        *ssa.Function
-		recvType  string
-	}
-	methodToImpls := make(map[string][]implFunc)
-	for fn := range cgCache.cg.Nodes {
-		if fn == nil || fn.Signature == nil || fn.Signature.Recv() == nil {
-			continue
-		}
-		if fn.Package() == nil || fn.Package().Pkg == nil {
-			continue
-		}
-		recvType := typeBaseName(fn.Signature.Recv().Type())
-		lowerRecv := strings.ToLower(recvType)
-		// Only DAO concrete impls (not interfaces)
-		if !strings.HasSuffix(lowerRecv, "dao") {
-			continue
-		}
-		// SSA method name is "(*Type).Method" — extract just "Method"
-		rawName := fn.Name()
-		methodName := rawName
-		if dot := strings.LastIndex(rawName, "."); dot >= 0 {
-			methodName = rawName[dot+1:]
-		}
-		methodToImpls[methodName] = append(methodToImpls[methodName], implFunc{fn: fn, recvType: recvType})
-	}
-
 	var findings []N1Finding
 	implIdx := cgCache.implIdx
 
 	for _, c := range candidates {
-		impls, ok := methodToImpls[c.MethodName]
-		if !ok {
-			// No concrete DAO impl found for this method — emit INFO if cross-pkg
+		// O(1): pre-computed DAO impls for this method name
+		impls := cgCache.DAOImplsForMethod(c.MethodName)
+		if len(impls) == 0 {
 			if isCrossPackageCall(c) {
 				findings = append(findings, *infoFinding(c))
 			}
@@ -178,18 +149,20 @@ func traceWithCallGraph(candidates []Candidate, cgCache *CallGraphCache, fset *t
 		var chain []ChainStep
 
 		for _, impl := range impls {
-			// First try implIdx (has AST body with source positions)
+			// AST confirm via implIdx (most accurate, uses source positions)
 			key := impl.recvType + "." + c.MethodName
-			if entries, ok2 := implIdx[key]; ok2 && len(entries) > 0 {
-				ch, terminal := astFindEntTerminal(entries[0].funcDecl.Body, entries[0].fset, entries[0].file, 0, 6)
+			if entries, ok := implIdx[key]; ok && len(entries) > 0 {
+				ch, terminal := astFindEntTerminal(
+					entries[0].funcDecl.Body, entries[0].fset, entries[0].file, 0, 6)
 				if terminal != "" {
 					entTerminal = terminal
 					chain = ch
 					break
 				}
+				// impl found in idx but no ent terminal — not a DB call, skip
 				continue
 			}
-			// Fallback: walk call graph from this impl node to find ent terminal
+			// implIdx miss: walk call graph from this impl's SSA node
 			if node := cgCache.cg.Nodes[impl.fn]; node != nil {
 				t, ch := cgReachesEntTerminal(node, cgCache, 0, 6, make(map[*callgraph_Node]bool))
 				if t != "" {
@@ -202,10 +175,10 @@ func traceWithCallGraph(candidates []Candidate, cgCache *CallGraphCache, fset *t
 
 		if entTerminal != "" {
 			loopSnip := readSourceSnippet(c.File, c.LoopLine-2, c.CallLine+3, c.LoopLine, c.CallLine)
-			// Find impl snippet
 			var implSnip []SourceLine
-			if key := (impls[0].recvType + "." + c.MethodName); len(implIdx[key]) > 0 {
-				entry := implIdx[key][0]
+			key := impls[0].recvType + "." + c.MethodName
+			if entries := implIdx[key]; len(entries) > 0 {
+				entry := entries[0]
 				implLine := entry.fset.Position(entry.funcDecl.Pos()).Line
 				termLine := implLine
 				if len(chain) > 0 {
