@@ -1510,7 +1510,8 @@ lint: # Run go linter | 运行代码错误分析
 	golangci-lint run -D staticcheck
 
 .PHONY: perf
-perf: # Static perf scan | 静态性能/泄漏/N+1/CVE 扫描，输出 build/perf/REPORT.md
+perf: # Static perf scan | 静态性能/泄漏/N+1/CVE 扫描，输出 build/perf/report.html
+	@rm -rf build/perf/
 	zctl perf scan --dir=. --out=build/perf/
 
 .PHONY: tools

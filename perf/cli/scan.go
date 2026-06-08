@@ -77,12 +77,12 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 
 	// Step 6: N+1 — two-phase: AST candidates + SSA callgraph trace
 	printStep(6, 6, "N+1 query scan (AST + SSA callgraph, partial load)")
-	res.N1 = checker.RunN1(absDir, outDir)
+	res.N1 = checker.RunN1(absDir)
 	printResult(res.N1)
 
 	res.Elapsed = time.Since(start)
 
-	// Write unified report.html
+	// Write unified report.html (+ details/n1.html + details/lint.html)
 	checker.WriteReportHTML(outDir, absDir, map[string]*checker.Result{
 		"fmt":    res.Fmt,
 		"vet":    res.Vet,

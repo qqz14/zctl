@@ -120,6 +120,7 @@ type n1HTMLData struct {
 	ProjectName string
 	Confirmed   []N1Finding
 	Info        []N1Finding
+	Inline      bool // true = embedded in report.html, hide redundant summary badges
 }
 
 const n1HTMLTemplate = `<!doctype html>
@@ -182,6 +183,7 @@ h1{font-size:1.5rem;margin-bottom:4px}
 </style>
 </head>
 <body>
+{{if not .Inline}}
 <h1>N+1 Query Analysis — {{.ProjectName}}</h1>
 <p class="subtitle">Two-phase: AST candidate collection + impl AST tracing (entgo.io/ent terminal methods)</p>
 
@@ -195,6 +197,7 @@ h1{font-size:1.5rem;margin-bottom:4px}
   <div class="badge badge-info">ℹ️ Review needed: {{len .Info}}</div>
 {{end}}
 </div>
+{{end}}
 
 <!-- Tab bar -->
 <div class="tabs">

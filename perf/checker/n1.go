@@ -12,7 +12,11 @@ import (
 
 // ── Public entry ──────────────────────────────────────────────────────────────
 
-// RunN1 runs the two-phase N+1 detector and writes build/perf/n1.html.
+// lastN1Findings holds the findings from the most recent RunN1 call,
+// so WriteReportHTML can access them without a second scan.
+var lastN1Findings []N1Finding
+
+// RunN1 runs the two-phase N+1 detector.
 //
 // Phase 1 (AST, ~100ms):
 //   Scan all business .go files for CallExpr inside for/range bodies.
@@ -29,7 +33,7 @@ import (
 //   FAIL  — confirmed DB query inside loop (ent terminal reachable)
 //   INFO  — cross-package call inside loop, no ent terminal found (e.g. cache)
 //   PASS  — no candidates or all resolved as non-DB
-func RunN1(dir, outDir string) *Result {
+func RunN1(dir string) *Result {
 	fset := token.NewFileSet()
 
 	// ── Phase 1: AST candidate collection ──
@@ -41,9 +45,8 @@ func RunN1(dir, outDir string) *Result {
 	// ── Phase 2: SSA callgraph trace ──
 	findings := traceWithSSA(dir, fset, candidates)
 
-	// ── Phase 3: HTML report ──
-	htmlPath := filepath.Join(outDir, "n1.html")
-	writeN1HTML(htmlPath, findings, dir)
+	// Cache findings for WriteReportHTML (called after all checks complete)
+	lastN1Findings = findings
 
 	var confirmed, info []N1Finding
 	for _, f := range findings {
@@ -69,14 +72,14 @@ func RunN1(dir, outDir string) *Result {
 		return &Result{
 			Level: LevelFail,
 			Summary: fmt.Sprintf(
-				"%d confirmed DB N+1 (ent), %d cross-pkg calls — details: build/perf/n1.html",
+				"%d confirmed DB N+1 (ent), %d cross-pkg calls — details: build/perf/report.html",
 				len(confirmed), len(info)),
 			Issues: issues,
 		}
 	}
 	if len(info) > 0 {
 		return Info(
-			fmt.Sprintf("%d cross-pkg calls in loops — non-DB, details: build/perf/n1.html", len(info)),
+			fmt.Sprintf("%d cross-pkg calls in loops — non-DB, details: build/perf/report.html", len(info)),
 			issues,
 		)
 	}
