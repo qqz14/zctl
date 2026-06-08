@@ -184,7 +184,10 @@ func RunLint(dir, outDir string) *Result {
 // Text format: "SA5011: ..." or just the message starting with SAnnnn.
 func classifyStaticcheck(text string) string {
 	for id := range staticcheckCritical {
-		if strings.HasPrefix(text, id) || strings.Contains(text, "("+id+")") {
+		// golangci-lint v2 formats: "message (SA5011)" or "SA5011: message"
+		if strings.HasPrefix(text, id+":") ||
+			strings.Contains(text, "("+id+")") ||
+			strings.Contains(text, id) {
 			return "panic"
 		}
 	}

@@ -1514,6 +1514,14 @@ perf: # Static perf scan | 静态性能/泄漏/N+1/CVE 扫描，输出 build/per
 	@rm -rf build/perf/
 	zctl perf scan --dir=. --out=build/perf/
 
+.PHONY: perf-dynamic
+perf-dynamic: # Static + dynamic perf scan | 静态+动态扫描（pprof+慢查询），需服务运行中
+	@rm -rf build/perf/
+	zctl perf scan --dir=. --out=build/perf/ --dynamic \
+		--pprof=$(or $(pprof),http://localhost:4001) \
+		$(if $(slow-log),--slow-log=$(slow-log),) \
+		$(if $(pprof-window),--pprof-window=$(pprof-window),)
+
 .PHONY: tools
 tools: # Install the necessary tools | 安装必要的工具
 	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest

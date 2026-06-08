@@ -32,6 +32,9 @@ type NavItem struct {
 	InlineHTML template.HTML // N+1 inline content
 	IframeURL  string        // full-screen iframe (lint raw)
 	FlatIssues []string      // simple flat list (no tabs)
+	// Count overrides the nav badge count for items without Tabs/FlatIssues (e.g. IframeURL).
+	// Leave 0 to auto-compute from Tabs/FlatIssues.
+	Count int
 }
 
 // NavGroup is a top-level module in the left nav.
@@ -57,6 +60,7 @@ func WriteReportHTML(
 	outDir, projectDir string,
 	results map[string]*Result,
 	elapsed time.Duration,
+	dr *DynamicResult,
 ) {
 	n1Findings := lastN1Findings
 	lintRes := lastLintResult
@@ -79,7 +83,7 @@ func WriteReportHTML(
 	gitBranch := gitOutput(projectDir, "rev-parse", "--abbrev-ref", "HEAD")
 	gitHash := gitOutput(projectDir, "rev-parse", "--short", "HEAD")
 
-	groups := buildGroups(results, lintRes, n1Findings, n1Inline)
+	groups := buildGroups(results, lintRes, n1Findings, n1Inline, dr)
 
 	data := ReportData{
 		ProjectName: projectName,
@@ -106,6 +110,7 @@ func buildGroups(
 	lr *LintResult,
 	n1Findings []N1Finding,
 	n1Inline template.HTML,
+	dr *DynamicResult,
 ) []NavGroup {
 	tabs := map[string][]string{}
 	if lr != nil {
@@ -264,8 +269,8 @@ func buildGroups(
 			defectVetIssues = append(defectVetIssues, s)
 		}
 	}
-	// Also include vet result from RunVet
-	defectVetIssues = append(defectVetIssues, results["vet"].safeIssues()...)
+	// Note: RunVet output is shown separately in "代码规范 → go vet".
+	// We intentionally don't merge it here to avoid duplicating issues.
 
 	defectItem := NavItem{
 		ID:    "bug-defect",
@@ -351,7 +356,30 @@ func buildGroups(
 	}
 	perfCodeItem.Level = worstTabLevel(perfCodeItem.Tabs)
 
-	// Item 3.3: 内存逃逸热点
+	// Item 3.3: SQL 性能 (ent 无分页全表扫描 — InlineHTML card 样式)
+	sqlPerfLevel := results["ent-fullscan"].safeLevel()
+	// Count for nav badge: split warn/info
+	var sqlNoLimitWarn, sqlNoLimitInfo []string
+	for _, s := range results["ent-fullscan"].safeIssues() {
+		if strings.Contains(s, "no WHERE") {
+			sqlNoLimitWarn = append(sqlNoLimitWarn, s)
+		} else {
+			sqlNoLimitInfo = append(sqlNoLimitInfo, s)
+		}
+	}
+	sqlPerfInline := renderSQLPerfInline(sqlNoLimitWarn, sqlNoLimitInfo)
+	sqlPerfItem := NavItem{
+		ID:         "perf-sql",
+		Label:      "SQL 性能",
+		Level:      sqlPerfLevel,
+		InlineHTML: sqlPerfInline,
+		Tabs: []IssueTab{
+			{ID: "sql-nolimit", Label: "无分页全表", Level: levelOf(sqlNoLimitWarn), Issues: sqlNoLimitWarn},
+			{ID: "sql-bounded", Label: "有WHERE无Limit", Level: LevelInfo, Issues: sqlNoLimitInfo},
+		},
+	}
+
+	// Item 3.4: 内存逃逸热点
 	escapeItem := NavItem{
 		ID:         "perf-escape",
 		Label:      "内存逃逸热点",
@@ -362,7 +390,7 @@ func buildGroups(
 	perfGroup := NavGroup{
 		Icon:  "🐌",
 		Label: "性能问题",
-		Items: []NavItem{n1Item, perfCodeItem, escapeItem},
+		Items: []NavItem{n1Item, perfCodeItem, sqlPerfItem, escapeItem},
 	}
 
 	// ════════════════════════════════════════════════════════
@@ -389,10 +417,6 @@ func buildGroups(
 			secOtherIssues = append(secOtherIssues, s)
 		}
 	}
-	// merge "other gosec" into sql for brevity if small
-	if len(secOtherIssues) > 0 {
-		secSQLIssues = append(secSQLIssues, secOtherIssues...)
-	}
 	codeSecItem := NavItem{
 		ID:    "sec-code",
 		Label: "代码安全",
@@ -405,6 +429,8 @@ func buildGroups(
 				Issues: secHardcodeIssues, Note: "密码/密钥写死在代码里 → G101"},
 			{ID: "sec-perm", Label: "不安全文件权限", Level: levelOf(secFilePermIssues),
 				Issues: secFilePermIssues, Note: "文件权限过宽（如 0777）→ G306"},
+			{ID: "sec-other", Label: "其他安全", Level: levelOf(secOtherIssues),
+				Issues: secOtherIssues, Note: "路径遍历 (G304)、命令注入 (G204)、SSRF 等其他 gosec 问题"},
 		},
 	}
 	codeSecItem.Level = worstTabLevel(codeSecItem.Tabs)
@@ -545,6 +571,7 @@ func buildGroups(
 		Label:     "Lint 原始报告",
 		Level:     results["lint"].safeLevel(),
 		IframeURL: "details/lint.html",
+		Count:     len(results["lint"].safeIssues()),
 	}
 
 	qualityGroup := NavGroup{
@@ -553,7 +580,77 @@ func buildGroups(
 		Items: []NavItem{complexItem, styleItem, testItem, vetRawItem, lintRawItem},
 	}
 
-	return []NavGroup{criticalGroup, bugGroup, perfGroup, secGroup, qualityGroup}
+	// ════════════════════════════════════════════════════════
+	// 🔬 Module 6: 动态分析 (Dynamic) — only when --dynamic flag is set
+	// ════════════════════════════════════════════════════════
+	var dynamicGroups []NavGroup
+	if dr != nil {
+		pprofCPUIssues := dr.CPU.safeIssues()
+		pprofHeapIssues := dr.Heap.safeIssues()
+		goroutineIssues := dr.Goroutine.safeIssues()
+		slowQueryIssues := dr.SlowQuery.safeIssues()
+
+		pprofItem := NavItem{
+			ID:    "dynamic-pprof",
+			Label: "pprof 热点",
+			Tabs: []IssueTab{
+				{ID: "pprof-cpu", Label: "CPU 热点", Level: dr.CPU.safeLevel(),
+					Issues: pprofCPUIssues,
+					Note:   "go tool pprof -top，排除 runtime 内部调用。数值越大说明该函数消耗 CPU 越多"},
+				{ID: "pprof-heap", Label: "堆内存热点", Level: dr.Heap.safeLevel(),
+					Issues: pprofHeapIssues,
+					Note:   "堆内存分配 top-N。关注 alloc_space 大的函数，考虑对象复用或减少逃逸"},
+				{ID: "pprof-goroutine", Label: "Goroutine 快照", Level: dr.Goroutine.safeLevel(),
+					Issues: goroutineIssues,
+					Note:   "当前所有 goroutine 状态统计。大量 IO wait 说明下游慢；大量 chan receive 检查有无泄漏"},
+			},
+		}
+		pprofItem.Level = worstTabLevel(pprofItem.Tabs)
+
+		slowQueryItem := NavItem{
+			ID:    "dynamic-slow",
+			Label: "慢查询",
+			Tabs: []IssueTab{
+				{ID: "slow-top", Label: "Top 慢 SQL", Level: dr.SlowQuery.safeLevel(),
+					Issues: slowQueryIssues,
+					Note:   "按 Query_time 降序排列。重点关注 Rows_examined 远大于 Rows_sent 的查询（全表扫），加索引或改写 SQL"},
+			},
+		}
+		slowQueryItem.Level = dr.SlowQuery.safeLevel()
+
+		dynamicGroups = append(dynamicGroups, NavGroup{
+			Icon:  "🔬",
+			Label: "动态分析",
+			Items: []NavItem{pprofItem, slowQueryItem},
+		})
+	}
+
+	// ════════════════════════════════════════════════════════
+	// 🔍 Module 6: 接口逻辑总览 (Logic Review) — standalone module
+	// ════════════════════════════════════════════════════════
+	logicReviewInline := renderLogicReviewInline(lastLogicReviewResult)
+	logicReviewLevel := results["logic-review"].safeLevel()
+	totalIOCount := 0
+	if lastLogicReviewResult != nil {
+		for _, m := range lastLogicReviewResult.Methods {
+			totalIOCount += len(m.Ops)
+		}
+	}
+	logicReviewItem := NavItem{
+		ID:         "review-logic",
+		Label:      "接口存储追踪",
+		Level:      logicReviewLevel,
+		InlineHTML: logicReviewInline,
+		Count:      totalIOCount,
+	}
+	logicReviewGroup := NavGroup{
+		Icon:  "🔍",
+		Label: "接口逻辑总览",
+		Items: []NavItem{logicReviewItem},
+	}
+
+	all := []NavGroup{criticalGroup, bugGroup, perfGroup, secGroup, qualityGroup, logicReviewGroup}
+	return append(all, dynamicGroups...)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -708,6 +805,232 @@ func makeSection(id, title string, r *Result) NavItem {
 	}
 }
 
+// ── SQL Perf inline renderer ──────────────────────────────────────────────────
+
+func renderSQLPerfInline(warnIssues, infoIssues []string) template.HTML {
+	if len(warnIssues)+len(infoIssues) == 0 {
+		return template.HTML(`<div style="padding:32px;text-align:center;color:#060;font-size:.95rem">✅ 未发现无分页全表扫描</div>`)
+	}
+	var sb strings.Builder
+	sb.WriteString(`<style>
+.sp-tabs{display:flex;border-bottom:2px solid #ddd;margin-bottom:20px}
+.sp-tab-btn{padding:10px 24px;font-size:.93rem;font-weight:600;cursor:pointer;border:none;background:none;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .15s}
+.sp-tab-btn:hover{color:#333}
+.sp-tab-btn.on-warn{color:#9a6000;border-bottom-color:#c80}
+.sp-tab-btn.on-info{color:#0055aa;border-bottom-color:#0055aa}
+.sp-panel{display:none;padding:4px 0}
+.sp-panel.active{display:block}
+.sp-card{background:#fff;border-radius:8px;border:1px solid #e0e0e0;margin-bottom:14px;overflow:hidden}
+.sp-card-warn{border-left:4px solid #e08000}
+.sp-card-info{border-left:4px solid #0066cc}
+.sp-hdr{padding:10px 16px;background:#fafafa;border-bottom:1px solid #eee;font-size:.86rem;font-family:monospace;color:#444}
+.sp-body{padding:12px 16px;font-size:.84rem}
+.sp-sql{background:#1e1e1e;border-radius:5px;padding:8px 12px;font-family:monospace;color:#d4d4d4;font-size:.82rem;white-space:pre;overflow-x:auto;margin-top:6px}
+.sp-empty{color:#666;padding:24px;text-align:center}
+</style>
+`)
+	sb.WriteString(`<div class="sp-tabs" id="sp-tabs">`)
+	firstWarnCls := ""
+	firstInfoCls := ""
+	if len(warnIssues) > 0 {
+		firstWarnCls = " on-warn"
+	} else {
+		firstInfoCls = " on-info"
+	}
+	fmt.Fprintf(&sb, `<button class="sp-tab-btn%s" onclick="spTab('sp-nolimit',this,'on-warn')">⚠️ 无分页全表 (%d)</button>`, firstWarnCls, len(warnIssues))
+	fmt.Fprintf(&sb, `<button class="sp-tab-btn%s" onclick="spTab('sp-bounded',this,'on-info')">ℹ️ 有WHERE无Limit (%d)</button>`, firstInfoCls, len(infoIssues))
+	sb.WriteString(`</div>`)
+
+	activeWarn := ""
+	if len(warnIssues) > 0 {
+		activeWarn = " active"
+	}
+	activeInfo := ""
+	if len(warnIssues) == 0 {
+		activeInfo = " active"
+	}
+
+	fmt.Fprintf(&sb, `<div id="sp-nolimit" class="sp-panel%s">`, activeWarn)
+	if len(warnIssues) == 0 {
+		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+	}
+	for _, s := range warnIssues {
+		loc, hint := splitSQLPerfIssue(s)
+		fmt.Fprintf(&sb, `<div class="sp-card sp-card-warn"><div class="sp-hdr">⚠️ %s</div><div class="sp-body">无 .Limit() 且无 WHERE 约束，可能全表扫描<div class="sp-sql">%s</div></div></div>`, loc, htmlEsc(hint))
+	}
+	sb.WriteString(`</div>`)
+
+	fmt.Fprintf(&sb, `<div id="sp-bounded" class="sp-panel%s">`, activeInfo)
+	sb.WriteString(`<p style="font-size:.83rem;color:#666;margin-bottom:12px">有 WHERE 条件但无 .Limit()，结果集有界时可接受，否则建议加 .Limit() 或分页</p>`)
+	if len(infoIssues) == 0 {
+		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+	}
+	for _, s := range infoIssues {
+		loc, hint := splitSQLPerfIssue(s)
+		fmt.Fprintf(&sb, `<div class="sp-card sp-card-info"><div class="sp-hdr">ℹ️ %s</div><div class="sp-body">有 WHERE 条件无 .Limit()<div class="sp-sql">%s</div></div></div>`, loc, htmlEsc(hint))
+	}
+	sb.WriteString(`</div>`)
+
+	sb.WriteString(`<script>
+function spTab(id,btn,cls){
+  ['sp-nolimit','sp-bounded'].forEach(function(x){var e=document.getElementById(x);if(e)e.classList.remove('active');});
+  document.getElementById('sp-tabs').querySelectorAll('.sp-tab-btn').forEach(function(b){b.classList.remove('on-warn','on-info');});
+  var p=document.getElementById(id);if(p)p.classList.add('active');
+  if(btn)btn.classList.add(cls);
+}
+</script>`)
+	return template.HTML(sb.String())
+}
+
+func splitSQLPerfIssue(s string) (loc, hint string) {
+	// format: "file:line [func]: [ent-fullscan] chain — hint"
+	idx := strings.Index(s, " — ")
+	if idx < 0 {
+		return s, ""
+	}
+	return s[:idx], s[idx+3:]
+}
+
+func htmlEsc(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// ── Logic IO inline renderer ──────────────────────────────────────────────────
+
+func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
+	if r == nil || len(r.Methods) == 0 {
+		return template.HTML(`<div style="padding:32px;text-align:center;color:#666;font-size:.95rem">ℹ️ 未发现接口存储操作（call graph 可能未加载）</div>`)
+	}
+
+	// Group methods by Module (first subdir under logic/)
+	type modGroup struct {
+		Name    string
+		Methods []LogicReviewMethod
+	}
+	modMap := make(map[string]*modGroup)
+	var modOrder []string
+	for _, m := range r.Methods {
+		mod := m.Module
+		if mod == "" {
+			mod = "root"
+		}
+		if _, ok := modMap[mod]; !ok {
+			modMap[mod] = &modGroup{Name: mod}
+			modOrder = append(modOrder, mod)
+		}
+		modMap[mod].Methods = append(modMap[mod].Methods, m)
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`<style>
+.lio-mod{margin-bottom:28px}
+.lio-mod-title{font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:#3a4a7a;padding:6px 0 8px;border-bottom:2px solid #e5e8ee;margin-bottom:12px}
+.lio-card{background:#fff;border-radius:8px;border:1px solid #e0e3ea;margin-bottom:12px;overflow:hidden}
+.lio-hdr{padding:10px 16px;background:#f7f8fc;border-bottom:1px solid #eee;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.lio-hdr:hover{background:#f0f2f8}
+.lio-title{font-weight:700;font-size:.9rem;flex:1}
+.lio-badges{display:flex;gap:6px;flex-shrink:0}
+.lio-badge{font-size:.7rem;padding:2px 8px;border-radius:10px;font-weight:700}
+.lio-db{background:#e8f0fe;color:#1a56cc}
+.lio-redis{background:#fce8e6;color:#c5221f}
+.lio-loc{font-size:.75rem;color:#888;font-family:monospace}
+.lio-body{padding:14px 16px;display:none}
+.lio-body.open{display:block}
+.lio-op{margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #f0f0f0}
+.lio-op:last-child{border-bottom:none;margin-bottom:0;padding-bottom:0}
+.lio-op-hdr{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:.84rem}
+.lio-kind-db{color:#1a56cc;font-weight:700;font-size:.72rem;background:#e8f0fe;padding:1px 6px;border-radius:4px}
+.lio-kind-redis{color:#c5221f;font-weight:700;font-size:.72rem;background:#fce8e6;padding:1px 6px;border-radius:4px}
+.lio-recv{font-family:monospace;color:#444;font-size:.82rem}
+.lio-exact{font-size:.68rem;color:#888;background:#f0f0f0;padding:1px 5px;border-radius:3px}
+.lio-sql{background:#1e1e1e;border-radius:5px;padding:7px 12px;font-family:monospace;color:#d4d4d4;font-size:.81rem;white-space:pre;overflow-x:auto}
+.lio-redis-cmd{background:#2a1818;border-radius:5px;padding:7px 12px;font-family:monospace;color:#ffb3b0;font-size:.81rem;white-space:pre;overflow-x:auto}
+.lio-snip{margin-top:6px}
+.lio-code{background:#1e1e1e;border-radius:4px;overflow:auto;font-size:.78rem}
+.lio-code table{border-collapse:collapse;width:100%}
+.lio-code td{padding:1px 0}
+.lio-lnum{color:#555;text-align:right;padding:0 10px 0 8px;font-family:monospace;white-space:nowrap;width:40px;border-right:1px solid #333;user-select:none}
+.lio-lcode{color:#d4d4d4;font-family:monospace;padding:0 10px;white-space:pre}
+.lio-hl{background:#2a2000}
+.lio-hl .lio-lnum{color:#f90;border-right-color:#f90}
+.lio-hl .lio-lcode{color:#ffd080}
+</style>
+`)
+
+	for _, modName := range modOrder {
+		grp := modMap[modName]
+		fmt.Fprintf(&sb, `<div class="lio-mod"><div class="lio-mod-title">📂 %s</div>`, htmlEsc(modName))
+		for i, m := range grp.Methods {
+			cardID := fmt.Sprintf("lio-%s-%d", strings.ReplaceAll(modName, "/", "-"), i)
+			fmt.Fprintf(&sb,
+				`<div class="lio-card"><div class="lio-hdr" onclick="lioToggle('%s')">`,
+				cardID)
+			subLabel := m.SubModule
+			if subLabel == "" {
+				subLabel = m.TypeName
+			}
+			fmt.Fprintf(&sb, `<div class="lio-title"><span style="color:#888;font-weight:400;font-size:.82rem">%s / </span>%s()</div>`,
+				htmlEsc(subLabel), htmlEsc(m.Method))
+			sb.WriteString(`<div class="lio-badges">`)
+			if m.DBCount > 0 {
+				fmt.Fprintf(&sb, `<span class="lio-badge lio-db">DB × %d</span>`, m.DBCount)
+			}
+			if m.RedisCount > 0 {
+				fmt.Fprintf(&sb, `<span class="lio-badge lio-redis">Redis × %d</span>`, m.RedisCount)
+			}
+			sb.WriteString(`</div>`)
+			fmt.Fprintf(&sb, `<div class="lio-loc">%s</div>`, htmlEsc(m.PkgPath))
+			sb.WriteString(`</div>`) // hdr
+			fmt.Fprintf(&sb, `<div id="%s" class="lio-body">`, cardID)
+			for idx, op := range m.Ops {
+				sb.WriteString(`<div class="lio-op">`)
+				// Step number + call chain
+				chain := strings.Join(op.CallChain, " → ")
+				fmt.Fprintf(&sb,
+					`<div class="lio-op-hdr"><span style="color:#aaa;font-size:.72rem;margin-right:4px">%d.</span>`,
+					idx+1)
+				if op.Kind == IOKindDB {
+					sb.WriteString(`<span class="lio-kind-db">SQL</span>`)
+				} else {
+					sb.WriteString(`<span class="lio-kind-redis">Redis</span>`)
+				}
+				fmt.Fprintf(&sb, `<span class="lio-recv">%s.<strong>%s</strong>()</span>`,
+					htmlEsc(op.Receiver), htmlEsc(op.Method))
+				if op.Kind == IOKindDB && !op.SQLExact {
+					sb.WriteString(`<span class="lio-exact">推断</span>`)
+				}
+				if chain != "" {
+					fmt.Fprintf(&sb, `<span style="font-size:.68rem;color:#999;margin-left:auto">via %s</span>`,
+						htmlEsc(chain))
+				}
+				sb.WriteString(`</div>`) // op-hdr
+				if op.Kind == IOKindDB {
+					fmt.Fprintf(&sb, `<div class="lio-sql">%s</div>`, htmlEsc(op.SQL))
+				} else {
+					fmt.Fprintf(&sb, `<div class="lio-redis-cmd">%s</div>`, htmlEsc(op.RedisCmd))
+				}
+				sb.WriteString(`</div>`) // op
+			}
+			sb.WriteString(`</div>`) // body
+			sb.WriteString(`</div>`) // card
+		}
+		sb.WriteString(`</div>`) // mod
+	}
+
+	sb.WriteString(`<script>
+function lioToggle(id){
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.classList.toggle('open');
+}
+</script>`)
+	return template.HTML(sb.String())
+}
+
+
 func buildFuncMap() template.FuncMap {
 	return template.FuncMap{
 		"levelClass":  levelClass,
@@ -720,6 +1043,10 @@ func buildFuncMap() template.FuncMap {
 		"tabIcon":     func(t IssueTab) string { return levelIcon(t.Level) },
 		"tabCount":    func(t IssueTab) int { return len(t.Issues) },
 		"navCount": func(item NavItem) int {
+			// Explicit override (used by IframeURL items like lint raw report)
+			if item.Count > 0 {
+				return item.Count
+			}
 			// For tabbed items: sum all tab counts
 			if len(item.Tabs) > 0 {
 				total := 0
@@ -779,8 +1106,10 @@ html,body{height:100%;overflow:hidden}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;height:100vh;background:#f0f2f5}
 
 /* ── Left nav ── */
-.nav{width:232px;min-width:232px;background:#141422;color:#bbb;display:flex;flex-direction:column;height:100vh;overflow-y:auto;flex-shrink:0}
-.nav-header{padding:15px 16px 10px;border-bottom:1px solid #252540}
+.nav{width:240px;min-width:240px;background:#141422;color:#bbb;display:flex;flex-direction:column;height:100vh;overflow-y:auto;flex-shrink:0;scrollbar-width:thin;scrollbar-color:#333 #141422}
+.nav::-webkit-scrollbar{width:4px}.nav::-webkit-scrollbar-track{background:#141422}.nav::-webkit-scrollbar-thumb{background:#333;border-radius:2px}
+.nav-scroll-area{flex:1;overflow-y:auto;padding-bottom:32px}
+.nav-header{padding:15px 16px 10px;border-bottom:1px solid #252540;flex-shrink:0}
 .nav-project{font-size:.98rem;font-weight:700;color:#fff;margin-bottom:2px}
 .nav-branch{font-size:.73rem;color:#6a8fff;font-family:monospace;margin-bottom:2px}
 .nav-meta{font-size:.7rem;color:#666}
@@ -861,21 +1190,23 @@ h1{font-size:1.2rem;margin-bottom:4px}
     {{if .GitBranch}}<div class="nav-branch">⎇ {{.GitBranch}}{{if .GitHash}} · {{.GitHash}}{{end}}</div>{{end}}
     <div class="nav-meta">{{.ScanTime}} · {{.Elapsed}}</div>
   </div>
-  <div class="nav-group-header">📊 Overview</div>
-  <button class="nav-btn active" id="nav-overview" onclick="goPanel('overview',this,'')">Summary</button>
-  {{range .Groups}}
-  {{$grp := .}}
-  <div class="nav-group-header">{{.Icon}} {{.Label}}</div>
-  {{range .Items}}
-  {{$item := .}}
-  {{$cnt := navCount .}}
-  <button class="nav-btn lv-{{levelClass .Level}}" id="nav-{{.ID}}"
-    onclick="goPanel('{{.ID}}',this,'lv-{{levelClass .Level}}')">
-    {{levelIcon .Level}} {{.Label}}
-    {{if gt $cnt 0}}<span class="nav-badge nb-{{levelClass .Level}}">{{$cnt}}</span>{{end}}
-  </button>
-  {{end}}
-  {{end}}
+  <div class="nav-scroll-area">
+    <div class="nav-group-header">📊 Overview</div>
+    <button class="nav-btn active" id="nav-overview" onclick="goPanel('overview',this,'')">Summary</button>
+    {{range .Groups}}
+    {{$grp := .}}
+    <div class="nav-group-header">{{.Icon}} {{.Label}}</div>
+    {{range .Items}}
+    {{$item := .}}
+    {{$cnt := navCount .}}
+    <button class="nav-btn lv-{{levelClass .Level}}" id="nav-{{.ID}}"
+      onclick="goPanel('{{.ID}}',this,'lv-{{levelClass .Level}}')">
+      {{levelIcon .Level}} {{.Label}}
+      {{if gt $cnt 0}}<span class="nav-badge nb-{{levelClass .Level}}">{{$cnt}}</span>{{end}}
+    </button>
+    {{end}}
+    {{end}}
+  </div>
 </nav>
 
 <div class="main">

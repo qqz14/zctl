@@ -14,17 +14,26 @@ import (
 var (
 	VarStringDir string
 	VarStringOut string
+
+	// Dynamic analysis flags (only active when --dynamic is set)
+	VarBoolDynamic         bool
+	VarStringPprof         string
+	VarStringSlowLog       string
+	VarDurationPprofWindow time.Duration
 )
 
 // ScanResult holds all checker results.
 type ScanResult struct {
-	Fmt     *checker.Result
-	Vet     *checker.Result
-	Lint    *checker.Result
-	Vuln    *checker.Result
-	Escape  *checker.Result
-	N1      *checker.Result
-	Elapsed time.Duration
+	Fmt         *checker.Result
+	Vet         *checker.Result
+	Lint        *checker.Result
+	Vuln        *checker.Result
+	Escape      *checker.Result
+	N1          *checker.Result
+	EntFullScan *checker.Result
+	LogicReview *checker.Result
+	Dynamic     *checker.DynamicResult // nil when --dynamic not set
+	Elapsed     time.Duration
 }
 
 // PerfScan is the entry for zctl perf scan.
@@ -45,63 +54,140 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("mkdir %s failed: %w", outDir, err)
 	}
 
-	printBanner(absDir)
+	printBanner(absDir, VarBoolDynamic)
 	start := time.Now()
 
 	res := &ScanResult{}
 
+	totalSteps := 8
+	if VarBoolDynamic {
+		totalSteps = 11
+	}
+
+	// Step 0: build call graph once — shared by N+1 and Logic Review
+	// This is the most expensive step (~5-20s) but runs only once.
+	color.Style{color.FgBlue, color.Bold}.Println("[0/–] building call graph (CHA, internal/... only) ...")
+	cgCache, cgErr := checker.BuildCallGraph(absDir)
+	if cgErr != nil {
+		color.Gray.Printf("  ⊘  call graph skipped: %v\n\n", cgErr)
+		cgCache = nil
+	} else {
+		color.Green.Println("  ✅ call graph ready\n")
+	}
+
 	// Step 1: gofmt
-	printStep(1, 6, "gofmt (code format)")
+	printStep(1, totalSteps, "gofmt (code format)")
 	res.Fmt = checker.RunFmt(absDir)
 	printResult(res.Fmt)
 
 	// Step 2: go vet
-	printStep(2, 6, "go vet (static correctness)")
+	printStep(2, totalSteps, "go vet (static correctness)")
 	res.Vet = checker.RunVet(absDir)
 	printResult(res.Vet)
 
 	// Step 3: golangci-lint
-	printStep(3, 6, "golangci-lint (resource leak + perf + style)")
+	printStep(3, totalSteps, "golangci-lint (resource leak + perf + style)")
 	res.Lint = checker.RunLint(absDir, outDir)
 	printResult(res.Lint)
 
 	// Step 4: govulncheck
-	printStep(4, 6, "govulncheck (CVE scan)")
+	printStep(4, totalSteps, "govulncheck (CVE scan)")
 	res.Vuln = checker.RunVuln(absDir, outDir)
 	printResult(res.Vuln)
 
 	// Step 5: escape analysis
-	printStep(5, 6, "escape analysis (heap alloc hotspot)")
+	printStep(5, totalSteps, "escape analysis (heap alloc hotspot)")
 	res.Escape = checker.RunEscape(absDir, outDir)
 	printResult(res.Escape)
 
-	// Step 6: N+1 — two-phase: AST candidates + SSA callgraph trace
-	printStep(6, 6, "N+1 query scan (AST + SSA callgraph, partial load)")
-	res.N1 = checker.RunN1(absDir)
+	// Step 6: N+1 — Phase1 AST candidates + Phase2 call graph trace (or AST fallback)
+	printStep(6, totalSteps, "N+1 query scan (call graph trace)")
+	res.N1 = checker.RunN1(absDir, cgCache)
 	printResult(res.N1)
+
+	// Step 7: ent full-table scan (.Query().All() without .Limit())
+	printStep(7, totalSteps, "ent full-scan check (.All() without .Limit())")
+	res.EntFullScan = checker.RunEntFullScan(absDir)
+	printResult(res.EntFullScan)
+
+	// Step 8: logic review — storage trace per interface via call graph
+	printStep(8, totalSteps, "logic review (DB/Redis trace per interface)")
+	res.LogicReview = checker.RunLogicReview(cgCache)
+	printResult(res.LogicReview)
+
+	// Steps 9-11: dynamic analysis (only when --dynamic flag is set)
+	if VarBoolDynamic {
+		dur := VarDurationPprofWindow
+		if dur == 0 {
+			dur = 30 * time.Second
+		}
+		cfg := checker.DynamicConfig{
+			PprofAddr:        VarStringPprof,
+			SlowQueryLogPath: VarStringSlowLog,
+			ProfileDuration:  dur,
+			OutDir:           outDir,
+		}
+
+		printStep(8, totalSteps, fmt.Sprintf("pprof CPU profile (%s)", dur))
+		printStep(9, totalSteps, "pprof heap + goroutine snapshot")
+		printStep(10, totalSteps, "slow query log analysis")
+
+		color.Gray.Println("  ⏳ collecting pprof data, please wait...")
+		res.Dynamic = checker.RunDynamic(cfg)
+		printResult(res.Dynamic.CPU)
+		printResult(res.Dynamic.Heap)
+		printResult(res.Dynamic.Goroutine)
+		printResult(res.Dynamic.SlowQuery)
+	}
 
 	res.Elapsed = time.Since(start)
 
-	// Write unified report.html (+ details/n1.html + details/lint.html)
+	// Write unified report.html
 	checker.WriteReportHTML(outDir, absDir, map[string]*checker.Result{
-		"fmt":    res.Fmt,
-		"vet":    res.Vet,
-		"lint":   res.Lint,
-		"vuln":   res.Vuln,
-		"escape": res.Escape,
-		"n1":     res.N1,
-	}, res.Elapsed)
+		"fmt":           res.Fmt,
+		"vet":           res.Vet,
+		"lint":          res.Lint,
+		"vuln":          res.Vuln,
+		"escape":        res.Escape,
+		"n1":            res.N1,
+		"ent-fullscan":  res.EntFullScan,
+		"logic-review":  res.LogicReview,
+		"dynamic":       dynamicSummaryResult(res.Dynamic),
+	}, res.Elapsed, res.Dynamic)
 
 	printSummary(res, outDir)
 	return exitCode(res)
 }
 
+// dynamicSummaryResult returns a synthetic Result for the dynamic section header (used in nav).
+func dynamicSummaryResult(dr *checker.DynamicResult) *checker.Result {
+	if dr == nil {
+		return nil
+	}
+	// worst level across all sub-results
+	worst := checker.LevelPass
+	order := map[checker.Level]int{
+		checker.LevelPass: 0, checker.LevelSkip: 0,
+		checker.LevelInfo: 1, checker.LevelWarn: 2, checker.LevelFail: 3,
+	}
+	for _, r := range []*checker.Result{dr.CPU, dr.Heap, dr.Goroutine, dr.SlowQuery} {
+		if r != nil && order[r.Level] > order[worst] {
+			worst = r.Level
+		}
+	}
+	return &checker.Result{Level: worst, Summary: "dynamic analysis"}
+}
+
 // ── helpers ──
 
-func printBanner(dir string) {
+func printBanner(dir string, dynamic bool) {
+	mode := "static"
+	if dynamic {
+		mode = "static + dynamic"
+	}
 	fmt.Println()
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
-	color.Style{color.FgCyan, color.Bold}.Printf("  zctl perf scan · %s\n", filepath.Base(dir))
+	color.Style{color.FgCyan, color.Bold}.Printf("  zctl perf scan [%s] · %s\n", mode, filepath.Base(dir))
 	color.Style{color.FgCyan, color.Bold}.Printf("  %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
 	fmt.Println()
@@ -150,6 +236,14 @@ func printSummary(res *ScanResult, outDir string) {
 	fmt.Printf("  %-28s %s\n", "govulncheck", badge(res.Vuln))
 	fmt.Printf("  %-28s %s\n", "escape analysis", badge(res.Escape))
 	fmt.Printf("  %-28s %s\n", "N+1 query scan", badge(res.N1))
+	fmt.Printf("  %-28s %s\n", "ent full-scan", badge(res.EntFullScan))
+	fmt.Printf("  %-28s %s\n", "logic review", badge(res.LogicReview))
+	if res.Dynamic != nil {
+		fmt.Printf("  %-28s %s\n", "pprof CPU", badge(res.Dynamic.CPU))
+		fmt.Printf("  %-28s %s\n", "pprof heap", badge(res.Dynamic.Heap))
+		fmt.Printf("  %-28s %s\n", "goroutine", badge(res.Dynamic.Goroutine))
+		fmt.Printf("  %-28s %s\n", "slow query", badge(res.Dynamic.SlowQuery))
+	}
 	fmt.Printf("  %-28s %s\n", "elapsed", res.Elapsed.Round(time.Millisecond).String())
 	fmt.Println()
 	color.Gray.Printf("  Report: %s/report.html\n", outDir)
@@ -198,8 +292,6 @@ func exitCode(res *ScanResult) error {
 	}
 	return nil
 }
-
-
 
 func min(a, b int) int {
 	if a < b {

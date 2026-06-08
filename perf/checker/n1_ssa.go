@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/ssa"
 )
 
 // ── N+1 Finding ───────────────────────────────────────────────────────────────
@@ -60,26 +62,33 @@ const entPkgPrefix = "entgo.io/ent"
 
 // ── Phase 2: type-guided AST tracing ─────────────────────────────────────────
 
-// traceWithSSA uses go/packages type info (not full SSA) to resolve interface
-// implementations, then AST-scans implementation bodies for ent terminal methods.
+// traceWithSSA resolves N+1 candidates using the pre-built call graph when available,
+// falling back to the original go/packages + impl-AST approach otherwise.
 //
-// Flow per candidate:
-//  1. Load candidate package with type info (fast: only the logic package)
-//  2. At the call site, use go/types to get the receiver's interface type
-//  3. Find all concrete types implementing that interface (via packages.Visit)
-//  4. Locate their method implementations on disk
-//  5. AST-scan those implementations for ent terminal calls (recursive, depth≤5)
-func traceWithSSA(dir string, fset *token.FileSet, candidates []Candidate) []N1Finding {
+// With call graph (cgCache != nil):
+//   For each candidate call site, look up the callee SSA node in the call graph,
+//   then walk its out-edges to find any ent terminal method. This is more accurate
+//   because it follows the actual type-checked call edges, not just name matching.
+//
+// Without call graph (cgCache == nil):
+//   Original path: load type info per package, resolve interface → concrete impl,
+//   AST-scan impl body for ent terminals.
+func traceWithSSA(dir string, fset *token.FileSet, candidates []Candidate, cgCache *CallGraphCache) []N1Finding {
 	if len(candidates) == 0 {
 		return nil
 	}
 
+	// Fast path: use pre-built call graph
+	if cgCache != nil {
+		return traceWithCallGraph(candidates, cgCache, fset)
+	}
+
+	// Slow path: original per-package type loading
 	moduleName := detectModuleName(dir)
 	if moduleName == "" {
 		return fallbackFindings(candidates)
 	}
 
-	// Group candidates by import path to load each package once
 	type pkgGroup struct {
 		importPath string
 		candidates []Candidate
@@ -98,7 +107,6 @@ func traceWithSSA(dir string, fset *token.FileSet, candidates []Candidate) []N1F
 		}
 	}
 
-	// Build impl index once: method signatures → impl file + func body
 	implIndex := buildImplIndex(dir, moduleName, fset)
 
 	var findings []N1Finding
@@ -112,6 +120,171 @@ func traceWithSSA(dir string, fset *token.FileSet, candidates []Candidate) []N1F
 		}
 	}
 	return findings
+}
+
+// traceWithCallGraph resolves N+1 candidates using the call graph's impl index.
+//
+// Strategy: for each candidate call (recv.Method in loop), look up all CHA callees
+// of that method name in the call graph, then use implIndex AST scan to confirm
+// whether the callee body reaches an ent terminal.
+//
+// This is equivalent to the original resolveCandidate path but uses the call graph's
+// type information to correctly resolve interface → concrete impl, avoiding the
+// unreliable name-based fallback.
+func traceWithCallGraph(candidates []Candidate, cgCache *CallGraphCache, fset *token.FileSet) []N1Finding {
+	// Build a lookup: methodName → []SSA functions in call graph that are concrete impls
+	// (i.e., their receiver type ends in "Dao" or similar)
+	type implFunc struct {
+		fn        *ssa.Function
+		recvType  string
+	}
+	methodToImpls := make(map[string][]implFunc)
+	for fn := range cgCache.cg.Nodes {
+		if fn == nil || fn.Signature == nil || fn.Signature.Recv() == nil {
+			continue
+		}
+		if fn.Package() == nil || fn.Package().Pkg == nil {
+			continue
+		}
+		recvType := typeBaseName(fn.Signature.Recv().Type())
+		lowerRecv := strings.ToLower(recvType)
+		// Only DAO concrete impls (not interfaces)
+		if !strings.HasSuffix(lowerRecv, "dao") {
+			continue
+		}
+		// SSA method name is "(*Type).Method" — extract just "Method"
+		rawName := fn.Name()
+		methodName := rawName
+		if dot := strings.LastIndex(rawName, "."); dot >= 0 {
+			methodName = rawName[dot+1:]
+		}
+		methodToImpls[methodName] = append(methodToImpls[methodName], implFunc{fn: fn, recvType: recvType})
+	}
+
+	var findings []N1Finding
+	implIdx := cgCache.implIdx
+
+	for _, c := range candidates {
+		impls, ok := methodToImpls[c.MethodName]
+		if !ok {
+			// No concrete DAO impl found for this method — emit INFO if cross-pkg
+			if isCrossPackageCall(c) {
+				findings = append(findings, *infoFinding(c))
+			}
+			continue
+		}
+
+		entTerminal := ""
+		var chain []ChainStep
+
+		for _, impl := range impls {
+			// First try implIdx (has AST body with source positions)
+			key := impl.recvType + "." + c.MethodName
+			if entries, ok2 := implIdx[key]; ok2 && len(entries) > 0 {
+				ch, terminal := astFindEntTerminal(entries[0].funcDecl.Body, entries[0].fset, entries[0].file, 0, 6)
+				if terminal != "" {
+					entTerminal = terminal
+					chain = ch
+					break
+				}
+				continue
+			}
+			// Fallback: walk call graph from this impl node to find ent terminal
+			if node := cgCache.cg.Nodes[impl.fn]; node != nil {
+				t, ch := cgReachesEntTerminal(node, cgCache, 0, 6, make(map[*callgraph_Node]bool))
+				if t != "" {
+					entTerminal = t
+					chain = ch
+					break
+				}
+			}
+		}
+
+		if entTerminal != "" {
+			loopSnip := readSourceSnippet(c.File, c.LoopLine-2, c.CallLine+3, c.LoopLine, c.CallLine)
+			// Find impl snippet
+			var implSnip []SourceLine
+			if key := (impls[0].recvType + "." + c.MethodName); len(implIdx[key]) > 0 {
+				entry := implIdx[key][0]
+				implLine := entry.fset.Position(entry.funcDecl.Pos()).Line
+				termLine := implLine
+				if len(chain) > 0 {
+					termLine = chain[len(chain)-1].Line
+				}
+				implSnip = readSourceSnippet(entry.file, implLine, termLine+3, termLine, termLine)
+			}
+			findings = append(findings, N1Finding{
+				File: c.File, ShortFile: c.ShortFile,
+				LoopLine: c.LoopLine, CallLine: c.CallLine,
+				RecvText: c.RecvText, MethodName: c.MethodName,
+				Level:       LevelFail,
+				Chain:       chain,
+				EntTerminal: entTerminal,
+				LoopSnippet: loopSnip,
+				ImplSnippet: implSnip,
+			})
+		} else if isCrossPackageCall(c) {
+			findings = append(findings, *infoFinding(c))
+		}
+	}
+	return findings
+}
+
+// callgraph_Node is a local alias to avoid import collision in the BFS visited map.
+type callgraph_Node = callgraph.Node
+
+// cgReachesEntTerminal does a BFS from a call graph node to find an ent terminal method.
+func cgReachesEntTerminal(
+	node *callgraph.Node,
+	cgCache *CallGraphCache,
+	depth, maxDepth int,
+	visited map[*callgraph_Node]bool,
+) (terminal string, chain []ChainStep) {
+	if node == nil || visited[node] || depth > maxDepth {
+		return "", nil
+	}
+	visited[node] = true
+
+	fn := node.Func
+	if fn == nil {
+		return "", nil
+	}
+
+	// Check if this function IS an ent terminal
+	if entTerminalMethods[fn.Name()] && isEntPackage(fn) {
+		pos := cgCache.prog.Fset.Position(fn.Pos())
+		return fn.Name(), []ChainStep{{
+			File:      pos.Filename,
+			ShortFile: shortPath(pos.Filename),
+			Line:      pos.Line,
+			FuncName:  fn.Name(),
+			CallText:  "." + fn.Name() + "(ctx)  ← SQL executed here",
+		}}
+	}
+
+	for _, edge := range node.Out {
+		t, c := cgReachesEntTerminal(edge.Callee, cgCache, depth+1, maxDepth, visited)
+		if t != "" {
+			// Prepend this step to the chain
+			pos := cgCache.prog.Fset.Position(fn.Pos())
+			step := ChainStep{
+				File:      pos.Filename,
+				ShortFile: shortPath(pos.Filename),
+				Line:      pos.Line,
+				FuncName:  fn.Name(),
+				CallText:  fn.Name(),
+			}
+			return t, append([]ChainStep{step}, c...)
+		}
+	}
+	return "", nil
+}
+
+func isEntPackage(fn *ssa.Function) bool {
+	if fn.Package() == nil || fn.Package().Pkg == nil {
+		return false
+	}
+	return strings.HasPrefix(fn.Package().Pkg.Path(), "entgo.io/ent")
 }
 
 // ── Type info loading ─────────────────────────────────────────────────────────

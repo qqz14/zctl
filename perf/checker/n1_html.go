@@ -200,17 +200,17 @@ h1{font-size:1.5rem;margin-bottom:4px}
 {{end}}
 
 <!-- Tab bar -->
-<div class="tabs">
-  <button class="tab-btn {{if .Confirmed}}active-fail{{else}}active-info{{end}}" onclick="switchTab('errors', this, 'active-fail')">
-    ❌ Errors{{if .Confirmed}} ({{len .Confirmed}}){{end}}
+<div class="tabs" id="n1-tabs">
+  <button class="tab-btn {{if .Confirmed}}active-fail{{else}}active-info{{end}}" onclick="n1SwitchTab('n1-errors', this, 'active-fail')">
+    ❌ 确认 N+1{{if .Confirmed}} ({{len .Confirmed}}){{end}}
   </button>
-  <button class="tab-btn {{if not .Confirmed}}active-info{{end}}" onclick="switchTab('review', this, 'active-info')">
+  <button class="tab-btn {{if not .Confirmed}}active-info{{end}}" onclick="n1SwitchTab('n1-review', this, 'active-info')">
     ℹ️ 人工审核{{if .Info}} ({{len .Info}}){{end}}
   </button>
 </div>
 
 <!-- Tab: Errors -->
-<div id="tab-errors" class="tab-panel {{if .Confirmed}}active{{end}}">
+<div id="n1-errors" class="tab-panel {{if .Confirmed}}active{{end}}">
 {{if .Confirmed}}
 <p style="font-size:.85rem;color:#666;margin-bottom:16px">
   以下调用已确认：循环体内的调用链最终触达 <code>entgo.io/ent</code> 终端方法，每次循环都会执行一条 SQL。
@@ -313,7 +313,7 @@ for _, item := range items {
 </div>
 
 <!-- Tab: Review -->
-<div id="tab-review" class="tab-panel {{if not .Confirmed}}active{{end}}">
+<div id="n1-review" class="tab-panel {{if not .Confirmed}}active{{end}}">
 {{if .Info}}
 <p style="font-size:.85rem;color:#666;margin-bottom:16px">
   以下调用在循环内调用了其他包的方法，impl 追踪未发现 ent 终端（非 DB 操作）。请人工确认无其他副作用。
@@ -355,11 +355,19 @@ for _, item := range items {
 </p>
 
 <script>
-function switchTab(name, btn, activeClass) {
-  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active-fail','active-info'));
-  document.getElementById('tab-' + name).classList.add('active');
-  btn.classList.add(activeClass);
+function n1SwitchTab(panelId, btn, activeClass) {
+  // Only operate within n1 panels (prefixed n1-)
+  ['n1-errors','n1-review'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.classList.remove('active');
+  });
+  var tabBar = document.getElementById('n1-tabs');
+  if (tabBar) tabBar.querySelectorAll('.tab-btn').forEach(function(b) {
+    b.classList.remove('active-fail','active-info');
+  });
+  var panel = document.getElementById(panelId);
+  if (panel) panel.classList.add('active');
+  if (btn) btn.classList.add(activeClass);
 }
 </script>
 </body>

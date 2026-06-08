@@ -1,6 +1,8 @@
 package perf
 
 import (
+	"time"
+
 	"github.com/qqz14/zctl/internal/cobrax"
 	"github.com/qqz14/zctl/perf/cli"
 	"github.com/spf13/cobra"
@@ -14,24 +16,28 @@ var (
 )
 
 func init() {
-	Cmd.Short = "Static performance & quality scan"
+	Cmd.Short = "Static (+ optional dynamic) performance & quality scan"
 	Cmd.Long = `Run static analysis on the current Go project to detect:
   - Code style (gofmt)
   - Static correctness (go vet)
-  - Resource leaks: HTTP body, sql.Rows, rows.Err(), context (golangci-lint)
-  - Performance patterns: slice prealloc, loop context, large-value params
-  - CVE vulnerabilities in dependencies (govulncheck)
+  - Resource leaks, perf patterns, style (golangci-lint)
+  - CVE vulnerabilities (govulncheck)
   - Heap escape hotspots (go build -gcflags="-m=1")
-  - N+1 DB query patterns (AST scan)
+  - N+1 DB query patterns (AST + impl trace)
+  - ent .All() without .Limit() (potential full-table scan)
 
-Outputs a Markdown report to build/perf/REPORT.md.
+With --dynamic, also runs:
+  - pprof CPU / heap / goroutine snapshot (service must expose /debug/pprof)
+  - MySQL slow query log analysis
 
 Example:
   zctl perf scan
   zctl perf scan --dir=/path/to/project
-  zctl perf scan --out=./reports/`
+  zctl perf scan --dynamic --pprof=http://localhost:6060
+  zctl perf scan --dynamic --pprof=http://localhost:6060 --slow-log=/var/log/mysql/slow.log
+  zctl perf scan --dynamic --pprof=http://localhost:6060 --pprof-window=60s`
 
-	scanCmd.Short = "Run all static checks and output REPORT.md"
+	scanCmd.Short = "Run static checks (+ optional dynamic) and output report.html"
 	scanCmd.Long = `Execute all static checkers in sequence and write results to build/perf/.
 
 Required tools (auto-detected, skipped if missing):
@@ -39,11 +45,28 @@ Required tools (auto-detected, skipped if missing):
   govulncheck    go install golang.org/x/vuln/cmd/govulncheck@latest
 
 Built-in (no install needed):
-  gofmt, go vet, go build -gcflags="-m=1", AST scanner`
+  gofmt, go vet, go build -gcflags="-m=1", AST scanner, ent full-scan
+
+Dynamic analysis (only with --dynamic):
+  --pprof        pprof HTTP endpoint, e.g. http://localhost:6060
+  --slow-log     MySQL slow query log file path
+  --pprof-window CPU profile collection window (default 30s)`
 
 	scanFlags := scanCmd.Flags()
+	// Static flags
 	scanFlags.StringVarWithDefaultValue(&cli.VarStringDir, "dir", ".")
 	scanFlags.StringVar(&cli.VarStringOut, "out")
+
+	// Dynamic flags — use cobra native FlagSet for bool/duration support
+	rawFlags := scanCmd.Command.Flags()
+	rawFlags.BoolVar(&cli.VarBoolDynamic, "dynamic", false,
+		"enable dynamic analysis (pprof + slow query log)")
+	rawFlags.StringVar(&cli.VarStringPprof, "pprof", "",
+		"pprof HTTP endpoint, e.g. http://localhost:6060 (requires --dynamic)")
+	rawFlags.StringVar(&cli.VarStringSlowLog, "slow-log", "",
+		"MySQL slow query log file path (requires --dynamic)")
+	rawFlags.DurationVar(&cli.VarDurationPprofWindow, "pprof-window", 30*time.Second,
+		"CPU profile collection window (default 30s, requires --dynamic)")
 
 	Cmd.AddCommand(scanCmd)
 

@@ -33,7 +33,8 @@ var lastN1Findings []N1Finding
 //   FAIL  — confirmed DB query inside loop (ent terminal reachable)
 //   INFO  — cross-package call inside loop, no ent terminal found (e.g. cache)
 //   PASS  — no candidates or all resolved as non-DB
-func RunN1(dir string) *Result {
+// RunN1 detects N+1 patterns. cgCache may be nil — falls back to per-package loading.
+func RunN1(dir string, cgCache *CallGraphCache) *Result {
 	fset := token.NewFileSet()
 
 	// ── Phase 1: AST candidate collection ──
@@ -42,8 +43,8 @@ func RunN1(dir string) *Result {
 		return Pass("no loop-internal calls detected")
 	}
 
-	// ── Phase 2: SSA callgraph trace ──
-	findings := traceWithSSA(dir, fset, candidates)
+	// ── Phase 2: Call graph trace (or AST fallback) ──
+	findings := traceWithSSA(dir, fset, candidates, cgCache)
 
 	// Cache findings for WriteReportHTML (called after all checks complete)
 	lastN1Findings = findings
