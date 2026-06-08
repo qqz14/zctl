@@ -444,7 +444,7 @@ func astFindEntTerminal(body *ast.BlockStmt, fset *token.FileSet, file string, d
 			FuncName: method,
 			CallText: "." + method + "(ctx)  ← SQL executed here",
 		}}
-		terminal = method + "(ctx)"
+		terminal = method
 		return false
 	})
 

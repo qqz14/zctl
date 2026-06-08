@@ -110,7 +110,7 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 	res.EntFullScan = checker.RunEntFullScan(absDir)
 	printResult(res.EntFullScan)
 
-	// Step 8: logic review — storage trace per interface via call graph
+	// Step 8: logic review — per-interface DB/Redis trace via call graph + implIdx AST
 	printStep(8, totalSteps, "logic review (DB/Redis trace per interface)")
 	res.LogicReview = checker.RunLogicReview(cgCache)
 	printResult(res.LogicReview)

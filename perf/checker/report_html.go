@@ -894,12 +894,12 @@ func htmlEsc(s string) string {
 
 // ── Logic Review inline renderer ─────────────────────────────────────────────
 //
-// Layout:
+// Layout (参考 SQL 性能 sp-tabs 样式):
 //   Top tabs  = first-level subdir under logic/ (e.g. user, oauth, permission)
 //   Tab body  = second-level subdir groups (e.g. list, register, auth)
 //   Each interface = one collapsible card, expanded by default
-//   Card body = numbered IO steps: SQL (dark) / Redis (dark red)
-//               + call chain shown inline after each step
+//   Card header = fn() + file:line + SQL/Redis badges
+//   Card body = numbered IO steps with source snippet (参考 N+1 样式)
 
 func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 	if r == nil || len(r.Methods) == 0 {
@@ -943,59 +943,73 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 
 	var sb strings.Builder
 
-	// ── CSS ──
+	// ── CSS (参考 sp-tabs 样式 + N+1 code-block 样式) ──
 	sb.WriteString(`<style>
-/* top-level module tabs */
-.lr-tabs{display:flex;border-bottom:2px solid #e0e3ea;margin-bottom:0;background:#fff;position:sticky;top:0;z-index:10}
-.lr-tab-btn{padding:10px 20px;font-size:.88rem;font-weight:600;cursor:pointer;border:none;background:none;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .13s;text-transform:capitalize}
-.lr-tab-btn:hover{color:#333;background:#f5f6fa}
+/* ── top-level tabs (参考 sp-tabs) ── */
+.lr-tabs{display:flex;border-bottom:2px solid #ddd;margin-bottom:20px;position:sticky;top:0;z-index:10;background:#fff}
+.lr-tab-btn{padding:10px 24px;font-size:.93rem;font-weight:600;cursor:pointer;border:none;background:none;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .15s;text-transform:capitalize}
+.lr-tab-btn:hover{color:#333}
 .lr-tab-btn.active{color:#141422;border-bottom-color:#141422}
-.lr-tab-panel{display:none;padding:20px 0 4px}
+.lr-tab-panel{display:none;padding:4px 0}
 .lr-tab-panel.active{display:block}
-/* submodule section */
+/* ── submodule section ── */
 .lr-sub{margin-bottom:24px}
 .lr-sub-title{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:#7a8aaa;padding:4px 0 8px;border-bottom:1px solid #eef0f5;margin-bottom:10px;display:flex;align-items:center;gap:6px}
-/* interface card */
-.lr-card{background:#fff;border:1px solid #e0e3ea;border-radius:8px;margin-bottom:10px;overflow:hidden}
-.lr-card-hdr{padding:10px 16px;display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;background:#f8f9fc}
+/* ── interface card ── */
+.lr-card{background:#fff;border:1px solid #e0e3ea;border-radius:8px;margin-bottom:14px;overflow:hidden}
+.lr-card-hdr{padding:10px 16px;display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;background:#f8f9fc;border-bottom:1px solid #eef0f5}
 .lr-card-hdr:hover{background:#f0f2f8}
-.lr-card-fn{font-weight:700;font-size:.88rem;font-family:monospace;flex:1;color:#1a1a3a}
+.lr-card-fn{font-weight:700;font-size:.88rem;font-family:monospace;color:#1a1a3a;flex:1}
+.lr-card-loc{font-size:.72rem;font-family:monospace;color:#888;flex-shrink:0}
 .lr-card-badges{display:flex;gap:5px;flex-shrink:0}
 .lr-badge-db{font-size:.68rem;padding:1px 7px;border-radius:8px;background:#e8f0fe;color:#1a56cc;font-weight:700}
 .lr-badge-redis{font-size:.68rem;padding:1px 7px;border-radius:8px;background:#fce8e6;color:#c5221f;font-weight:700}
 .lr-card-arrow{color:#bbb;font-size:.8rem;transition:transform .15s;flex-shrink:0}
-.lr-card-body{display:none;padding:14px 16px 16px;border-top:1px solid #eef0f5}
+.lr-card-body{display:none;padding:14px 16px 16px}
 .lr-card-body.open{display:block}
-/* IO step */
-.lr-step{display:flex;gap:0;margin-bottom:10px}
+/* ── IO step ── */
+.lr-step{display:flex;gap:0;margin-bottom:16px}
 .lr-step:last-child{margin-bottom:0}
-.lr-step-num{width:26px;flex-shrink:0;padding-top:5px;color:#ccc;font-size:.72rem;text-align:right;padding-right:8px}
+.lr-step-num{width:28px;flex-shrink:0;padding-top:4px;color:#bbb;font-size:.72rem;text-align:right;padding-right:8px;font-weight:700}
 .lr-step-body{flex:1;min-width:0}
-.lr-step-meta{display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap}
-.lr-kind-sql{font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:3px;background:#e8f0fe;color:#1a56cc;flex-shrink:0}
-.lr-kind-redis{font-size:.68rem;font-weight:700;padding:1px 6px;border-radius:3px;background:#2a1818;color:#ffb3b0;flex-shrink:0}
-.lr-dao{font-family:monospace;font-size:.8rem;color:#555}
-.lr-dao strong{color:#333}
+.lr-step-meta{display:flex;align-items:center;gap:6px;margin-bottom:5px;flex-wrap:wrap}
+.lr-kind-sql{font-size:.68rem;font-weight:700;padding:2px 7px;border-radius:3px;background:#e8f0fe;color:#1a56cc;flex-shrink:0}
+.lr-kind-redis{font-size:.68rem;font-weight:700;padding:2px 7px;border-radius:3px;background:#2a1818;color:#ffb3b0;flex-shrink:0}
+.lr-dao{font-family:monospace;font-size:.82rem;color:#444}
+.lr-dao strong{color:#222}
+.lr-loc{font-size:.72rem;font-family:monospace;color:#888;margin-left:2px}
 .lr-inferred{font-size:.65rem;color:#aaa;background:#f5f5f5;padding:1px 5px;border-radius:3px}
-.lr-chain{font-size:.68rem;color:#aaa;font-style:italic;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
-.lr-sql{background:#1a1a2e;border-radius:5px;padding:6px 12px;font-family:monospace;color:#a8d8a8;font-size:.8rem;white-space:pre;overflow-x:auto;margin-top:2px;border-left:3px solid #2e7d32}
-.lr-redis{background:#1a0a0a;border-radius:5px;padding:6px 12px;font-family:monospace;color:#ffb3b0;font-size:.8rem;white-space:pre;overflow-x:auto;margin-top:2px;border-left:3px solid #c5221f}
+.lr-chain{font-size:.68rem;color:#aaa;font-style:italic;margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+/* ── SQL block (dark green) ── */
+.lr-sql-wrap{margin-top:3px}
+.lr-sql{background:#1a1a2e;border-radius:5px;padding:7px 12px;font-family:monospace;color:#a8d8a8;font-size:.82rem;white-space:pre;overflow-x:auto;border-left:3px solid #2e7d32;margin-top:2px}
+.lr-sql-hook{border-left-color:#5a7d5a;opacity:.85}
+.lr-hook-label{font-size:.68rem;color:#6a9a6a;font-style:italic;margin-top:6px;margin-bottom:1px}
+.lr-hook-badge{font-size:.65rem;background:#1a2e1a;color:#6aaa6a;padding:1px 6px;border-radius:3px;margin-left:4px;font-weight:600}
+.lr-sql-missing{font-size:.78rem;color:#a05000;background:#fff8f0;border:1px dashed #e08000;border-radius:4px;padding:5px 10px;margin-top:3px}
+/* ── Redis block (dark red) ── */
+.lr-redis{background:#1a0a0a;border-radius:5px;padding:7px 12px;font-family:monospace;color:#ffb3b0;font-size:.82rem;white-space:pre;overflow-x:auto;margin-top:3px;border-left:3px solid #c5221f}
 </style>
 `)
 
 	// Unique prefix to avoid ID collisions when embedded in report.html
 	pfx := "lr"
 
-	// Render top-level module tabs
+	// Render top-level module tabs (参考 sp-tabs 样式)
 	sb.WriteString(fmt.Sprintf(`<div class="lr-tabs" id="%s-tabs">`, pfx))
 	for i, modName := range topOrder {
 		activeCls := ""
 		if i == 0 {
 			activeCls = " active"
 		}
+		// Count methods in this module
+		cnt := 0
+		for _, sg := range topMap[modName].Subs {
+			cnt += len(sg.Methods)
+		}
 		fmt.Fprintf(&sb,
-			`<button class="lr-tab-btn%s" onclick="lrTab('%s','%s-%s',this)">%s</button>`,
-			activeCls, pfx, pfx, strings.ReplaceAll(modName, "/", "-"), htmlEsc(modName))
+			`<button class="lr-tab-btn%s" onclick="lrTab('%s','%s-%s',this)">%s <span style="font-size:.72rem;opacity:.7">(%d)</span></button>`,
+			activeCls, pfx, pfx, strings.ReplaceAll(modName, "/", "-"), htmlEsc(modName), cnt)
 	}
 	sb.WriteString(`</div>`)
 
@@ -1019,11 +1033,22 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 					strings.ReplaceAll(modName, "/", "-"),
 					strings.ReplaceAll(sg.Name, "/", "-"), mi)
 
-				// Card header
+				// Card header: signature + file:line + badges + arrow
 				fmt.Fprintf(&sb,
 					`<div class="lr-card"><div class="lr-card-hdr" onclick="lrToggle('%s')">`,
 					cardID)
+				// Card title: method name only (clean, no params/returns)
 				fmt.Fprintf(&sb, `<span class="lr-card-fn">%s()</span>`, htmlEsc(m.Method))
+
+				// Show file:line of Logic method definition
+				if m.LogicFile != "" {
+					locStr := m.LogicFile
+					if m.LogicLine > 0 {
+						locStr = fmt.Sprintf("%s:%d", m.LogicFile, m.LogicLine)
+					}
+					fmt.Fprintf(&sb, `<span class="lr-card-loc">%s</span>`, htmlEsc(locStr))
+				}
+
 				sb.WriteString(`<div class="lr-card-badges">`)
 				if m.DBCount > 0 {
 					fmt.Fprintf(&sb, `<span class="lr-badge-db">SQL×%d</span>`, m.DBCount)
@@ -1032,10 +1057,10 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 					fmt.Fprintf(&sb, `<span class="lr-badge-redis">Redis×%d</span>`, m.RedisCount)
 				}
 				sb.WriteString(`</div>`)
-				sb.WriteString(`<span class="lr-card-arrow" id="arr-` + cardID + `">▶</span>`)
+				sb.WriteString(`<span class="lr-card-arrow" id="arr-` + cardID + `">▼</span>`)
 				sb.WriteString(`</div>`) // hdr
 
-				// Card body — open by default
+				// Card body — open by default (lr-card-body.open shown via CSS)
 				fmt.Fprintf(&sb, `<div id="%s" class="lr-card-body open">`, cardID)
 
 				if len(m.Ops) == 0 {
@@ -1044,7 +1069,7 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 				for si, op := range m.Ops {
 					fmt.Fprintf(&sb, `<div class="lr-step"><div class="lr-step-num">%d</div><div class="lr-step-body">`, si+1)
 
-					// Meta line: kind badge + dao.method + inferred? + call chain
+					// Meta line: kind badge + dao.method + file:line + inferred? + call chain
 					sb.WriteString(`<div class="lr-step-meta">`)
 					if op.Kind == IOKindDB {
 						sb.WriteString(`<span class="lr-kind-sql">SQL</span>`)
@@ -1053,6 +1078,11 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 					}
 					fmt.Fprintf(&sb, `<span class="lr-dao">%s.<strong>%s</strong>()</span>`,
 						htmlEsc(op.Receiver), htmlEsc(op.Method))
+					// File:line for the call site
+					if op.ShortFile != "" && op.Line > 0 {
+						fmt.Fprintf(&sb, `<span class="lr-loc">%s:%d</span>`,
+							htmlEsc(op.ShortFile), op.Line)
+					}
 					if op.Kind == IOKindDB && !op.SQLExact {
 						sb.WriteString(`<span class="lr-inferred">推断</span>`)
 					}
@@ -1066,7 +1096,23 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 
 					// SQL or Redis command
 					if op.Kind == IOKindDB {
-						fmt.Fprintf(&sb, `<div class="lr-sql">%s</div>`, htmlEsc(op.SQL))
+						if op.SQL == "" {
+							// No SQL captured and no ent terminal found in AST — show error, never guess
+							sb.WriteString(`<div class="lr-sql-missing">⚠ SQL 未捕获 — impl 未在 implIdx 中 或 无 ent 终端调用</div>`)
+						} else {
+							sqlLabel := ""
+							if len(op.HookSQLs) > 0 {
+								sqlLabel = fmt.Sprintf(` <span class="lr-hook-badge">+%d hook SQL</span>`, len(op.HookSQLs))
+							}
+							fmt.Fprintf(&sb, `<div class="lr-sql-wrap">%s<div class="lr-sql">%s</div>`,
+								sqlLabel, htmlEsc(op.SQL))
+							for hi, hsql := range op.HookSQLs {
+								fmt.Fprintf(&sb,
+									`<div class="lr-hook-label">hook cascade #%d</div><div class="lr-sql lr-sql-hook">%s</div>`,
+									hi+1, htmlEsc(hsql))
+							}
+							sb.WriteString(`</div>`) // sql-wrap
+						}
 					} else {
 						fmt.Fprintf(&sb, `<div class="lr-redis">%s</div>`, htmlEsc(op.RedisCmd))
 					}

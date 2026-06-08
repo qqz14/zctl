@@ -22,8 +22,10 @@ package checker
 
 import (
 	"fmt"
+	"go/ast"
 	"go/token"
 	"go/types"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -46,10 +48,13 @@ type daoImplFunc struct {
 
 // LogicFuncEntry is one exported Logic method from the call graph.
 type LogicFuncEntry struct {
-	PkgPath  string
-	TypeName string // e.g. "GetAllUserListLogic"
-	Method   string // e.g. "GetAllUserList"
-	Func     *ssa.Function
+	PkgPath   string
+	TypeName  string // e.g. "GetAllUserListLogic"
+	Method    string // e.g. "GetAllUserList"
+	Func      *ssa.Function
+	ShortFile string // short path of source file
+	Line      int    // line of method declaration
+	Signature string // SSA-derived signature string
 }
 
 // CallGraphCache is the shared, pre-built call graph result.
@@ -101,8 +106,9 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 			packages.NeedTypesSizes |
 			packages.NeedImports |
 			packages.NeedDeps,
-		Fset: fset,
-		Dir:  dir,
+		Fset:  fset,
+		Dir:   dir,
+		Tests: false, // exclude *_test.go test packages — saves SSA build time
 	}
 
 	pkgs, err := packages.Load(cfg, "./...")
@@ -112,9 +118,16 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 
 	var goodPkgs []*packages.Package
 	packages.Visit(pkgs, func(p *packages.Package) bool {
-		if p.Types != nil {
-			goodPkgs = append(goodPkgs, p)
+		if p.Types == nil {
+			return true
 		}
+		// Skip mock and test packages early — before SSA build.
+		// This is more efficient than filtering during BFS traversal because
+		// excluded packages won't have SSA nodes built at all.
+		if isMockOrTestPkg(p) {
+			return true // visit deps but don't add this pkg
+		}
+		goodPkgs = append(goodPkgs, p)
 		return true
 	}, nil)
 	if len(goodPkgs) == 0 {
@@ -178,7 +191,8 @@ func (c *CallGraphCache) precompute() {
 		// Extract bare method name from SSA format "(*Type).Method" or "(Type).Method"
 		methodName := ssaMethodName(fn.Name())
 
-		// Skip mock packages entirely
+		// Mock/test packages are excluded at packages.Load time (see isMockOrTestPkg).
+		// This check is a defensive fallback only.
 		if strings.Contains(pkgPath, "/mock") || strings.Contains(pkgPath, "/mocks") {
 			continue
 		}
@@ -206,11 +220,17 @@ func (c *CallGraphCache) precompute() {
 			continue
 		}
 		seen[key] = true
+		// Extract source position and signature from SSA function
+		pos := c.fset.Position(fn.Pos())
+		sig := formatSSASignature(fn)
 		c.logicEntries = append(c.logicEntries, LogicFuncEntry{
-			PkgPath:  pkgPath,
-			TypeName: recvType,
-			Method:   methodName,
-			Func:     fn,
+			PkgPath:   pkgPath,
+			TypeName:  recvType,
+			Method:    methodName,
+			Func:      fn,
+			ShortFile: shortPath(pos.Filename),
+			Line:      pos.Line,
+			Signature: sig,
 		})
 	}
 
@@ -295,6 +315,15 @@ func (c *CallGraphCache) bfsIO(
 		}
 		fn := callee.Func
 
+		// Defensive: skip any mock packages that slipped through packages.Load filter
+		// (e.g. vendored mocks or unusually named packages).
+		if fn.Package() != nil && fn.Package().Pkg != nil {
+			pkgPath := fn.Package().Pkg.Path()
+			if strings.Contains(pkgPath, "/mock") || strings.Contains(pkgPath, "/mocks") {
+				continue
+			}
+		}
+
 		pos := token.NoPos
 		if edge.Site != nil {
 			pos = edge.Site.Pos()
@@ -341,12 +370,18 @@ func (c *CallGraphCache) classifyCall(
 
 	// ── Redis ──
 	if strings.Contains(lower, "redis") {
+		// Try to extract key/TTL from the call site's enclosing function body
+		keyHint, ttlHint := c.extractRedisArgsFromCallSite(file, line, method)
+		snippet := readSourceSnippet(file, line-1, line+2, line, line)
 		return IONode{
 			File: file, ShortFile: short, Line: line,
-			CallChain: chain,
-			Kind:      IOKindRedis,
-			Receiver:  typeName, Method: method,
-			RedisCmd: redisCmd(method),
+			CallChain:    chain,
+			Kind:         IOKindRedis,
+			Receiver:     typeName, Method: method,
+			RedisCmd:     redisCmdWithContext(method, keyHint, ttlHint),
+			RedisKeyHint: keyHint,
+			RedisTTLHint: ttlHint,
+			Snippet:      snippet,
 		}, true
 	}
 
@@ -354,27 +389,104 @@ func (c *CallGraphCache) classifyCall(
 	if !strings.HasSuffix(lower, "dao") || !isIOVerb(method) {
 		return IONode{}, false
 	}
-	sql, exact := c.deriveSQL(typeName, method)
+	sql, exact, snippet := c.deriveSQLWithSnippet(typeName, method)
 	return IONode{
 		File: file, ShortFile: short, Line: line,
 		CallChain: chain,
 		Kind:      IOKindDB,
 		Receiver:  typeName, Method: method,
 		SQL: sql, SQLExact: exact,
+		Snippet: snippet,
 	}, true
 }
 
-// deriveSQL: implIdx AST first, method-name heuristic as fallback.
-// Table name is resolved from entTableMap (ent schema AST), falling back to filename heuristic.
-func (c *CallGraphCache) deriveSQL(typeName, method string) (string, bool) {
-	if entries, ok := c.implIdx[typeName+"."+method]; ok && len(entries) > 0 {
-		_, terminal := astFindEntTerminal(entries[0].funcDecl.Body, entries[0].fset, entries[0].file, 0, 4)
-		if terminal != "" {
-			table := c.resolveTableName(typeName, entries[0].file)
-			return entTerminalToSQL(terminal, method, table, entries[0].funcDecl), true
+// extractRedisArgsFromCallSite parses the source file at file/line,
+// finds the enclosing function body, and extracts Redis key/TTL arguments.
+// This works for Redis calls in Logic layer, pkg/cache, or any other file.
+func (c *CallGraphCache) extractRedisArgsFromCallSite(file string, line int, method string) (keyHint, ttlHint string) {
+	if file == "" {
+		return "", ""
+	}
+
+	// First check implIdx (for DAO impls)
+	for _, entries := range c.implIdx {
+		for _, e := range entries {
+			if e.file != file {
+				continue
+			}
+			if e.funcDecl == nil || e.funcDecl.Body == nil {
+				continue
+			}
+			startLine := e.fset.Position(e.funcDecl.Pos()).Line
+			endLine := e.fset.Position(e.funcDecl.End()).Line
+			if line >= startLine && line <= endLine {
+				return extractRedisArgs(e.funcDecl.Body, method)
+			}
 		}
 	}
-	return methodNameToSQL(method, typeName), false
+
+	// Fallback: parse the source file directly to find enclosing function
+	return extractRedisArgsFromFile(file, line, method, c.fset)
+}
+
+// extractRedisArgsFromFile parses a Go source file and finds the function
+// enclosing the given line, then extracts Redis call arguments.
+// Always uses a fresh FileSet to avoid "file already exists" conflicts with
+// the shared call-graph fset.
+func extractRedisArgsFromFile(file string, line int, method string, _ *token.FileSet) (keyHint, ttlHint string) {
+	// Always use a fresh fset — reusing the shared one causes token.Pos conflicts
+	// when the same file was already registered by packages.Load.
+	freshFset := token.NewFileSet()
+
+	src, err := os.ReadFile(file)
+	if err != nil {
+		return "", ""
+	}
+	f, err := parseWithGoParser(freshFset, file, src)
+	if err != nil {
+		return "", ""
+	}
+
+	// Find the function declaration enclosing the given line.
+	// freshFset.Position(fd.Pos()).Line gives the 1-based line within the file,
+	// which matches the call-graph's Position(site.Pos()).Line.
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		startLine := freshFset.Position(fd.Pos()).Line
+		endLine := freshFset.Position(fd.End()).Line
+		if line >= startLine && line <= endLine {
+			return extractRedisArgs(fd.Body, method)
+		}
+	}
+	return "", ""
+}
+
+// deriveSQL uses implIdx AST to derive SQL from ent terminal methods.
+// Returns ("", false) if the impl is not in the index or has no ent terminal —
+// callers should show "[SQL 未捕获]" rather than guessing.
+func (c *CallGraphCache) deriveSQL(typeName, method string) (string, bool) {
+	sql, exact, _ := c.deriveSQLWithSnippet(typeName, method)
+	return sql, exact
+}
+
+// deriveSQLWithSnippet derives SQL by AST-scanning the impl body for ent terminal calls.
+// No fallback guessing: if the impl is missing or has no ent terminal, returns ("", false).
+func (c *CallGraphCache) deriveSQLWithSnippet(typeName, method string) (sql string, exact bool, snippet []SourceLine) {
+	entries, ok := c.implIdx[typeName+"."+method]
+	if !ok || len(entries) == 0 {
+		return "", false, nil // impl not in index — no guess
+	}
+	entry := entries[0]
+	_, terminal := astFindEntTerminal(entry.funcDecl.Body, entry.fset, entry.file, 0, 4)
+	if terminal == "" {
+		return "", false, nil // no ent terminal found — no guess
+	}
+	table := c.resolveTableName(typeName, entry.file)
+	sql = entTerminalToSQL(terminal, method, table, entry.funcDecl)
+	return sql, true, nil
 }
 
 // resolveTableName finds the actual DB table name for a DAO impl type.
@@ -416,6 +528,57 @@ func (c *CallGraphCache) resolveTableName(implStructName, implFile string) strin
 	return camelToSnake(stripped)
 }
 
+// ── Package filter ────────────────────────────────────────────────────────────
+
+// isMockOrTestPkg returns true if a package should be excluded from the call graph.
+//
+// Excluded cases:
+//  1. Package import path contains mock path segments (/mock, /mocks, /mock_, _mock)
+//  2. Package name is "mock" or "mocks"
+//  3. All Go files in the package are _test.go files (external test package)
+//  4. Any Go file in the package has a "_mock.go" suffix (generated mocks)
+func isMockOrTestPkg(p *packages.Package) bool {
+	// 1. Check import path segments
+	pkgPath := p.PkgPath
+	for _, seg := range strings.Split(pkgPath, "/") {
+		lower := strings.ToLower(seg)
+		if lower == "mock" || lower == "mocks" ||
+			strings.HasPrefix(lower, "mock_") || strings.HasSuffix(lower, "_mock") {
+			return true
+		}
+	}
+
+	// 2. Check package name
+	pkgName := strings.ToLower(p.Name)
+	if pkgName == "mock" || pkgName == "mocks" {
+		return true
+	}
+
+	// 3 & 4. Check filenames
+	if len(p.GoFiles) == 0 {
+		return false
+	}
+	allTest := true
+	for _, f := range p.GoFiles {
+		base := filepath.Base(f)
+		// Generated mock files (mockery, gomock, etc.)
+		if strings.HasSuffix(base, "_mock.go") ||
+			strings.HasPrefix(base, "mock_") {
+			return true
+		}
+		// Test files
+		if !strings.HasSuffix(base, "_test.go") {
+			allTest = false
+		}
+	}
+	// All files are _test.go → pure test package
+	if allTest && len(p.GoFiles) > 0 {
+		return true
+	}
+
+	return false
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // ssaMethodName extracts the bare method name from SSA format.
@@ -451,4 +614,55 @@ func typeBaseName(t types.Type) string {
 
 func isExported(name string) bool {
 	return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
+}
+
+// formatSSASignature builds a readable signature string from an SSA function.
+// e.g. "UpdateAPI(in *passport.UpdateAPIReq) (*passport.Empty, error)"
+// Falls back to just the method name on parse failure.
+func formatSSASignature(fn *ssa.Function) string {
+	if fn == nil || fn.Signature == nil {
+		return ""
+	}
+	sig := fn.Signature
+	methodName := ssaMethodName(fn.Name())
+
+	// Build params string
+	var params []string
+	for i := 0; i < sig.Params().Len(); i++ {
+		p := sig.Params().At(i)
+		name := p.Name()
+		typStr := types.TypeString(p.Type(), func(pkg *types.Package) string {
+			return pkg.Name() // use short package name
+		})
+		if name != "" && name != "_" && name != "ctx" {
+			params = append(params, name+" "+typStr)
+		} else if name == "ctx" {
+			// skip ctx for brevity
+		} else {
+			params = append(params, typStr)
+		}
+	}
+
+	// Build results string
+	var results []string
+	for i := 0; i < sig.Results().Len(); i++ {
+		r := sig.Results().At(i)
+		typStr := types.TypeString(r.Type(), func(pkg *types.Package) string {
+			return pkg.Name()
+		})
+		results = append(results, typStr)
+	}
+
+	paramStr := strings.Join(params, ", ")
+	var retStr string
+	switch len(results) {
+	case 0:
+		retStr = ""
+	case 1:
+		retStr = " " + results[0]
+	default:
+		retStr = " (" + strings.Join(results, ", ") + ")"
+	}
+
+	return fmt.Sprintf("%s(%s)%s", methodName, paramStr, retStr)
 }
