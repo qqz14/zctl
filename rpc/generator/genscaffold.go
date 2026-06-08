@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/qqz14/zctl/perf/checker"
 	"github.com/qqz14/zctl/util/ctx"
 	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
@@ -81,6 +82,10 @@ func (g *Generator) GenScaffold(abs string, projectCtx *ctx.ProjectContext, zctx
 	}
 	// .gitignore
 	if err := g.genGitignore(abs); err != nil {
+		return err
+	}
+	// .golangci.yml (perf/lint config — writeIfNotExist so user customizations are preserved)
+	if err := g.genGolangciYml(abs); err != nil {
 		return err
 	}
 	// cmd/migrate-ddl/main.go (offline DDL diff tool: ent schema vs DB → migrations/*.sql)
@@ -1504,6 +1509,10 @@ fmt: # Format the codes | 格式化代码
 lint: # Run go linter | 运行代码错误分析
 	golangci-lint run -D staticcheck
 
+.PHONY: perf
+perf: # Static perf scan | 静态性能/泄漏/N+1/CVE 扫描，输出 build/perf/REPORT.md
+	zctl perf scan --dir=. --out=build/perf/
+
 .PHONY: tools
 tools: # Install the necessary tools | 安装必要的工具
 	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
@@ -1511,6 +1520,7 @@ tools: # Install the necessary tools | 安装必要的工具
 	$(GO) install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 	$(GO) install github.com/fullstorydev/grpcui/cmd/grpcui@latest
 	$(GO) install github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc@latest
+	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 
 .PHONY: health
 health: # Check gRPC health status | 检查 gRPC 健康状态
@@ -3035,6 +3045,12 @@ var nameRe = regexp.MustCompile(` + "`" + `^[a-z0-9_-]+$` + "`" + `)
 		return err
 	}
 	return writeIfNotExist(filepath.Join(dir, "main.go"), content)
+}
+
+// ==================== .golangci.yml ====================
+
+func (g *Generator) genGolangciYml(abs string) error {
+	return writeIfNotExist(filepath.Join(abs, ".golangci.yml"), checker.GolangciYmlContent())
 }
 
 // ==================== helpers ====================

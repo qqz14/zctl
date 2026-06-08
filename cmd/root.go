@@ -20,6 +20,7 @@ import (
 	"github.com/qqz14/zctl/kube"
 	"github.com/qqz14/zctl/migrate"
 	"github.com/qqz14/zctl/model"
+	"github.com/qqz14/zctl/perf"
 	"github.com/qqz14/zctl/quickstart"
 	"github.com/qqz14/zctl/rpc"
 	"github.com/qqz14/zctl/tpl"
@@ -115,6 +116,7 @@ func init() {
 	rootCmd.SetUsageTemplate(usageTpl)
 	rootCmd.AddCommand(api.Cmd, bug.Cmd, docker.Cmd, kube.Cmd, env.Cmd, gateway.Cmd, model.Cmd)
 	rootCmd.AddCommand(migrate.Cmd, quickstart.Cmd, rpc.Cmd, tpl.Cmd, upgrade.Cmd, config.Cmd)
+	rootCmd.AddCommand(perf.Cmd)
 	rootCmd.Command.AddCommand(cobracompletefig.CreateCompletionSpecCommand())
 	rootCmd.MustInit()
 }
