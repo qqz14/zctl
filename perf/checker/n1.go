@@ -204,22 +204,29 @@ func skipFileN1(path string) bool {
 		!strings.Contains(path, "/pkg/")
 }
 
-// skipTrivialCall skips calls that are obviously not interesting:
-// stdlib packages, single-char vars (loop counters), format/log calls.
+// skipTrivialCall skips calls that are 100% certain to be non-DB in all possible cases.
+// Only pure Go stdlib identifiers and single-char loop vars qualify.
+//
+// IMPORTANT: Do NOT add log/errcode/enums here — those are filtered later
+// in writeN1HTML AFTER Phase 2 confirms they are not DB calls.
+// Filtering them here would skip Phase 2 entirely and could mask a DB call
+// hidden behind a wrapper with a deceptive name.
 func skipTrivialCall(recv, method string) bool {
 	lower := strings.ToLower(recv)
+	// Pure stdlib packages — these can never wrap a DB call
 	trivialRecv := map[string]bool{
-		"ctx": true, "context": true, "err": true, "strings": true,
-		"strconv": true, "fmt": true, "json": true, "proto": true,
-		"md": true, "buf": true, "sb": true, "w": true, "r": true,
-		"t": true, "c": true, "s": true, "b": true, "n": true,
-		"log": true, "logx": true, "time": true, "sync": true,
-		"math": true, "sort": true, "bytes": true, "os": true,
+		"ctx": true, "context": true, "err": true,
+		"strings": true, "strconv": true, "fmt": true,
+		"json": true, "bytes": true, "os": true,
+		"sort": true, "math": true, "sync": true, "time": true,
+		"proto": true, "md": true, "buf": true, "sb": true,
+		"w": true, "r": true, "t": true, "c": true, "s": true,
+		"b": true, "n": true,
 	}
 	if trivialRecv[lower] {
 		return true
 	}
-	// Single-char lowercase — almost always a loop var or err
+	// Single-char lowercase — loop counter or local err var
 	if len(recv) == 1 {
 		return true
 	}
