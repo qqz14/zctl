@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gookit/color"
@@ -83,12 +82,15 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 
 	res.Elapsed = time.Since(start)
 
-	// Write REPORT.md
-	report := buildReport(absDir, res)
-	reportPath := filepath.Join(outDir, "REPORT.md")
-	if err := os.WriteFile(reportPath, []byte(report), 0o644); err != nil {
-		color.Red.Printf("  failed to write report: %v\n", err)
-	}
+	// Write unified report.html
+	checker.WriteReportHTML(outDir, absDir, map[string]*checker.Result{
+		"fmt":    res.Fmt,
+		"vet":    res.Vet,
+		"lint":   res.Lint,
+		"vuln":   res.Vuln,
+		"escape": res.Escape,
+		"n1":     res.N1,
+	}, res.Elapsed)
 
 	printSummary(res, outDir)
 	return exitCode(res)
@@ -150,7 +152,7 @@ func printSummary(res *ScanResult, outDir string) {
 	fmt.Printf("  %-28s %s\n", "N+1 query scan", badge(res.N1))
 	fmt.Printf("  %-28s %s\n", "elapsed", res.Elapsed.Round(time.Millisecond).String())
 	fmt.Println()
-	color.Gray.Printf("  Report: %s/REPORT.md\n", outDir)
+	color.Gray.Printf("  Report: %s/report.html\n", outDir)
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
 
 	if hasFail(res) {
@@ -192,64 +194,12 @@ func hasFail(res *ScanResult) bool {
 
 func exitCode(res *ScanResult) error {
 	if hasFail(res) {
-		return fmt.Errorf("perf scan found issues — check build/perf/REPORT.md")
+		return fmt.Errorf("perf scan found issues — open build/perf/report.html")
 	}
 	return nil
 }
 
-func buildReport(dir string, res *ScanResult) string {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("# Perf Static Scan Report — %s\n\n", filepath.Base(dir)))
-	sb.WriteString(fmt.Sprintf("- Time   : %s\n", time.Now().Format("2006-01-02 15:04:05")))
-	sb.WriteString(fmt.Sprintf("- Elapsed: %s\n\n", res.Elapsed.Round(time.Millisecond)))
 
-	sb.WriteString("## Summary\n\n")
-	sb.WriteString("| 检测项 | 状态 | 问题数 |\n")
-	sb.WriteString("|--------|:----:|-------:|\n")
-	writeRow(&sb, "gofmt (代码格式)", res.Fmt)
-	writeRow(&sb, "go vet (静态正确性)", res.Vet)
-	writeRow(&sb, "golangci-lint (资源泄漏/性能/规范)", res.Lint)
-	writeRow(&sb, "govulncheck (CVE漏洞)", res.Vuln)
-	writeRow(&sb, "escape analysis (堆逃逸热点)", res.Escape)
-	writeRow(&sb, "N+1 query scan (SSA callgraph)", res.N1)
-	sb.WriteString("\n")
-
-	writeSection(&sb, "gofmt", res.Fmt)
-	writeSection(&sb, "go vet", res.Vet)
-	writeSection(&sb, "golangci-lint", res.Lint)
-	writeSection(&sb, "govulncheck (CVE)", res.Vuln)
-	writeSection(&sb, "escape analysis (heap hotspot)", res.Escape)
-	writeSection(&sb, "N+1 query scan", res.N1)
-
-	return sb.String()
-}
-
-func writeRow(sb *strings.Builder, name string, r *checker.Result) {
-	if r == nil {
-		sb.WriteString(fmt.Sprintf("| %s | ⊘ SKIP | - |\n", name))
-		return
-	}
-	icon := map[checker.Level]string{
-		checker.LevelPass: "✅ PASS",
-		checker.LevelWarn: "⚠️ WARN",
-		checker.LevelFail: "❌ FAIL",
-		checker.LevelInfo: "ℹ️ INFO",
-		checker.LevelSkip: "⊘ SKIP",
-	}[r.Level]
-	sb.WriteString(fmt.Sprintf("| %s | %s | %d |\n", name, icon, len(r.Issues)))
-}
-
-func writeSection(sb *strings.Builder, title string, r *checker.Result) {
-	if r == nil || len(r.Issues) == 0 {
-		return
-	}
-	sb.WriteString(fmt.Sprintf("## %s\n\n", title))
-	sb.WriteString("```\n")
-	for _, issue := range r.Issues {
-		sb.WriteString(issue + "\n")
-	}
-	sb.WriteString("```\n\n")
-}
 
 func min(a, b int) int {
 	if a < b {

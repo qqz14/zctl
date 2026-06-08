@@ -49,7 +49,8 @@ func RunN1(dir, outDir string) *Result {
 	for _, f := range findings {
 		if f.Level == LevelFail {
 			confirmed = append(confirmed, f)
-		} else {
+		} else if !isNoiseFinding(f) {
+			// Apply the same noise filter as writeN1HTML — confirmed N+1 are NEVER filtered
 			info = append(info, f)
 		}
 	}
