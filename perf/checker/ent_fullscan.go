@@ -307,3 +307,106 @@ func renderChainMethods(chain []methodChainNode) string {
 func renderChain(chain []methodChainNode) string {
 	return renderChainMethods(chain)
 }
+
+// ── SQL perf from logic review ─────────────────────────────────────────────────
+
+// SQLPerfFinding is one SQL statement with a potential full-scan risk,
+// derived directly from the logic review IONode SQL strings.
+type SQLPerfFinding struct {
+	DAO      string // e.g. "iamappOceanBaseDao.List"
+	Logic    string // e.g. "GetAllUserList"
+	File     string // ShortFile of the DAO call site
+	Line     int
+	SQL      string
+	HasWhere bool // SQL contains a WHERE clause
+	HasLimit bool // SQL contains LIMIT
+}
+
+// RunSQLPerfFromLogicReview derives SQL performance findings from the already-computed
+// logic review IONodes. No file walking — uses the SQL strings already extracted by
+// call graph + implIdx AST analysis.
+func RunSQLPerfFromLogicReview(r *LogicReviewResult) *Result {
+	if r == nil || len(r.Methods) == 0 {
+		return Skip("logic review not available")
+	}
+
+	seen := map[string]bool{} // deduplicate by DAO.Method
+	var warn, info []SQLPerfFinding
+
+	for _, m := range r.Methods {
+		for _, op := range m.Ops {
+			if op.Kind != IOKindDB || op.SQL == "" {
+				continue
+			}
+			sql := op.SQL
+			upper := strings.ToUpper(sql)
+
+			// Only SELECT statements can full-scan; skip INSERT/UPDATE/DELETE
+			if !strings.HasPrefix(upper, "SELECT") {
+				continue
+			}
+
+			hasWhere := strings.Contains(upper, " WHERE ")
+			hasLimit := strings.Contains(upper, " LIMIT ")
+
+			// No LIMIT → potential full scan
+			if hasLimit {
+				continue
+			}
+
+			key := op.Receiver + "." + op.Method
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			f := SQLPerfFinding{
+				DAO:      key,
+				Logic:    m.Method,
+				File:     op.ShortFile,
+				Line:     op.Line,
+				SQL:      sql,
+				HasWhere: hasWhere,
+				HasLimit: false,
+			}
+			if hasWhere {
+				info = append(info, f)
+			} else {
+				warn = append(warn, f)
+			}
+		}
+	}
+
+	if len(warn)+len(info) == 0 {
+		return Pass("no full-scan risk detected")
+	}
+
+	// Build issue strings for nav badge / tabs
+	var issues []string
+	for _, f := range warn {
+		issues = append(issues, fmt.Sprintf("%s:%d [%s] no WHERE no LIMIT — %s",
+			f.File, f.Line, f.DAO, f.SQL))
+	}
+	for _, f := range info {
+		issues = append(issues, fmt.Sprintf("%s:%d [%s] WHERE but no LIMIT — %s",
+			f.File, f.Line, f.DAO, f.SQL))
+	}
+
+	level := LevelInfo
+	if len(warn) > 0 {
+		level = LevelWarn
+	}
+
+	// Store for renderSQLPerfFromFindings
+	lastSQLPerfWarn = warn
+	lastSQLPerfInfo = info
+
+	return &Result{
+		Level:   level,
+		Summary: fmt.Sprintf("SQL perf: %d no-WHERE warn, %d has-WHERE info (from logic review)", len(warn), len(info)),
+		Issues:  issues,
+	}
+}
+
+var lastSQLPerfWarn []SQLPerfFinding
+var lastSQLPerfInfo []SQLPerfFinding

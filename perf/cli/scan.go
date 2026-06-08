@@ -100,20 +100,19 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 	res.Escape = checker.RunEscape(absDir, outDir)
 	printResult(res.Escape)
 
-	// Step 6: N+1 — Phase1 AST candidates + Phase2 call graph trace (or AST fallback)
+	// Step 6: N+1 — Phase1 AST candidates + Phase2 call graph trace
 	printStep(6, totalSteps, "N+1 query scan (call graph trace)")
 	res.N1 = checker.RunN1(absDir, cgCache)
 	printResult(res.N1)
 
-	// Step 7: ent full-table scan (.Query().All() without .Limit())
-	printStep(7, totalSteps, "ent full-scan check (.All() without .Limit())")
-	res.EntFullScan = checker.RunEntFullScan(absDir)
-	printResult(res.EntFullScan)
-
-	// Step 8: logic review — per-interface DB/Redis trace via call graph + implIdx AST
-	printStep(8, totalSteps, "logic review (DB/Redis trace per interface)")
+	// Step 7: logic review — per-interface DB/Redis trace via call graph + implIdx AST
+	// Must run before SQL perf since SQL perf derives its findings from logic review IONodes.
+	printStep(7, totalSteps, "logic review (DB/Redis trace per interface)")
 	res.LogicReview = checker.RunLogicReview(cgCache)
 	printResult(res.LogicReview)
+
+	// Step 7.5 (no banner): SQL perf derived from logic review results — no extra file scan needed
+	res.EntFullScan = checker.RunSQLPerfFromLogicReview(checker.LastLogicReviewResult())
 
 	// Steps 9-11: dynamic analysis (only when --dynamic flag is set)
 	if VarBoolDynamic {
@@ -144,15 +143,14 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 
 	// Write unified report.html
 	checker.WriteReportHTML(outDir, absDir, map[string]*checker.Result{
-		"fmt":           res.Fmt,
-		"vet":           res.Vet,
-		"lint":          res.Lint,
-		"vuln":          res.Vuln,
-		"escape":        res.Escape,
-		"n1":            res.N1,
-		"ent-fullscan":  res.EntFullScan,
-		"logic-review":  res.LogicReview,
-		"dynamic":       dynamicSummaryResult(res.Dynamic),
+		"fmt":      res.Fmt,
+		"vet":      res.Vet,
+		"lint":     res.Lint,
+		"vuln":     res.Vuln,
+		"escape":   res.Escape,
+		"n1":       res.N1,
+		"sql-perf": res.EntFullScan,
+		"dynamic":  dynamicSummaryResult(res.Dynamic),
 	}, res.Elapsed, res.Dynamic)
 
 	printSummary(res, outDir)

@@ -356,18 +356,16 @@ func buildGroups(
 	}
 	perfCodeItem.Level = worstTabLevel(perfCodeItem.Tabs)
 
-	// Item 3.3: SQL 性能 (ent 无分页全表扫描 — InlineHTML card 样式)
-	sqlPerfLevel := results["ent-fullscan"].safeLevel()
-	// Count for nav badge: split warn/info
+	// Item 3.3: SQL 性能 — derived from logic review IONode SQL strings (not file scanning)
+	sqlPerfLevel := results["sql-perf"].safeLevel()
+	sqlPerfInline := renderSQLPerfFromFindings(lastSQLPerfWarn, lastSQLPerfInfo)
 	var sqlNoLimitWarn, sqlNoLimitInfo []string
-	for _, s := range results["ent-fullscan"].safeIssues() {
-		if strings.Contains(s, "no WHERE") {
-			sqlNoLimitWarn = append(sqlNoLimitWarn, s)
-		} else {
-			sqlNoLimitInfo = append(sqlNoLimitInfo, s)
-		}
+	for _, f := range lastSQLPerfWarn {
+		sqlNoLimitWarn = append(sqlNoLimitWarn, fmt.Sprintf("%s:%d [%s] %s", f.File, f.Line, f.DAO, f.SQL))
 	}
-	sqlPerfInline := renderSQLPerfInline(sqlNoLimitWarn, sqlNoLimitInfo)
+	for _, f := range lastSQLPerfInfo {
+		sqlNoLimitInfo = append(sqlNoLimitInfo, fmt.Sprintf("%s:%d [%s] %s", f.File, f.Line, f.DAO, f.SQL))
+	}
 	sqlPerfItem := NavItem{
 		ID:         "perf-sql",
 		Label:      "SQL 性能",
@@ -877,12 +875,110 @@ function spTab(id,btn,cls){
 }
 
 func splitSQLPerfIssue(s string) (loc, hint string) {
-	// format: "file:line [func]: [ent-fullscan] chain — hint"
 	idx := strings.Index(s, " — ")
 	if idx < 0 {
 		return s, ""
 	}
 	return s[:idx], s[idx+3:]
+}
+
+// renderSQLPerfFromFindings renders the SQL perf inline panel using real SQL strings
+// derived from logic review IONodes. The dark box shows the actual SQL.
+func renderSQLPerfFromFindings(warn, info []SQLPerfFinding) template.HTML {
+	if len(warn)+len(info) == 0 {
+		return template.HTML(`<div style="padding:32px;text-align:center;color:#060;font-size:.95rem">✅ 未发现无分页全表扫描</div>`)
+	}
+	var sb strings.Builder
+	// Reuse sp-* CSS already defined in renderSQLPerfInline
+	sb.WriteString(`<style>
+.sp-tabs{display:flex;border-bottom:2px solid #ddd;margin-bottom:20px}
+.sp-tab-btn{padding:10px 24px;font-size:.93rem;font-weight:600;cursor:pointer;border:none;background:none;color:#888;border-bottom:3px solid transparent;margin-bottom:-2px;transition:all .15s}
+.sp-tab-btn:hover{color:#333}
+.sp-tab-btn.on-warn{color:#9a6000;border-bottom-color:#c80}
+.sp-tab-btn.on-info{color:#0055aa;border-bottom-color:#0055aa}
+.sp-panel{display:none;padding:4px 0}
+.sp-panel.active{display:block}
+.sp-card{background:#fff;border-radius:8px;border:1px solid #e0e0e0;margin-bottom:14px;overflow:hidden}
+.sp-card-warn{border-left:4px solid #e08000}
+.sp-card-info{border-left:4px solid #0066cc}
+.sp-hdr{padding:10px 16px;background:#fafafa;border-bottom:1px solid #eee;font-size:.86rem;font-family:monospace;color:#444;display:flex;align-items:center;justify-content:space-between}
+.sp-hdr-dao{font-weight:700;color:#333}
+.sp-hdr-loc{font-size:.78rem;color:#888}
+.sp-body{padding:12px 16px;font-size:.84rem}
+.sp-desc{color:#666;margin-bottom:6px;font-size:.82rem}
+.sp-sql{background:#1e1e1e;border-radius:5px;padding:8px 12px;font-family:monospace;color:#d4d4d4;font-size:.82rem;white-space:pre;overflow-x:auto}
+.sp-empty{color:#666;padding:24px;text-align:center}
+</style>
+`)
+	firstWarnCls := ""
+	firstInfoCls := ""
+	if len(warn) > 0 {
+		firstWarnCls = " on-warn"
+	} else {
+		firstInfoCls = " on-info"
+	}
+	sb.WriteString(`<div class="sp-tabs" id="sp-tabs">`)
+	fmt.Fprintf(&sb, `<button class="sp-tab-btn%s" onclick="spTab('sp-nolimit',this,'on-warn')">⚠️ 无分页全表 (%d)</button>`, firstWarnCls, len(warn))
+	fmt.Fprintf(&sb, `<button class="sp-tab-btn%s" onclick="spTab('sp-bounded',this,'on-info')">ℹ️ 有WHERE无Limit (%d)</button>`, firstInfoCls, len(info))
+	sb.WriteString(`</div>`)
+
+	activeWarn := ""
+	if len(warn) > 0 {
+		activeWarn = " active"
+	}
+	activeInfo := ""
+	if len(warn) == 0 {
+		activeInfo = " active"
+	}
+
+	// ── 无分页全表 panel ──
+	fmt.Fprintf(&sb, `<div id="sp-nolimit" class="sp-panel%s">`, activeWarn)
+	if len(warn) == 0 {
+		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+	}
+	for _, f := range warn {
+		loc := f.File
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", f.File, f.Line)
+		}
+		fmt.Fprintf(&sb,
+			`<div class="sp-card sp-card-warn">`+
+				`<div class="sp-hdr"><span class="sp-hdr-dao">%s</span><span class="sp-hdr-loc">%s</span></div>`+
+				`<div class="sp-body"><div class="sp-desc">无 WHERE 约束，无 LIMIT — 可能全表扫描</div>`+
+				`<div class="sp-sql">%s</div></div></div>`,
+			htmlEsc(f.DAO), htmlEsc(loc), htmlEsc(f.SQL))
+	}
+	sb.WriteString(`</div>`)
+
+	// ── 有WHERE无Limit panel ──
+	fmt.Fprintf(&sb, `<div id="sp-bounded" class="sp-panel%s">`, activeInfo)
+	sb.WriteString(`<p style="font-size:.83rem;color:#666;margin-bottom:12px">有 WHERE 条件但无 LIMIT，结果集有界时可接受，否则建议加 LIMIT 或分页</p>`)
+	if len(info) == 0 {
+		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+	}
+	for _, f := range info {
+		loc := f.File
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", f.File, f.Line)
+		}
+		fmt.Fprintf(&sb,
+			`<div class="sp-card sp-card-info">`+
+				`<div class="sp-hdr"><span class="sp-hdr-dao">%s</span><span class="sp-hdr-loc">%s</span></div>`+
+				`<div class="sp-body"><div class="sp-desc">有 WHERE 条件，无 LIMIT</div>`+
+				`<div class="sp-sql">%s</div></div></div>`,
+			htmlEsc(f.DAO), htmlEsc(loc), htmlEsc(f.SQL))
+	}
+	sb.WriteString(`</div>`)
+
+	sb.WriteString(`<script>
+function spTab(id,btn,cls){
+  ['sp-nolimit','sp-bounded'].forEach(function(x){var e=document.getElementById(x);if(e)e.classList.remove('active');});
+  document.getElementById('sp-tabs').querySelectorAll('.sp-tab-btn').forEach(function(b){b.classList.remove('on-warn','on-info');});
+  var p=document.getElementById(id);if(p)p.classList.add('active');
+  if(btn)btn.classList.add(cls);
+}
+</script>`)
+	return template.HTML(sb.String())
 }
 
 func htmlEsc(s string) string {

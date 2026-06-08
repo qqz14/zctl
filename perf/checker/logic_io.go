@@ -83,6 +83,10 @@ type LogicReviewResult struct {
 
 var lastLogicReviewResult *LogicReviewResult
 
+// LastLogicReviewResult returns the last computed logic review result.
+// Used by SQL perf analysis to derive findings without re-scanning.
+func LastLogicReviewResult() *LogicReviewResult { return lastLogicReviewResult }
+
 // RunLogicReview reads pre-computed IO subgraphs from the call graph cache.
 // SQL is derived entirely from call graph + implIdx AST analysis — no probe, no guessing.
 func RunLogicReview(cgCache *CallGraphCache) *Result {

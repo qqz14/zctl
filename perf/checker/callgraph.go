@@ -81,6 +81,11 @@ type CallGraphCache struct {
 	// Key format: "pkgPath::TypeName::Method"
 	logicIOByKey map[string][]IONode
 
+	// entHookMap: table name → list of hook SQL strings triggered on mutation.
+	// e.g. "iam_api" → ["UPDATE iam_api_permission SET deleted_at = ? WHERE api_id IN (?)"]
+	// Built by scanning internal/dao/hook/*.go for ent chain calls.
+	entHookMap map[string][]string
+
 	// entTableMap: Go schema type name → actual DB table name
 	// e.g. "IamUserRole" → "iam_user_role"
 	// Built from ent/schema/*.go via AST parsing.
@@ -144,6 +149,9 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 	// Parse ent/schema/*.go to get accurate table names
 	entTableMap := buildEntSchemaTableMap(dir)
 
+	// Scan internal/dao/hook/*.go to build hook SQL map
+	entHookMap := buildEntHookMap(dir, moduleName, fset, entTableMap)
+
 	cache := &CallGraphCache{
 		prog:         prog,
 		cg:           cg,
@@ -152,6 +160,7 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 		dir:          dir,
 		implIdx:      implIdx,
 		entTableMap:  entTableMap,
+		entHookMap:   entHookMap,
 		daoByMethod:  make(map[string][]daoImplFunc),
 		logicIOByKey: make(map[string][]IONode),
 	}
@@ -390,13 +399,19 @@ func (c *CallGraphCache) classifyCall(
 		return IONode{}, false
 	}
 	sql, exact, snippet := c.deriveSQLWithSnippet(typeName, method)
+	// Attach hook SQLs only for mutation operations (writes can trigger hooks)
+	var hookSQLs []string
+	if exact && isMutationMethod(method) {
+		hookSQLs = c.hookSQLsFor(typeName, method, file)
+	}
 	return IONode{
 		File: file, ShortFile: short, Line: line,
 		CallChain: chain,
 		Kind:      IOKindDB,
 		Receiver:  typeName, Method: method,
 		SQL: sql, SQLExact: exact,
-		Snippet: snippet,
+		HookSQLs: hookSQLs,
+		Snippet:  snippet,
 	}, true
 }
 
@@ -474,19 +489,30 @@ func (c *CallGraphCache) deriveSQL(typeName, method string) (string, bool) {
 
 // deriveSQLWithSnippet derives SQL by AST-scanning the impl body for ent terminal calls.
 // No fallback guessing: if the impl is missing or has no ent terminal, returns ("", false).
+// Hook SQLs (from registered ent hooks on the same table) are returned separately.
 func (c *CallGraphCache) deriveSQLWithSnippet(typeName, method string) (sql string, exact bool, snippet []SourceLine) {
 	entries, ok := c.implIdx[typeName+"."+method]
 	if !ok || len(entries) == 0 {
-		return "", false, nil // impl not in index — no guess
+		return "", false, nil
 	}
 	entry := entries[0]
 	_, terminal := astFindEntTerminal(entry.funcDecl.Body, entry.fset, entry.file, 0, 4)
 	if terminal == "" {
-		return "", false, nil // no ent terminal found — no guess
+		return "", false, nil
 	}
 	table := c.resolveTableName(typeName, entry.file)
 	sql = entTerminalToSQL(terminal, method, table, entry.funcDecl)
 	return sql, true, nil
+}
+
+// hookSQLsFor returns any hook-triggered SQL statements for the given table+method.
+// Only mutation operations (Save/Exec → UPDATE/INSERT/DELETE) can trigger hooks.
+func (c *CallGraphCache) hookSQLsFor(typeName, method string, implFile string) []string {
+	if c.entHookMap == nil {
+		return nil
+	}
+	table := c.resolveTableName(typeName, implFile)
+	return c.entHookMap[table]
 }
 
 // resolveTableName finds the actual DB table name for a DAO impl type.
@@ -614,6 +640,208 @@ func typeBaseName(t types.Type) string {
 
 func isExported(name string) bool {
 	return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
+}
+
+// isMutationMethod returns true if the DAO method name is a write operation
+// (which can trigger ent hooks).
+func isMutationMethod(method string) bool {
+	for _, pfx := range []string{"Create", "Insert", "Update", "Delete", "SoftDelete", "Upsert", "Save", "Reset"} {
+		if strings.HasPrefix(method, pfx) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEntHookMap scans internal/dao/hook/*.go and extracts SQL triggered by ent hooks.
+// Returns map: table_name → []SQL strings produced inside hook mutator functions.
+//
+// Detection: find functions whose name contains "Hook" or are registered via
+// enthook.On(...). Walk their bodies for ent terminal calls (same as DAO impl).
+func buildEntHookMap(dir, moduleName string, fset *token.FileSet, entTableMap map[string]string) map[string][]string {
+	result := make(map[string][]string)
+	hookDir := filepath.Join(dir, "internal", "dao", "hook")
+	if _, err := os.Stat(hookDir); err != nil {
+		return result
+	}
+
+	entries, _ := os.ReadDir(hookDir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(hookDir, e.Name())
+		src, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		f, err := parseWithGoParser(fset, path, src)
+		if err != nil {
+			continue
+		}
+
+		// Determine which table this hook file is for, from the file name.
+		// e.g. "iam_api_hook.go" → "iam_api"
+		stem := strings.TrimSuffix(e.Name(), ".go")
+		stem = strings.TrimSuffix(stem, "_hook")
+		tableName := stem // already snake_case from filename
+
+		// Scan every function body for ent terminal calls
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			// Only look at hook mutator functions (not Register* or resolve* helpers)
+			fnLower := strings.ToLower(fd.Name.Name)
+			if strings.HasPrefix(fnLower, "register") || strings.HasPrefix(fnLower, "resolve") {
+				continue
+			}
+
+			// Find all ent terminal calls in this function body
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if !entTerminalMethods[sel.Sel.Name] {
+					return true
+				}
+				// Found a terminal call — derive the table from the chain
+				// Walk the chain to find the ent client call: m.Client().IamAPIPermission.Update()...
+				chainTable := extractEntClientTable(call, entTableMap)
+				if chainTable == "" {
+					chainTable = tableName // fallback: same table as the hook file
+				}
+				// Derive SQL from the surrounding chain
+				info := extractEntChainInfoFromExpr(call)
+				sql := entChainInfoToSQL(sel.Sel.Name, chainTable, info)
+				if sql != "" {
+					result[tableName] = appendUnique(result[tableName], sql)
+				}
+				return true
+			})
+		}
+	}
+	return result
+}
+
+// extractEntClientTable walks a call expression chain to find the ent table name.
+// e.g. m.Client().IamAPIPermission.Update().Where(...).Save(ctx)
+//      → finds "IamAPIPermission" → looks up entTableMap → "iam_api_permission"
+func extractEntClientTable(call ast.Expr, entTableMap map[string]string) string {
+	// Walk inward through .Save() → .SetX() → .Where() → .Update() → .IamAPIPermission → .Client() → m
+	cur := call
+	for {
+		c, ok := cur.(*ast.CallExpr)
+		if !ok {
+			break
+		}
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		// Check if the receiver is a field access like .IamAPIPermission
+		if inner, ok := sel.X.(*ast.CallExpr); ok {
+			// Could be m.Client().IamAPIPermission — check the selector on Client() result
+			if innerSel, ok := inner.Fun.(*ast.SelectorExpr); ok {
+				if innerSel.Sel.Name == "Client" {
+					// Next level should be .IamAPIPermission
+					// Actually the pattern is: m.Client().IamAPIPermission.Update()
+					// sel.X = m.Client().IamAPIPermission (SelectorExpr)
+					// We need to look at sel.X as a SelectorExpr
+				}
+			}
+		}
+		// Check if sel.X is a selector like m.Client().IamAPIPermission
+		if sExpr, ok := sel.X.(*ast.SelectorExpr); ok {
+			name := sExpr.Sel.Name
+			// Check if this is an ent entity name (PascalCase, in entTableMap)
+			lowerName := strings.ToLower(name)
+			for schemaType, table := range entTableMap {
+				if strings.ToLower(schemaType) == lowerName {
+					return table
+				}
+			}
+		}
+		cur = sel.X
+	}
+	return ""
+}
+
+// extractEntChainInfoFromExpr extracts WHERE/SET/ORDER info from a call expression chain.
+func extractEntChainInfoFromExpr(call ast.Expr) entChainInfo {
+	// Wrap in a fake block to reuse extractEntChainInfo
+	// We do this by walking the chain manually
+	var info entChainInfo
+	cur := call
+	for {
+		c, ok := cur.(*ast.CallExpr)
+		if !ok {
+			break
+		}
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		method := sel.Sel.Name
+		switch method {
+		case "Where":
+			for _, arg := range c.Args {
+				if cond := extractEntPredicate(arg); cond != "" {
+					info.whereConds = append(info.whereConds, cond)
+				}
+			}
+		case "Limit":
+			info.hasLimit = true
+		case "Offset":
+			info.hasOffset = true
+		case "OnConflict", "OnConflictColumns":
+			info.hasUpsert = true
+		default:
+			if strings.HasPrefix(method, "Set") {
+				if field := extractSetFieldName(method); field != "" {
+					info.setCols = append(info.setCols, field)
+				}
+			}
+		}
+		cur = sel.X
+	}
+	return info
+}
+
+// entChainInfoToSQL produces a SQL string from extracted chain info and terminal method.
+func entChainInfoToSQL(terminal, table string, info entChainInfo) string {
+	switch terminal {
+	case "Save", "SaveX", "Exec", "ExecX":
+		where := buildWhereClause(info.whereConds)
+		setCols := buildSetClause(info.setCols)
+		if setCols == "..." {
+			return ""
+		}
+		return fmt.Sprintf("UPDATE %s SET %s%s", table, setCols, where)
+	case "All":
+		where := buildWhereClause(info.whereConds)
+		return fmt.Sprintf("SELECT * FROM %s%s", table, where)
+	case "Count":
+		where := buildWhereClause(info.whereConds)
+		return fmt.Sprintf("SELECT COUNT(*) FROM %s%s", table, where)
+	default:
+		return ""
+	}
+}
+
+func appendUnique(slice []string, s string) []string {
+	for _, v := range slice {
+		if v == s {
+			return slice
+		}
+	}
+	return append(slice, s)
 }
 
 // formatSSASignature builds a readable signature string from an SSA function.
