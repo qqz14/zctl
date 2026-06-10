@@ -51,6 +51,7 @@ type ReportData struct {
 	ProjectName string
 	GitBranch   string
 	GitHash     string
+	GitAuthor   string // last committer name+email
 	StartTime   string // e.g. "2026-06-10 14:09:00"
 	EndTime     string // e.g. "2026-06-10 14:11:23"
 	ScanTime    string // alias for StartTime (used in legacy template spots)
@@ -110,17 +111,18 @@ func WriteReportHTML(
 
 	gitBranch := gitOutput(projectDir, "rev-parse", "--abbrev-ref", "HEAD")
 	gitHash := gitOutput(projectDir, "rev-parse", "--short", "HEAD")
+	// "Name <email>" of the most recent commit author
+	gitAuthor := gitOutput(projectDir, "log", "-1", "--format=%an <%ae>")
 
 	coverHTMLPath := filepath.Join(detailsDir, "cover.html")
 	groups := buildGroups(results, lintRes, n1Findings, n1Inline, dr, coverHTMLPath)
 
-	endTime := startTime.Add(elapsed)
 	data := ReportData{
 		ProjectName: projectName,
 		GitBranch:   gitBranch,
 		GitHash:     gitHash,
+		GitAuthor:   gitAuthor,
 		StartTime:   startTime.Format("2006-01-02 15:04:05"),
-		EndTime:     endTime.Format("2006-01-02 15:04:05"),
 		ScanTime:    startTime.Format("2006-01-02 15:04:05"),
 		Elapsed:     FormatElapsed(elapsed),
 		Groups:      groups,
@@ -146,8 +148,28 @@ func buildGroups(
 	coverHTMLPath string, // absolute path to details/cover.html, "" if not generated
 ) []NavGroup {
 	tabs := map[string][]string{}
+	buildFailed := false
 	if lr != nil {
 		tabs = lr.Tabs
+		buildFailed = lr.BuildFailed
+	}
+
+	// buildFailedNote is injected into every lint-derived tab's Note when the project
+	// failed to compile, making it clear the empty result is NOT "no issues found".
+	buildFailedNote := ""
+	if buildFailed {
+		// Pull the first compile error as context hint
+		hint := ""
+		if errLines := tabs["build-error"]; len(errLines) > 0 {
+			for _, l := range errLines {
+				if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
+					hint = " (" + l + ")"
+					break
+				}
+			}
+		}
+		buildFailedNote = "⚠️ 此检查项因编译失败未能运行，结果不可信（不代表无问题）" + hint +
+			" — 请修复「Panic 风险 > 编译错误」tab 中列出的编译错误后重新扫描"
 	}
 
 	// ════════════════════════════════════════════════════════
@@ -224,6 +246,19 @@ func buildGroups(
 		},
 	}
 	errItem.Level = worstTabLevel(errItem.Tabs)
+
+	// If build failed, append a "编译错误" tab inside panicItem so the user sees
+	// compile errors in context — not as a separate mysterious panel.
+	if buildFailed {
+		panicItem.Tabs = append(panicItem.Tabs, IssueTab{
+			ID:     "panic-build-error",
+			Label:  "编译错误",
+			Level:  LevelFail,
+			Issues: tabs["build-error"],
+			Note:   "以下包编译失败，导致 golangci-lint 所有 linter 跳过。修复后重新扫描",
+		})
+		panicItem.Level = worstTabLevel(panicItem.Tabs)
+	}
 
 	criticalGroup := NavGroup{
 		Icon:  "⚡",
@@ -696,7 +731,54 @@ func buildGroups(
 	}
 
 	all := []NavGroup{criticalGroup, bugGroup, perfGroup, secGroup, qualityGroup, logicReviewGroup}
-	return append(all, dynamicGroups...)
+	all = append(all, dynamicGroups...)
+
+	// Post-process: when lint build failed, inject a visible warning entry into every
+	// lint-derived tab that has no real issues — so the tab clearly shows WHY it's
+	// empty instead of a misleading "✅ No issues found".
+	//
+	// We also leave the original Note intact (it explains what the tab normally checks).
+	// The injected entry uses a "⚠️" prefix so issueClass() renders it as warn style.
+	if buildFailed && buildFailedNote != "" {
+		// These tab IDs are purely populated by golangci-lint; they go empty on build fail.
+		lintOnlyTabs := map[string]bool{
+			"panic-typeassert": true, "panic-nilnil": true, "panic-nilderef": true,
+			"err-drop": true, "err-swallow": true, "err-wrap": true, "err-wasted": true,
+			"leak-body": true, "leak-rows": true, "leak-rowserr": true,
+			"conc-ctx": true, "conc-noctx": true, "conc-loopvar": true,
+			"defect-enum": true, "defect-unparam": true, "defect-vet": true,
+			"perf-slice": true, "perf-ctx": true, "perf-huge": true, "perf-sprint": true, "perf-select": true,
+			"sec-sql": true, "sec-rand": true, "sec-hardcode": true, "sec-perm": true, "sec-other": true,
+			"trojan-bidi": true,
+			"cx-cyclo": true, "cx-cognit": true, "cx-funlen": true, "cx-nestif": true, "cx-maintidx": true,
+			"sty-fmt": true, "sty-mnd": true, "sty-const": true, "sty-lll": true, "sty-spell": true, "sty-todo": true,
+			"test-testify": true,
+		}
+		for gi := range all {
+			for ii := range all[gi].Items {
+				changed := false
+				for ti := range all[gi].Items[ii].Tabs {
+					tab := &all[gi].Items[ii].Tabs[ti]
+					if !lintOnlyTabs[tab.ID] || tab.InlineHTML != "" {
+						continue
+					}
+					if len(tab.Issues) == 0 {
+						tab.Issues = []string{buildFailedNote}
+						if tab.Level == LevelPass {
+							tab.Level = LevelWarn
+							changed = true
+						}
+					}
+				}
+				// Re-compute item level so nav badge reflects the injected warn
+				if changed {
+					all[gi].Items[ii].Level = worstTabLevel(all[gi].Items[ii].Tabs)
+				}
+			}
+		}
+	}
+
+	return all
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -710,7 +792,7 @@ func levelOf(issues []string) Level {
 
 func worstTabLevel(tabs []IssueTab) Level {
 	worst := LevelPass
-	order := map[Level]int{LevelPass: 0, LevelSkip: 0, LevelInfo: 1, LevelWarn: 2, LevelFail: 3}
+	order := map[Level]int{LevelPass: 0, LevelSkip: 0, LevelInfo: 1, LevelWarn: 2, LevelFail: 3, LevelPanic: 4}
 	for _, t := range tabs {
 		if order[t.Level] > order[worst] {
 			worst = t.Level
@@ -721,7 +803,7 @@ func worstTabLevel(tabs []IssueTab) Level {
 
 func worstLevel(levels ...Level) Level {
 	worst := LevelPass
-	order := map[Level]int{LevelPass: 0, LevelSkip: 0, LevelInfo: 1, LevelWarn: 2, LevelFail: 3}
+	order := map[Level]int{LevelPass: 0, LevelSkip: 0, LevelInfo: 1, LevelWarn: 2, LevelFail: 3, LevelPanic: 4}
 	for _, l := range levels {
 		if order[l] > order[worst] {
 			worst = l
@@ -730,23 +812,11 @@ func worstLevel(levels ...Level) Level {
 	return worst
 }
 
-func (r *Result) safeLevel() Level {
-	if r == nil {
-		return LevelSkip
-	}
-	return r.Level
-}
 func (r *Result) safeSummary() string {
 	if r == nil {
 		return "skipped"
 	}
 	return r.Summary
-}
-func (r *Result) safeIssues() []string {
-	if r == nil {
-		return nil
-	}
-	return r.Issues
 }
 
 func levelClass(l Level) string {
@@ -759,6 +829,8 @@ func levelClass(l Level) string {
 		return "pass"
 	case LevelInfo:
 		return "info"
+	case LevelPanic:
+		return "panic"
 	default:
 		return "skip"
 	}
@@ -774,6 +846,8 @@ func levelIcon(l Level) string {
 		return "✅"
 	case LevelInfo:
 		return "ℹ️"
+	case LevelPanic:
+		return "💥"
 	default:
 		return "⊘"
 	}
@@ -1012,11 +1086,15 @@ func renderCoverTable(pkgs []PkgCoverage, overallPct float64, coverHTMLExists bo
 	} else if overallPct >= 60 {
 		overallColor = "#b45309"
 	}
+	totalFiles := 0
+	for _, p := range pkgs {
+		totalFiles += p.Files
+	}
 	sb.WriteString(fmt.Sprintf(`
 <div style="padding:16px 20px 0">
   <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px">
     <span style="font-size:2rem;font-weight:700;color:%s">%.1f%%</span>
-    <span style="color:#555;font-size:.9rem">总体语句覆盖率 · %d 个包</span>`, overallColor, overallPct, len(pkgs)))
+    <span style="color:#555;font-size:.9rem">总体语句覆盖率 · %d 个文件 · %d 个包</span>`, overallColor, overallPct, totalFiles, len(pkgs)))
 
 	if coverHTMLExists {
 		sb.WriteString(`    <a href="details/cover.html" target="_blank"
@@ -1555,9 +1633,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .nav-btn{display:flex;align-items:center;gap:7px;padding:6px 14px 6px 22px;cursor:pointer;font-size:.84rem;color:#999;border-left:3px solid transparent;background:none;border-top:none;border-right:none;border-bottom:none;width:100%;text-align:left;transition:all .12s}
 .nav-btn:hover{background:#1e1e38;color:#ddd;border-left-color:#444}
 .nav-btn.active{background:#1a1a40;color:#fff;border-left-color:#5a7fff}
-.nav-btn.lv-fail{color:#ff8888} .nav-btn.lv-warn{color:#ffcc66}
+.nav-btn.lv-fail{color:#ff8888} .nav-btn.lv-warn{color:#ffcc66} .nav-btn.lv-panic{color:#ff66ff}
 .nav-btn.active.lv-fail{background:#2a1010;border-left-color:#d00}
 .nav-btn.active.lv-warn{background:#2a2000;border-left-color:#d80}
+.nav-btn.active.lv-panic{background:#2a0a2a;border-left-color:#c0c}
 .nav-btn.active.lv-pass{background:#0a200a;border-left-color:#080}
 .nav-badge{margin-left:auto;font-size:.67rem;padding:1px 5px;border-radius:8px;font-weight:700;flex-shrink:0}
 .nb-fail{background:#c00;color:#fff} .nb-warn{background:#9a6000;color:#fff}
@@ -1577,7 +1656,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .panel-hdr{padding:12px 24px 0;background:#fff;border-bottom:1px solid #e5e8ee;flex-shrink:0}
 .panel-title{font-size:1rem;font-weight:700;margin-bottom:4px}
 .panel-title.fail{color:#c00} .panel-title.warn{color:#9a6000}
-.panel-title.pass{color:#060} .panel-title.info{color:#0055aa}
+.panel-title.pass{color:#060} .panel-title.info{color:#0055aa} .panel-title.panic{color:#a00a}
 .panel-note{font-size:.8rem;color:#888;margin-bottom:8px}
 .tab-bar{display:flex;gap:0;overflow-x:auto}
 .tab-btn{padding:7px 16px;font-size:.85rem;font-weight:600;cursor:pointer;border:none;background:none;color:#999;border-bottom:3px solid transparent;transition:all .12s;white-space:nowrap;flex-shrink:0}
@@ -1589,7 +1668,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .tab-btn.on-info{color:#0055aa;border-bottom-color:#0055aa}
 .tab-count{font-size:.7rem;padding:1px 5px;border-radius:8px;margin-left:4px;font-weight:700}
 .tc-fail{background:#fde;color:#c00} .tc-warn{background:#fff3cc;color:#9a6000}
-.tc-pass{background:#dfd;color:#060} .tc-info{background:#e0ecff;color:#0055aa}
+.tc-pass{background:#dfd;color:#060} .tc-info{background:#e0ecff;color:#0055aa} .tc-panic{background:#f0d0f0;color:#800080}
 .tab-panel{display:none;overflow-y:auto;flex:1;padding:14px 24px 18px}
 .tab-panel.on{display:flex;flex-direction:column}
 .tab-note{font-size:.8rem;color:#888;font-style:italic;padding:6px 0 10px;border-bottom:1px solid #f0f0f0;margin-bottom:10px}
@@ -1626,9 +1705,9 @@ h1{font-size:1.2rem;margin-bottom:4px}
   <div class="nav-header">
     <div class="nav-project">{{.ProjectName}}</div>
     {{if .GitBranch}}<div class="nav-branch">⎇ {{.GitBranch}}{{if .GitHash}} · {{.GitHash}}{{end}}</div>{{end}}
-    <div class="nav-meta">开始 {{.StartTime}}</div>
-    <div class="nav-meta">结束 {{.EndTime}}</div>
-    <div class="nav-meta" style="color:#8af;font-weight:600">耗时 {{.Elapsed}}</div>
+    {{if .GitAuthor}}<div class="nav-meta" style="color:#8ab4f8">👤 {{.GitAuthor}}</div>{{end}}
+    <div class="nav-meta">🕐 {{.StartTime}}</div>
+    <div class="nav-meta" style="color:#8af;font-weight:600">⏱ 耗时 {{.Elapsed}}</div>
   </div>
   <div class="nav-scroll-area">
     <div class="nav-group-header">📊 Overview</div>
@@ -1753,7 +1832,7 @@ h1{font-size:1.2rem;margin-bottom:4px}
 function goPanel(id, btn, lvCls) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b =>
-    b.classList.remove('active','lv-fail','lv-warn','lv-pass','lv-info','lv-skip'));
+    b.classList.remove('active','lv-fail','lv-warn','lv-pass','lv-info','lv-skip','lv-panic'));
   document.getElementById('panel-' + id).classList.add('active');
   if (btn) { btn.classList.add('active'); if (lvCls) btn.classList.add(lvCls); }
 }

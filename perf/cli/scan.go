@@ -68,7 +68,9 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 	// Step 0: build call graph once — shared by N+1 and Logic Review
 	// This is the most expensive step (~5-20s) but runs only once.
 	color.Style{color.FgBlue, color.Bold}.Println("[0/–] building call graph (CHA, internal/... only) ...")
-	cgCache, cgErr := checker.BuildCallGraph(absDir)
+	cgCache, cgErr := checker.SafeRunCG(func() (*checker.CallGraphCache, error) {
+		return checker.BuildCallGraph(absDir)
+	})
 	if cgErr != nil {
 		color.Gray.Printf("  ⊘  call graph skipped: %v\n\n", cgErr)
 		cgCache = nil
@@ -78,47 +80,60 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 
 	// Step 1: gofmt
 	printStep(1, totalSteps, "gofmt (code format)")
-	res.Fmt = checker.RunFmt(absDir)
+	res.Fmt = checker.SafeRun("RunFmt", func() *checker.Result { return checker.RunFmt(absDir) })
 	printResult(res.Fmt)
 
 	// Step 2: go vet
 	printStep(2, totalSteps, "go vet (static correctness)")
-	res.Vet = checker.RunVet(absDir)
+	res.Vet = checker.SafeRun("RunVet", func() *checker.Result { return checker.RunVet(absDir) })
 	printResult(res.Vet)
 
 	// Step 3: golangci-lint
 	printStep(3, totalSteps, "golangci-lint (resource leak + perf + style)")
-	res.Lint = checker.RunLint(absDir, outDir)
+	res.Lint = checker.SafeRun("RunLint", func() *checker.Result { return checker.RunLint(absDir, outDir) })
 	printResult(res.Lint)
+	// If the project failed to compile, ALL linters were skipped by golangci-lint.
+	// We warn loudly but continue — other modules (vet, N+1, coverage etc.) are independent.
+	if lr := checker.LastLintResult(); lr != nil && lr.BuildFailed {
+		fmt.Println()
+		color.Style{color.FgRed, color.Bold}.Println("  ╔══════════════════════════════════════════════════════════╗")
+		color.Style{color.FgRed, color.Bold}.Println("  ║  ⚠️  部分包编译失败 — golangci-lint 所有 linter 被跳过    ║")
+		color.Style{color.FgRed, color.Bold}.Println("  ║  报告中「Panic 风险 > 编译错误」tab 有详细错误信息        ║")
+		color.Style{color.FgRed, color.Bold}.Println("  ║  其他模块（vet / N+1 / 覆盖率…）不受影响，继续运行中      ║")
+		color.Style{color.FgRed, color.Bold}.Println("  ╚══════════════════════════════════════════════════════════╝")
+		fmt.Println()
+	}
 
 	// Step 4: govulncheck
 	printStep(4, totalSteps, "govulncheck (CVE scan)")
-	res.Vuln = checker.RunVuln(absDir, outDir)
+	res.Vuln = checker.SafeRun("RunVuln", func() *checker.Result { return checker.RunVuln(absDir, outDir) })
 	printResult(res.Vuln)
 
 	// Step 5: escape analysis
 	printStep(5, totalSteps, "escape analysis (heap alloc hotspot)")
-	res.Escape = checker.RunEscape(absDir, outDir)
+	res.Escape = checker.SafeRun("RunEscape", func() *checker.Result { return checker.RunEscape(absDir, outDir) })
 	printResult(res.Escape)
 
 	// Step 6: N+1 — Phase1 AST candidates + Phase2 call graph trace
 	printStep(6, totalSteps, "N+1 query scan (call graph trace)")
-	res.N1 = checker.RunN1(absDir, cgCache)
+	res.N1 = checker.SafeRun("RunN1", func() *checker.Result { return checker.RunN1(absDir, cgCache) })
 	printResult(res.N1)
 
 	// Step 7: logic review — per-interface DB/Redis trace via call graph + implIdx AST
 	// Must run before SQL perf since SQL perf derives its findings from logic review IONodes.
 	printStep(7, totalSteps, "logic review (DB/Redis trace per interface)")
-	res.LogicReview = checker.RunLogicReview(cgCache)
+	res.LogicReview = checker.SafeRun("RunLogicReview", func() *checker.Result { return checker.RunLogicReview(cgCache) })
 	printResult(res.LogicReview)
 
 	// Step 7.5 (no banner): SQL perf derived from logic review results — no extra file scan needed
-	res.EntFullScan = checker.RunSQLPerfFromLogicReview(checker.LastLogicReviewResult())
+	res.EntFullScan = checker.SafeRun("RunSQLPerf", func() *checker.Result {
+		return checker.RunSQLPerfFromLogicReview(checker.LastLogicReviewResult())
+	})
 
 	// Step 8: test coverage — go test -coverprofile + go tool cover -html
 	// Generates details/cover.html (same iframe pattern as lint raw report).
 	printStep(8, totalSteps, "test coverage (go test -coverprofile)")
-	res.Test = checker.RunTestCover(absDir, outDir)
+	res.Test = checker.SafeRun("RunTestCover", func() *checker.Result { return checker.RunTestCover(absDir, outDir) })
 	printResult(res.Test)
 
 	// Steps 9-11: dynamic analysis (only when --dynamic flag is set)
@@ -230,6 +245,9 @@ func printResult(r *checker.Result) {
 		color.Gray.Printf("  ℹ️  INFO — %s\n", r.Summary)
 	case checker.LevelSkip:
 		color.Gray.Printf("  ⊘  SKIP — %s\n", r.Summary)
+	case checker.LevelPanic:
+		color.Style{color.FgMagenta, color.Bold}.Printf("  💥 PANIC — %s\n", r.Summary)
+		color.Magenta.Printf("     ⚠️  结果未知，不代表无问题，请修复 panic 后重新扫描\n")
 	}
 	fmt.Println()
 }
@@ -283,6 +301,8 @@ func badge(r *checker.Result) string {
 		return color.Red.Sprintf("FAIL (%d issues)", len(r.Issues))
 	case checker.LevelInfo:
 		return color.Gray.Sprintf("INFO (%d items)", len(r.Issues))
+	case checker.LevelPanic:
+		return color.Magenta.Sprint("💥 PANIC")
 	default:
 		return color.Gray.Sprint("SKIP")
 	}
