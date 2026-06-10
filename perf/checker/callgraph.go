@@ -25,6 +25,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,9 +88,21 @@ type CallGraphCache struct {
 	entHookMap map[string][]string
 
 	// entTableMap: Go schema type name → actual DB table name
-	// e.g. "IamUserRole" → "iam_user_role"
-	// Built from ent/schema/*.go via AST parsing.
 	entTableMap map[string]string
+
+	// keyFuncCache: function name → resolved key template string.
+	// e.g. "SessionKey" → "passport:auth_session:{sessionID}"
+	//      "simulatedLoginKey" → "simulated_login:{account}"
+	// Built by scanning pkg/** and internal/** for simple string-returning functions.
+	keyFuncCache map[string]string
+
+	// ttlConstCache: identifier name → numeric string value.
+	// e.g. "SessionTTLSeconds" → "86400"
+	ttlConstCache map[string]string
+
+	// ttlFuncCache: method/function name → default int value from function body.
+	// e.g. "simulatedLoginTTLSeconds" → "600"  (from positiveOrDefaultInt(config, 600))
+	ttlFuncCache map[string]string
 }
 
 // BuildCallGraph loads the project, builds SSA + CHA call graph, and pre-computes
@@ -152,17 +165,23 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 	// Scan internal/dao/hook/*.go to build hook SQL map
 	entHookMap := buildEntHookMap(dir, moduleName, fset, entTableMap)
 
+	// Scan pkg/ and internal/ for Redis key functions and TTL constants/methods
+	keyFuncCache, ttlConstCache, ttlFuncCache := buildRedisKeyCache(dir)
+
 	cache := &CallGraphCache{
-		prog:         prog,
-		cg:           cg,
-		fset:         fset,
-		moduleName:   moduleName,
-		dir:          dir,
-		implIdx:      implIdx,
-		entTableMap:  entTableMap,
-		entHookMap:   entHookMap,
-		daoByMethod:  make(map[string][]daoImplFunc),
-		logicIOByKey: make(map[string][]IONode),
+		prog:          prog,
+		cg:            cg,
+		fset:          fset,
+		moduleName:    moduleName,
+		dir:           dir,
+		implIdx:       implIdx,
+		entTableMap:   entTableMap,
+		entHookMap:    entHookMap,
+		keyFuncCache:  keyFuncCache,
+		ttlConstCache: ttlConstCache,
+		ttlFuncCache:  ttlFuncCache,
+		daoByMethod:   make(map[string][]daoImplFunc),
+		logicIOByKey:  make(map[string][]IONode),
 	}
 
 	// ── Pre-computation pass (single traversal of call graph nodes) ────────────
@@ -378,9 +397,11 @@ func (c *CallGraphCache) classifyCall(
 	short := shortPath(file)
 
 	// ── Redis ──
-	if strings.Contains(lower, "redis") {
-		// Try to extract key/TTL from the call site's enclosing function body
+	if strings.Contains(lower, "redis") && isRedisVerb(method) {
 		keyHint, ttlHint := c.extractRedisArgsFromCallSite(file, line, method)
+		// Resolve key function calls to actual templates using keyFuncCache
+		keyHint = c.resolveKeyHint(keyHint)
+		ttlHint = c.resolveTTLHint(ttlHint)
 		snippet := readSourceSnippet(file, line-1, line+2, line, line)
 		return IONode{
 			File: file, ShortFile: short, Line: line,
@@ -554,6 +575,386 @@ func (c *CallGraphCache) resolveTableName(implStructName, implFile string) strin
 	return camelToSnake(stripped)
 }
 
+// ── Redis key / TTL resolution ────────────────────────────────────────────────
+
+// buildRedisKeyCache scans pkg/ and internal/ for:
+//  1. Key functions: func FooKey(x T) string { return "prefix:" + x }
+//     → keyFuncCache["FooKey"] = "prefix:{x}"
+//  2. Numeric TTL constants: const FooTTL = 600
+//     → ttlConstCache["FooTTL"] = "600"
+//  3. TTL methods: func (l X) fooTTLSeconds() int { return positiveOrDefaultInt(cfg, 600) }
+//     → ttlFuncCache["fooTTLSeconds"] = "600"
+func buildRedisKeyCache(dir string) (keyFuncs, ttlConsts, ttlFuncs map[string]string) {
+	keyFuncs = make(map[string]string)
+	ttlConsts = make(map[string]string)
+	ttlFuncs = make(map[string]string)
+
+	fset := token.NewFileSet()
+	scanDirs := []string{
+		filepath.Join(dir, "pkg"),
+		filepath.Join(dir, "internal", "logic"),
+	}
+
+	for _, scanDir := range scanDirs {
+		if _, err := os.Stat(scanDir); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(scanDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			src, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			f, err := parseWithGoParser(fset, path, src)
+			if err != nil {
+				return nil
+			}
+
+			for _, decl := range f.Decls {
+				switch d := decl.(type) {
+				case *ast.GenDecl:
+					// Scan const blocks for TTL values
+					for _, spec := range d.Specs {
+						vs, ok := spec.(*ast.ValueSpec)
+						if !ok {
+							continue
+						}
+						for i, name := range vs.Names {
+							if i >= len(vs.Values) {
+								continue
+							}
+							if v := evalConstExpr(vs.Values[i]); v != "" {
+								ttlConsts[name.Name] = v
+							}
+						}
+					}
+				case *ast.FuncDecl:
+					if d.Body == nil || d.Type.Results == nil || d.Type.Results.NumFields() != 1 {
+						continue
+					}
+					resField := d.Type.Results.List[0]
+					resTypeName := ""
+					if id, ok := resField.Type.(*ast.Ident); ok {
+						resTypeName = id.Name
+					}
+
+					if resTypeName == "string" {
+						// Key function: extract template
+						var paramNames []string
+						if d.Type.Params != nil {
+							for _, param := range d.Type.Params.List {
+								for _, pname := range param.Names {
+									paramNames = append(paramNames, pname.Name)
+								}
+							}
+						}
+						if tmpl := extractKeyTemplate(d.Body, paramNames); tmpl != "" {
+							keyFuncs[d.Name.Name] = tmpl
+						}
+					} else if resTypeName == "int" || resTypeName == "int64" || resTypeName == "int32" {
+						// TTL method: find default int literal in body
+						// Pattern: positiveOrDefaultInt(config, 600) or return 600
+						fnName := d.Name.Name
+						lowerName := strings.ToLower(fnName)
+						if strings.Contains(lowerName, "ttl") || strings.Contains(lowerName, "second") ||
+							strings.Contains(lowerName, "expire") || strings.Contains(lowerName, "timeout") {
+							if v := extractDefaultIntFromBodyWithConsts(d.Body, ttlConsts); v != "" {
+								ttlFuncs[fnName] = v
+							}
+						}
+					}
+				}
+			}
+			return nil
+		})
+	}
+	return keyFuncs, ttlConsts, ttlFuncs
+}
+
+// evalConstExpr evaluates simple constant expressions to a numeric string.
+// e.g. 24 * 60 * 60 → "86400", 10 * 60 → "600"
+func evalConstExpr(expr ast.Expr) string {
+	switch v := expr.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.INT {
+			return v.Value
+		}
+	case *ast.BinaryExpr:
+		if v.Op == token.MUL {
+			left := evalConstExpr(v.X)
+			right := evalConstExpr(v.Y)
+			if left != "" && right != "" {
+				// Simple integer multiplication
+				var l, r int64
+				if _, err := fmt.Sscanf(left, "%d", &l); err != nil {
+					return ""
+				}
+				if _, err := fmt.Sscanf(right, "%d", &r); err != nil {
+					return ""
+				}
+				return fmt.Sprintf("%d", l*r)
+			}
+		}
+		if v.Op == token.ADD {
+			left := evalConstExpr(v.X)
+			right := evalConstExpr(v.Y)
+			if left != "" && right != "" {
+				var l, r int64
+				if _, err := fmt.Sscanf(left, "%d", &l); err != nil {
+					return ""
+				}
+				if _, err := fmt.Sscanf(right, "%d", &r); err != nil {
+					return ""
+				}
+				return fmt.Sprintf("%d", l+r)
+			}
+		}
+	}
+	return ""
+}
+
+// extractKeyTemplate extracts the key template from a simple key function body.
+// e.g. `return "passport:auth_session:" + sessionID` → "passport:auth_session:{sessionID}"
+// e.g. `return fmt.Sprintf("passport:rt_map:%d", userID)` → "passport:rt_map:{userID}"
+func extractKeyTemplate(body *ast.BlockStmt, paramNames []string) string {
+	paramSet := make(map[string]bool)
+	for _, p := range paramNames {
+		paramSet[p] = true
+	}
+
+	var result string
+	ast.Inspect(body, func(n ast.Node) bool {
+		if result != "" {
+			return false
+		}
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) == 0 {
+			return true
+		}
+		result = exprToKeyTemplate(ret.Results[0], paramSet)
+		return false
+	})
+	return result
+}
+
+// exprToKeyTemplate converts a return expression to a key template string.
+func exprToKeyTemplate(expr ast.Expr, params map[string]bool) string {
+	switch v := expr.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			return strings.Trim(v.Value, `"`)
+		}
+	case *ast.Ident:
+		if params[v.Name] {
+			return "{" + v.Name + "}"
+		}
+		return v.Name
+	case *ast.BinaryExpr:
+		if v.Op == token.ADD {
+			left := exprToKeyTemplate(v.X, params)
+			right := exprToKeyTemplate(v.Y, params)
+			if left != "" && right != "" {
+				return left + right
+			}
+		}
+	case *ast.CallExpr:
+		fnName := ""
+		switch f := v.Fun.(type) {
+		case *ast.Ident:
+			fnName = f.Name
+		case *ast.SelectorExpr:
+			fnName = f.Sel.Name
+		}
+		// fmt.Sprintf("prefix:%s", param)
+		if strings.ToLower(fnName) == "sprintf" && len(v.Args) > 0 {
+			if lit, ok := v.Args[0].(*ast.BasicLit); ok {
+				tmpl := strings.Trim(lit.Value, `"`)
+				for i, arg := range v.Args[1:] {
+					placeholder := fmt.Sprintf("{arg%d}", i)
+					if id, ok := arg.(*ast.Ident); ok && params[id.Name] {
+						placeholder = "{" + id.Name + "}"
+					}
+					for _, verb := range []string{"%s", "%d", "%v", "%q"} {
+						if idx := strings.Index(tmpl, verb); idx >= 0 {
+							tmpl = tmpl[:idx] + placeholder + tmpl[idx+len(verb):]
+							break
+						}
+					}
+				}
+				return tmpl
+			}
+		}
+		// String manipulation wrappers: TrimSpace(x), ToLower(x), etc.
+		// Treat the inner argument as the key part.
+		trimFuncs := map[string]bool{
+			"TrimSpace": true, "ToLower": true, "ToUpper": true,
+			"Trim": true, "TrimPrefix": true, "TrimSuffix": true,
+		}
+		if trimFuncs[fnName] && len(v.Args) > 0 {
+			return exprToKeyTemplate(v.Args[0], params)
+		}
+	}
+	return ""
+}
+
+// extractDefaultIntFromBody finds the best int default in a TTL function body.
+// It also returns any const/selector idents for further resolution.
+// Handles:
+//   - return 600
+//   - return positiveOrDefaultInt(cfg, 600)
+//   - return positiveOrDefaultInt(cfg, poauth.SessionTTLSeconds)  → "poauth.SessionTTLSeconds" for lookup
+func extractDefaultIntFromBody(body *ast.BlockStmt) string {
+	return extractDefaultIntFromBodyWithConsts(body, nil)
+}
+
+func extractDefaultIntFromBodyWithConsts(body *ast.BlockStmt, ttlConsts map[string]string) string {
+	var result string
+	ast.Inspect(body, func(n ast.Node) bool {
+		if result != "" {
+			return false
+		}
+		// Direct return int literal
+		if ret, ok := n.(*ast.ReturnStmt); ok && len(ret.Results) == 1 {
+			if v := evalConstExpr(ret.Results[0]); v != "" {
+				result = v
+				return false
+			}
+		}
+		// Call like positiveOrDefaultInt(config, arg) — check last args
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		for i := len(call.Args) - 1; i >= 0; i-- {
+			arg := call.Args[i]
+			// Int literal
+			if v := evalConstExpr(arg); v != "" {
+				result = v
+				return false
+			}
+			// pkg.Const selector like poauth.SessionTTLSeconds
+			if sel, ok := arg.(*ast.SelectorExpr); ok && ttlConsts != nil {
+				constName := sel.Sel.Name
+				if v, ok := ttlConsts[constName]; ok {
+					result = v
+					return false
+				}
+			}
+			// Bare ident like SessionTTLSeconds
+			if id, ok := arg.(*ast.Ident); ok && ttlConsts != nil {
+				if v, ok := ttlConsts[id.Name]; ok {
+					result = v
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return result
+}
+
+// resolveKeyHint resolves a key hint that may be a function call like "SessionKey({sessionID})"
+// to the actual template "passport:auth_session:{sessionID}" using keyFuncCache.
+func (c *CallGraphCache) resolveKeyHint(hint string) string {
+	if hint == "" || c.keyFuncCache == nil {
+		return hint
+	}
+	// Check if hint is "FuncName({arg})" or "FuncName(...)"
+	parenIdx := strings.Index(hint, "(")
+	if parenIdx < 0 {
+		return hint
+	}
+	funcName := hint[:parenIdx]
+	argPart := ""
+	if parenIdx < len(hint)-1 {
+		argPart = hint[parenIdx+1 : len(hint)-1] // strip outer parens
+	}
+
+	tmpl, ok := c.keyFuncCache[funcName]
+	if !ok {
+		return hint
+	}
+	// Replace parameter placeholders in template with the actual arg hints
+	// e.g. template "passport:auth_session:{sessionID}", arg "{sessionID}" → keep as-is
+	// e.g. template "passport:auth_session:{sessionID}", arg "{code}" → replace {sessionID} with {code}
+	if argPart != "" && argPart != "..." {
+		// Find {param} in template and replace with actual arg
+		result := tmpl
+		// Simple single-arg case: replace first {x} with argPart
+		if start := strings.Index(result, "{"); start >= 0 {
+			if end := strings.Index(result[start:], "}"); end >= 0 {
+				result = result[:start] + argPart + result[start+end+1:]
+			}
+		}
+		return result
+	}
+	return tmpl
+}
+
+// resolveTTLHint resolves a TTL hint to a numeric string.
+//
+// Resolution order:
+//  1. Direct const name: "SessionTTLSeconds" → ttlConstCache["SessionTTLSeconds"] → "86400s"
+//  2. Hint contains const name: "sessionTTLSeconds(...)" contains "SessionTTLSeconds" → "86400s"
+//  3. Strip to bare name, try capitalized: "simulatedLoginTTLSeconds" → scan func body for int literal default
+//  4. Scan ttlFuncCache for method name → default int in function body
+func (c *CallGraphCache) resolveTTLHint(hint string) string {
+	if hint == "" {
+		return hint
+	}
+	if c.ttlConstCache != nil {
+		if v, ok := c.ttlConstCache[hint]; ok {
+			return formatTTL(v)
+		}
+		for constName, value := range c.ttlConstCache {
+			if strings.Contains(hint, constName) {
+				return formatTTL(value)
+			}
+		}
+	}
+
+	// Extract bare method/func name from "methodName(...)" or "pkg.methodName(...)"
+	bare := hint
+	if idx := strings.Index(bare, "("); idx >= 0 {
+		bare = bare[:idx]
+	}
+	if idx := strings.LastIndex(bare, "."); idx >= 0 {
+		bare = bare[idx+1:]
+	}
+	bare = strings.TrimSpace(bare)
+
+	// Look up in ttlFuncCache (maps method name → default int value from function body)
+	if c.ttlFuncCache != nil {
+		if v, ok := c.ttlFuncCache[bare]; ok {
+			return formatTTL(v)
+		}
+	}
+
+	return hint
+}
+
+// formatTTL converts a numeric seconds string to "Ns (human)" e.g. "86400 (24h)".
+func formatTTL(seconds string) string {
+	var n int64
+	if _, err := fmt.Sscanf(seconds, "%d", &n); err != nil || n <= 0 {
+		return seconds + "s"
+	}
+	switch {
+	case n%(30*24*3600) == 0:
+		return fmt.Sprintf("%ds (%dd)", n, n/86400)
+	case n%(24*3600) == 0:
+		return fmt.Sprintf("%ds (%dh)", n, n/3600)
+	case n%3600 == 0:
+		return fmt.Sprintf("%ds (%dh)", n, n/3600)
+	case n%60 == 0:
+		return fmt.Sprintf("%ds (%dmin)", n, n/60)
+	default:
+		return fmt.Sprintf("%ds", n)
+	}
+}
+
 // ── Package filter ────────────────────────────────────────────────────────────
 
 // isMockOrTestPkg returns true if a package should be excluded from the call graph.
@@ -640,6 +1041,30 @@ func typeBaseName(t types.Type) string {
 
 func isExported(name string) bool {
 	return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
+}
+
+// isRedisVerb returns true if the method name corresponds to a real Redis command.
+// Filters out non-command methods like Error, Ping, Close, Dial that happen to
+// exist on *redis.Redis but are not IO operations.
+func isRedisVerb(method string) bool {
+	m := strings.ToLower(strings.TrimSuffix(strings.ToLower(method), "ctx"))
+	switch m {
+	case "get", "set", "setex", "setnx", "del", "exists", "expire", "ttl", "persist",
+		"hget", "hset", "hmget", "hmset", "hgetall", "hdel", "hlen", "hexists",
+		"incr", "incrby", "incrbyfloat", "decr", "decrby",
+		"sadd", "smembers", "sismember", "srem", "scard",
+		"zadd", "zrange", "zrangebyscore", "zrevrange", "zrevrangebyscore",
+		"zrem", "zscore", "zcard", "zrank", "zrevrank",
+		"lrange", "rpush", "lpush", "lpop", "rpop", "llen", "lindex",
+		"mget", "mset", "getset", "getdel",
+		"pipelined", "pipeline", "eval", "evalsha",
+		"lock", "unlock", "takedistributedlock",
+		"scan", "hscan", "sscan", "zscan",
+		"pexpire", "pttl", "psetex",
+		"keys", "type", "rename", "renamenx", "move":
+		return true
+	}
+	return false
 }
 
 // isMutationMethod returns true if the DAO method name is a write operation
