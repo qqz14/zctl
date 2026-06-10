@@ -22,6 +22,7 @@ type IssueTab struct {
 	Issues     []string
 	Note       string        // optional explanatory note for empty tabs
 	InlineHTML template.HTML // optional: render custom HTML instead of issue list
+	Count      int           // override badge count (used when InlineHTML is set)
 }
 
 // NavItem is one clickable item in the left nav (maps to one right-pane panel).
@@ -634,12 +635,18 @@ func buildGroups(
 	// Build coverage table inline HTML
 	coverTableHTML := renderCoverTable(lastCoverPkgs, overallPct, coverHTMLExists, pkgAnchors)
 
+	// Count = total file count across all packages for the coverage tab badge
+	coverFileCount := 0
+	for _, p := range lastCoverPkgs {
+		coverFileCount += p.Files
+	}
+
 	testItem := NavItem{
 		ID:    "quality-testing",
 		Label: "测试质量",
 		Tabs: []IssueTab{
 			{ID: "test-cover", Label: "覆盖率汇总", Level: coverLevel,
-				InlineHTML: coverTableHTML},
+				InlineHTML: coverTableHTML, Count: coverFileCount},
 			{ID: "test-testify", Label: "Testify 规范", Level: levelOf(testTestifyIssues),
 				Issues: testTestifyIssues, Note: "testify 断言写法错误，如 assert.Equal(t, nil, err) 应改为 assert.NoError"},
 		},
@@ -1557,7 +1564,12 @@ func buildFuncMap() template.FuncMap {
 		"hasFlat":     func(issues []string) bool { return len(issues) > 0 },
 		"tabLevel":    func(t IssueTab) string { return levelClass(t.Level) },
 		"tabIcon":     func(t IssueTab) string { return levelIcon(t.Level) },
-		"tabCount":    func(t IssueTab) int { return len(t.Issues) },
+		"tabCount": func(t IssueTab) int {
+			if t.Count > 0 {
+				return t.Count
+			}
+			return len(t.Issues)
+		},
 		"navCount": func(item NavItem) int {
 			// Explicit override (used by IframeURL items like lint raw report)
 			if item.Count > 0 {
