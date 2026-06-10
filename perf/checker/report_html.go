@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,11 +16,12 @@ import (
 
 // IssueTab is one tab inside a right-pane panel.
 type IssueTab struct {
-	ID     string
-	Label  string
-	Level  Level
-	Issues []string
-	Note   string // optional explanatory note for empty tabs
+	ID         string
+	Label      string
+	Level      Level
+	Issues     []string
+	Note       string        // optional explanatory note for empty tabs
+	InlineHTML template.HTML // optional: render custom HTML instead of issue list
 }
 
 // NavItem is one clickable item in the left nav (maps to one right-pane panel).
@@ -49,9 +51,34 @@ type ReportData struct {
 	ProjectName string
 	GitBranch   string
 	GitHash     string
-	ScanTime    string
-	Elapsed     string
+	StartTime   string // e.g. "2026-06-10 14:09:00"
+	EndTime     string // e.g. "2026-06-10 14:11:23"
+	ScanTime    string // alias for StartTime (used in legacy template spots)
+	Elapsed     string // e.g. "2分23秒456毫秒"
 	Groups      []NavGroup
+}
+
+// FormatElapsed converts a duration to "Xm Ys Zms" Chinese readable format.
+// e.g. 143456ms → "2分23秒456毫秒"
+// e.g.  23456ms → "23秒456毫秒"
+// e.g.    456ms → "456毫秒"
+func FormatElapsed(d time.Duration) string {
+	total := d.Round(time.Millisecond)
+	ms := total.Milliseconds()
+
+	minutes := ms / 60000
+	ms -= minutes * 60000
+	seconds := ms / 1000
+	ms -= seconds * 1000
+
+	switch {
+	case minutes > 0:
+		return fmt.Sprintf("%d分%d秒%d毫秒", minutes, seconds, ms)
+	case seconds > 0:
+		return fmt.Sprintf("%d秒%d毫秒", seconds, ms)
+	default:
+		return fmt.Sprintf("%d毫秒", ms)
+	}
 }
 
 // ── WriteReportHTML ───────────────────────────────────────────────────────────
@@ -59,6 +86,7 @@ type ReportData struct {
 func WriteReportHTML(
 	outDir, projectDir string,
 	results map[string]*Result,
+	startTime time.Time,
 	elapsed time.Duration,
 	dr *DynamicResult,
 ) {
@@ -83,14 +111,18 @@ func WriteReportHTML(
 	gitBranch := gitOutput(projectDir, "rev-parse", "--abbrev-ref", "HEAD")
 	gitHash := gitOutput(projectDir, "rev-parse", "--short", "HEAD")
 
-	groups := buildGroups(results, lintRes, n1Findings, n1Inline, dr)
+	coverHTMLPath := filepath.Join(detailsDir, "cover.html")
+	groups := buildGroups(results, lintRes, n1Findings, n1Inline, dr, coverHTMLPath)
 
+	endTime := startTime.Add(elapsed)
 	data := ReportData{
 		ProjectName: projectName,
 		GitBranch:   gitBranch,
 		GitHash:     gitHash,
-		ScanTime:    time.Now().Format("2006-01-02 15:04:05"),
-		Elapsed:     elapsed.Round(time.Millisecond).String(),
+		StartTime:   startTime.Format("2006-01-02 15:04:05"),
+		EndTime:     endTime.Format("2006-01-02 15:04:05"),
+		ScanTime:    startTime.Format("2006-01-02 15:04:05"),
+		Elapsed:     FormatElapsed(elapsed),
 		Groups:      groups,
 	}
 
@@ -111,6 +143,7 @@ func buildGroups(
 	n1Findings []N1Finding,
 	n1Inline template.HTML,
 	dr *DynamicResult,
+	coverHTMLPath string, // absolute path to details/cover.html, "" if not generated
 ) []NavGroup {
 	tabs := map[string][]string{}
 	if lr != nil {
@@ -533,24 +566,45 @@ func buildGroups(
 	}
 	styleItem.Level = worstTabLevel(styleItem.Tabs)
 
-	// Item 5.3: 测试质量
+	// Item 5.3: 测试质量 (覆盖率汇总表格 + Testify 规范)
 	var testTestifyIssues []string
 	for _, s := range tabs["testing"] {
 		if strings.Contains(s, "[testifylint]") {
 			testTestifyIssues = append(testTestifyIssues, s)
 		}
 	}
-	// Coverage: parse from results["test"] if available (may be nil in static-only run)
-	var coverIssues []string
+	// Overall coverage pct from result summary
+	var overallPct float64
+	coverLevel := LevelSkip
 	if r := results["test"]; r != nil {
-		coverIssues = r.safeIssues()
+		coverLevel = r.Level
+		// Extract pct from summary string "coverage XX.X% ..."
+		if idx := strings.Index(r.Summary, "coverage "); idx >= 0 {
+			parts := strings.Fields(r.Summary[idx+9:])
+			if len(parts) > 0 {
+				pctStr := strings.TrimSuffix(parts[0], "%")
+				if v, err := strconv.ParseFloat(pctStr, 64); err == nil {
+					overallPct = v
+				}
+			}
+		}
 	}
+	// Check if cover.html exists for the "view detail" link
+	coverHTMLExists := coverHTMLPath != "" && fileExists(coverHTMLPath)
+	// Parse file anchors from cover.html for per-package deep links
+	var pkgAnchors map[string]string
+	if coverHTMLExists {
+		pkgAnchors = parseCoverHTMLAnchors(coverHTMLPath)
+	}
+	// Build coverage table inline HTML
+	coverTableHTML := renderCoverTable(lastCoverPkgs, overallPct, coverHTMLExists, pkgAnchors)
+
 	testItem := NavItem{
 		ID:    "quality-testing",
 		Label: "测试质量",
 		Tabs: []IssueTab{
-			{ID: "test-cover", Label: "覆盖率", Level: levelOf(coverIssues),
-				Issues: coverIssues, Note: "单测覆盖率统计，运行 make test 获取"},
+			{ID: "test-cover", Label: "覆盖率汇总", Level: coverLevel,
+				InlineHTML: coverTableHTML},
 			{ID: "test-testify", Label: "Testify 规范", Level: levelOf(testTestifyIssues),
 				Issues: testTestifyIssues, Note: "testify 断言写法错误，如 assert.Equal(t, nil, err) 应改为 assert.NoError"},
 		},
@@ -844,7 +898,7 @@ func renderSQLPerfInline(warnIssues, infoIssues []string) template.HTML {
 
 	fmt.Fprintf(&sb, `<div id="sp-nolimit" class="sp-panel%s">`, activeWarn)
 	if len(warnIssues) == 0 {
-		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+		sb.WriteString(`<div class="empty-pass">✅ No issues found</div>`)
 	}
 	for _, s := range warnIssues {
 		loc, hint := splitSQLPerfIssue(s)
@@ -855,7 +909,7 @@ func renderSQLPerfInline(warnIssues, infoIssues []string) template.HTML {
 	fmt.Fprintf(&sb, `<div id="sp-bounded" class="sp-panel%s">`, activeInfo)
 	sb.WriteString(`<p style="font-size:.83rem;color:#666;margin-bottom:12px">有 WHERE 条件但无 .Limit()，结果集有界时可接受，否则建议加 .Limit() 或分页</p>`)
 	if len(infoIssues) == 0 {
-		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+		sb.WriteString(`<div class="empty-pass">✅ No issues found</div>`)
 	}
 	for _, s := range infoIssues {
 		loc, hint := splitSQLPerfIssue(s)
@@ -880,6 +934,178 @@ func splitSQLPerfIssue(s string) (loc, hint string) {
 		return s, ""
 	}
 	return s[:idx], s[idx+3:]
+}
+
+// parseCoverHTMLAnchors parses go tool cover -html output and returns a map
+// from file path suffix (e.g. "internal/logic/user/user_logic.go") to anchor
+// fragment (e.g. "file3"), so table rows can link directly to the right section.
+//
+// cover.html structure:
+//
+//	<option value="file0">github.com/foo/bar/internal/logic/user/user_logic.go (N%)</option>
+func parseCoverHTMLAnchors(coverHTMLPath string) map[string]string {
+	data, err := os.ReadFile(coverHTMLPath)
+	if err != nil {
+		return nil
+	}
+	result := map[string]string{}
+	content := string(data)
+	// Find all: value="fileN">some/path/file.go
+	searchStr := `value="`
+	idx := 0
+	for {
+		start := strings.Index(content[idx:], searchStr)
+		if start < 0 {
+			break
+		}
+		start += idx + len(searchStr)
+		end := strings.Index(content[start:], `"`)
+		if end < 0 {
+			break
+		}
+		anchor := content[start : start+end] // e.g. "file3"
+		idx = start + end + 1
+
+		// Find the text content between > and <
+		gt := strings.Index(content[idx:], ">")
+		if gt < 0 {
+			break
+		}
+		gt += idx + 1
+		lt := strings.Index(content[gt:], "<")
+		if lt < 0 {
+			break
+		}
+		label := strings.TrimSpace(content[gt : gt+lt]) // e.g. "github.com/.../file.go (80.0%)"
+		// Strip coverage pct suffix
+		if paren := strings.LastIndex(label, " ("); paren >= 0 {
+			label = label[:paren]
+		}
+		idx = gt + lt
+
+		// Map every suffix of the path, so pkg-level matching works
+		parts := strings.Split(label, "/")
+		for i := range parts {
+			suffix := strings.Join(parts[i:], "/")
+			if _, exists := result[suffix]; !exists {
+				result[suffix] = anchor
+			}
+		}
+	}
+	return result
+}
+
+// renderCoverTable renders an HTML coverage summary table from per-package stats.
+// pkgAnchors maps package path → anchor in details/cover.html (e.g. "file3").
+// Clicking a row opens cover.html scrolled to the first file in that package.
+func renderCoverTable(pkgs []PkgCoverage, overallPct float64, coverHTMLExists bool, pkgAnchors map[string]string) template.HTML {
+	if len(pkgs) == 0 {
+		return template.HTML(`<div style="padding:32px;text-align:center;color:#888;font-size:.93rem">⚠️ 暂无覆盖率数据（无测试文件或构建失败）</div>`)
+	}
+
+	var sb strings.Builder
+
+	// ── overall banner ─────────────────────────────────────────────────────
+	overallColor := "#c00"
+	if overallPct >= 80 {
+		overallColor = "#1a7f37"
+	} else if overallPct >= 60 {
+		overallColor = "#b45309"
+	}
+	sb.WriteString(fmt.Sprintf(`
+<div style="padding:16px 20px 0">
+  <div style="display:flex;align-items:center;gap:16px;margin-bottom:12px">
+    <span style="font-size:2rem;font-weight:700;color:%s">%.1f%%</span>
+    <span style="color:#555;font-size:.9rem">总体语句覆盖率 · %d 个包</span>`, overallColor, overallPct, len(pkgs)))
+
+	if coverHTMLExists {
+		sb.WriteString(`    <a href="details/cover.html" target="_blank"
+         style="margin-left:auto;padding:5px 14px;border-radius:6px;background:#0969da;color:#fff;
+                font-size:.82rem;text-decoration:none;white-space:nowrap">🔍 查看行级覆盖详情</a>`)
+	}
+	sb.WriteString(`
+  </div>`)
+
+	// ── progress bar for overall ────────────────────────────────────────────
+	sb.WriteString(fmt.Sprintf(`
+  <div style="height:8px;background:#e8e8e8;border-radius:4px;margin-bottom:16px;overflow:hidden">
+    <div style="height:100%%;width:%.1f%%;background:%s;border-radius:4px;transition:width .3s"></div>
+  </div>`, overallPct, overallColor))
+
+	// ── package table ───────────────────────────────────────────────────────
+	sb.WriteString(`
+  <table style="width:100%;border-collapse:collapse;font-size:.83rem">
+    <thead>
+      <tr style="border-bottom:2px solid #e0e0e0;color:#555">
+        <th style="text-align:left;padding:6px 8px;font-weight:600">包路径</th>
+        <th style="text-align:right;padding:6px 8px;font-weight:600;white-space:nowrap">语句数</th>
+        <th style="text-align:right;padding:6px 8px;font-weight:600;white-space:nowrap">覆盖率</th>
+        <th style="padding:6px 8px;min-width:120px;font-weight:600">进度</th>
+      </tr>
+    </thead>
+    <tbody>`)
+
+	for i, p := range pkgs {
+		rowBg := "#fff"
+		if i%2 == 1 {
+			rowBg = "#f9f9f9"
+		}
+		barColor := "#c00"
+		textColor := "#c00"
+		if p.Pct >= 80 {
+			barColor = "#1a7f37"
+			textColor = "#1a7f37"
+		} else if p.Pct >= 60 {
+			barColor = "#b45309"
+			textColor = "#b45309"
+		}
+
+		// Build link to the first file in this package inside cover.html
+		pkgCell := htmlEscape(p.Pkg)
+		if coverHTMLExists {
+			// Try to find an anchor for any file in this package
+			anchor := ""
+			for suffix, anch := range pkgAnchors {
+				if strings.HasPrefix(suffix, p.Pkg+"/") || suffix == p.Pkg {
+					anchor = anch
+					break
+				}
+			}
+			if anchor != "" {
+				pkgCell = fmt.Sprintf(`<a href="details/cover.html#%s" target="_blank"
+              style="color:#0969da;text-decoration:none;font-family:monospace" title="在覆盖率详情中查看">%s</a>`,
+					anchor, htmlEscape(p.Pkg))
+			}
+		}
+
+		sb.WriteString(fmt.Sprintf(`
+      <tr style="background:%s;border-bottom:1px solid #ebebeb">
+        <td style="padding:6px 8px;word-break:break-all">%s</td>
+        <td style="text-align:right;padding:6px 8px;color:#555">%d</td>
+        <td style="text-align:right;padding:6px 8px;font-weight:600;color:%s">%.1f%%</td>
+        <td style="padding:6px 8px">
+          <div style="height:6px;background:#e8e8e8;border-radius:3px;overflow:hidden">
+            <div style="height:100%%;width:%.1f%%;background:%s;border-radius:3px"></div>
+          </div>
+        </td>
+      </tr>`,
+			rowBg, pkgCell, p.Stmts, textColor, p.Pct, p.Pct, barColor))
+	}
+
+	sb.WriteString(`
+    </tbody>
+  </table>
+</div>`)
+
+	return template.HTML(sb.String())
+}
+
+// htmlEscape escapes s for safe use in HTML text content.
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
 }
 
 // renderSQLPerfFromFindings renders the SQL perf inline panel using real SQL strings
@@ -934,7 +1160,7 @@ func renderSQLPerfFromFindings(warn, info []SQLPerfFinding) template.HTML {
 	// ── 无分页全表 panel ──
 	fmt.Fprintf(&sb, `<div id="sp-nolimit" class="sp-panel%s">`, activeWarn)
 	if len(warn) == 0 {
-		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+		sb.WriteString(`<div class="empty-pass">✅ No issues found</div>`)
 	}
 	for _, f := range warn {
 		loc := f.File
@@ -954,7 +1180,7 @@ func renderSQLPerfFromFindings(warn, info []SQLPerfFinding) template.HTML {
 	fmt.Fprintf(&sb, `<div id="sp-bounded" class="sp-panel%s">`, activeInfo)
 	sb.WriteString(`<p style="font-size:.83rem;color:#666;margin-bottom:12px">有 WHERE 条件但无 LIMIT，结果集有界时可接受，否则建议加 LIMIT 或分页</p>`)
 	if len(info) == 0 {
-		sb.WriteString(`<div class="sp-empty">✅ 无此类问题</div>`)
+		sb.WriteString(`<div class="empty-pass">✅ No issues found</div>`)
 	}
 	for _, f := range info {
 		loc := f.File
@@ -1364,8 +1590,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .tab-count{font-size:.7rem;padding:1px 5px;border-radius:8px;margin-left:4px;font-weight:700}
 .tc-fail{background:#fde;color:#c00} .tc-warn{background:#fff3cc;color:#9a6000}
 .tc-pass{background:#dfd;color:#060} .tc-info{background:#e0ecff;color:#0055aa}
-.tab-panel{display:none;padding:14px 24px 18px}
-.tab-panel.on{display:block}
+.tab-panel{display:none;overflow-y:auto;flex:1;padding:14px 24px 18px}
+.tab-panel.on{display:flex;flex-direction:column}
 .tab-note{font-size:.8rem;color:#888;font-style:italic;padding:6px 0 10px;border-bottom:1px solid #f0f0f0;margin-bottom:10px}
 
 /* ── Overview ── */
@@ -1400,7 +1626,9 @@ h1{font-size:1.2rem;margin-bottom:4px}
   <div class="nav-header">
     <div class="nav-project">{{.ProjectName}}</div>
     {{if .GitBranch}}<div class="nav-branch">⎇ {{.GitBranch}}{{if .GitHash}} · {{.GitHash}}{{end}}</div>{{end}}
-    <div class="nav-meta">{{.ScanTime}} · {{.Elapsed}}</div>
+    <div class="nav-meta">开始 {{.StartTime}}</div>
+    <div class="nav-meta">结束 {{.EndTime}}</div>
+    <div class="nav-meta" style="color:#8af;font-weight:600">耗时 {{.Elapsed}}</div>
   </div>
   <div class="nav-scroll-area">
     <div class="nav-group-header">📊 Overview</div>
@@ -1485,7 +1713,7 @@ h1{font-size:1.2rem;margin-bottom:4px}
     {{range $i, $tab := .Tabs}}
     <div id="tp-{{$item.ID}}-{{$tab.ID}}" class="tab-panel {{if eq $i 0}}on{{end}}">
       {{if $tab.Note}}<div class="tab-note">{{$tab.Note}}</div>{{end}}
-      {{template "issueList" $tab.Issues}}
+      {{if $tab.InlineHTML}}{{$tab.InlineHTML}}{{else}}{{template "issueList" $tab.Issues}}{{end}}
     </div>
     {{end}}
   </div>

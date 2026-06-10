@@ -32,6 +32,7 @@ type ScanResult struct {
 	N1          *checker.Result
 	EntFullScan *checker.Result
 	LogicReview *checker.Result
+	Test        *checker.Result // test coverage (go test -coverprofile)
 	Dynamic     *checker.DynamicResult // nil when --dynamic not set
 	Elapsed     time.Duration
 }
@@ -54,14 +55,14 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("mkdir %s failed: %w", outDir, err)
 	}
 
-	printBanner(absDir, VarBoolDynamic)
 	start := time.Now()
+	printBanner(absDir, VarBoolDynamic, start)
 
 	res := &ScanResult{}
 
-	totalSteps := 8
+	totalSteps := 9
 	if VarBoolDynamic {
-		totalSteps = 11
+		totalSteps = 12
 	}
 
 	// Step 0: build call graph once — shared by N+1 and Logic Review
@@ -114,6 +115,12 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 	// Step 7.5 (no banner): SQL perf derived from logic review results — no extra file scan needed
 	res.EntFullScan = checker.RunSQLPerfFromLogicReview(checker.LastLogicReviewResult())
 
+	// Step 8: test coverage — go test -coverprofile + go tool cover -html
+	// Generates details/cover.html (same iframe pattern as lint raw report).
+	printStep(8, totalSteps, "test coverage (go test -coverprofile)")
+	res.Test = checker.RunTestCover(absDir, outDir)
+	printResult(res.Test)
+
 	// Steps 9-11: dynamic analysis (only when --dynamic flag is set)
 	if VarBoolDynamic {
 		dur := VarDurationPprofWindow
@@ -150,10 +157,11 @@ func PerfScan(_ *cobra.Command, _ []string) error {
 		"escape":   res.Escape,
 		"n1":       res.N1,
 		"sql-perf": res.EntFullScan,
+		"test":     res.Test,
 		"dynamic":  dynamicSummaryResult(res.Dynamic),
-	}, res.Elapsed, res.Dynamic)
+	}, start, res.Elapsed, res.Dynamic)
 
-	printSummary(res, outDir)
+	printSummary(res, outDir, start)
 	return exitCode(res)
 }
 
@@ -178,7 +186,7 @@ func dynamicSummaryResult(dr *checker.DynamicResult) *checker.Result {
 
 // ── helpers ──
 
-func printBanner(dir string, dynamic bool) {
+func printBanner(dir string, dynamic bool, start time.Time) {
 	mode := "static"
 	if dynamic {
 		mode = "static + dynamic"
@@ -186,7 +194,7 @@ func printBanner(dir string, dynamic bool) {
 	fmt.Println()
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
 	color.Style{color.FgCyan, color.Bold}.Printf("  zctl perf scan [%s] · %s\n", mode, filepath.Base(dir))
-	color.Style{color.FgCyan, color.Bold}.Printf("  %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	color.Style{color.FgCyan, color.Bold}.Printf("  开始时间  %s\n", start.Format("2006-01-02 15:04:05"))
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
 	fmt.Println()
 }
@@ -226,7 +234,8 @@ func printResult(r *checker.Result) {
 	fmt.Println()
 }
 
-func printSummary(res *ScanResult, outDir string) {
+func printSummary(res *ScanResult, outDir string, start time.Time) {
+	end := start.Add(res.Elapsed)
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
 	fmt.Printf("  %-28s %s\n", "gofmt", badge(res.Fmt))
 	fmt.Printf("  %-28s %s\n", "go vet", badge(res.Vet))
@@ -235,6 +244,7 @@ func printSummary(res *ScanResult, outDir string) {
 	fmt.Printf("  %-28s %s\n", "escape analysis", badge(res.Escape))
 	fmt.Printf("  %-28s %s\n", "N+1 query scan", badge(res.N1))
 	fmt.Printf("  %-28s %s\n", "ent full-scan", badge(res.EntFullScan))
+	fmt.Printf("  %-28s %s\n", "test coverage", badge(res.Test))
 	fmt.Printf("  %-28s %s\n", "logic review", badge(res.LogicReview))
 	if res.Dynamic != nil {
 		fmt.Printf("  %-28s %s\n", "pprof CPU", badge(res.Dynamic.CPU))
@@ -242,7 +252,10 @@ func printSummary(res *ScanResult, outDir string) {
 		fmt.Printf("  %-28s %s\n", "goroutine", badge(res.Dynamic.Goroutine))
 		fmt.Printf("  %-28s %s\n", "slow query", badge(res.Dynamic.SlowQuery))
 	}
-	fmt.Printf("  %-28s %s\n", "elapsed", res.Elapsed.Round(time.Millisecond).String())
+	fmt.Println()
+	color.Style{color.FgCyan, color.Bold}.Printf("  %-14s %s\n", "开始时间", start.Format("2006-01-02 15:04:05"))
+	color.Style{color.FgCyan, color.Bold}.Printf("  %-14s %s\n", "结束时间", end.Format("2006-01-02 15:04:05"))
+	color.Style{color.FgCyan, color.Bold}.Printf("  %-14s %s\n", "总耗时", checker.FormatElapsed(res.Elapsed))
 	fmt.Println()
 	color.Gray.Printf("  Report: %s/report.html\n", outDir)
 	color.Style{color.FgCyan, color.Bold}.Println("════════════════════════════════════════════════════════════")
