@@ -13,8 +13,8 @@ import (
 
 	"github.com/qqz14/zctl/rpc/generator"
 	"github.com/qqz14/zctl/util/ctx"
-	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/format"
+	"github.com/qqz14/zctl/util/name"
 	"github.com/qqz14/zctl/util/pathx"
 
 	"entgo.io/ent/entc"
@@ -63,16 +63,18 @@ func (g *GenContext) Validate() error {
 // GenEntLogic generates DAO + desc proto for one or all ent schemas.
 //
 // 默认职责（对齐用户工作流）：
-//   PhaseA  →  写 dao/impl/mock/hook         （独立落盘，失败直接退出）
-//   EntInfra → 写 entlog/entx + patch ServiceContext（紧贴 PhaseA，让 dao 阶段产物自洽可编译）
-//   PhaseB  →  写 desc proto                  （已存在或 dao 已存在则跳过；空目录/空文件自动剪枝）
-//   ── 到此为止。后续 merge desc → 根 .proto → protoc → logic/server 由用户跑 `make gen-rpc`
-//      （即 `zctl rpc merge-proto` + `zctl rpc protoc`）完成，确保与 `make gen-rpc` 完全同源。
+//
+//	PhaseA  →  写 dao/impl/mock/hook         （独立落盘，失败直接退出）
+//	EntInfra → 写 entlog/entx + patch ServiceContext（紧贴 PhaseA，让 dao 阶段产物自洽可编译）
+//	PhaseB  →  写 desc proto                  （已存在或 dao 已存在则跳过；空目录/空文件自动剪枝）
+//	── 到此为止。后续 merge desc → 根 .proto → protoc → logic/server 由用户跑 `make gen-rpc`
+//	   （即 `zctl rpc merge-proto` + `zctl rpc protoc`）完成，确保与 `make gen-rpc` 完全同源。
 //
 // 旧路径（包内常量 enableLegacyLogicGen，默认 false）：
-//   PhaseB 之后追加 protoc 预校验 + PhaseC（errcode/test/model/consts）+ enum + logic/server。
-//   需要时改 enableLegacyLogicGen=true 并重编译 zctl；不暴露 CLI flag，避免命令面增加。
-//   失败时仅回滚 PhaseB 新增 desc proto / 根 .proto / types/ pb，**dao 与 EntInfra 永不回滚**。
+//
+//	PhaseB 之后追加 protoc 预校验 + PhaseC（errcode/test/model/consts）+ enum + logic/server。
+//	需要时改 enableLegacyLogicGen=true 并重编译 zctl；不暴露 CLI flag，避免命令面增加。
+//	失败时仅回滚 PhaseB 新增 desc proto / 根 .proto / types/ pb，**dao 与 EntInfra 永不回滚**。
 func GenEntLogic(g *GenContext) error {
 	fmt.Println("[zctl] Generating from ent schema...")
 
@@ -334,7 +336,8 @@ func generateSchemaPhaseA(g *GenContext, projectCtx *ctx.ProjectContext, outputD
 }
 
 // generateSchemaPhaseC 生成"protoc 预校验通过后"的产物：
-//   errcode 模块文件 / test 骨架 / pkg/model 占位 / pkg/consts 占位。
+//
+//	errcode 模块文件 / test 骨架 / pkg/model 占位 / pkg/consts 占位。
 //
 // 这些产物全部依赖 desc proto 已经合法（否则 logic/test 会引用不存在的 pb 类型）。
 // 当 daoPreExisted=true 且未指定 --overwrite 时，与原逻辑一致整体跳过。
@@ -551,7 +554,11 @@ func genDaoMock(g *GenContext, outputDir, modulePath string, schema *load.Schema
 	fmt.Fprintf(&methodsCode, "func (m *%s) WithTx(tx *ent.Tx) dao.%s {\n", mockName, daoName)
 	fmt.Fprintf(&methodsCode, "\targs := m.Called(tx)\n")
 	fmt.Fprintf(&methodsCode, "\tif v := args.Get(0); v != nil {\n")
-	fmt.Fprintf(&methodsCode, "\t\treturn v.(dao.%s)\n", daoName)
+	fmt.Fprintf(&methodsCode, "\t\td, ok := v.(dao.%s)\n", daoName)
+	fmt.Fprintf(&methodsCode, "\t\tif !ok {\n")
+	fmt.Fprintf(&methodsCode, "\t\t\treturn m\n")
+	fmt.Fprintf(&methodsCode, "\t\t}\n")
+	fmt.Fprintf(&methodsCode, "\t\treturn d\n")
 	fmt.Fprintf(&methodsCode, "\t}\n")
 	fmt.Fprintf(&methodsCode, "\treturn m\n")
 	fmt.Fprintf(&methodsCode, "}\n")
@@ -721,10 +728,10 @@ func extractParamNames(params string) string {
 	return strings.Join(names, ", ")
 }
 
-// buildReturnStmt builds the return statement for a mock method.
+// buildReturnStmt builds the return statement for a mock method,
+// using checked type assertions to pass forcetypeassert linter.
 func buildReturnStmt(returns string) string {
 	returns = strings.TrimSpace(returns)
-	// Remove outer parens if present
 	if strings.HasPrefix(returns, "(") && strings.HasSuffix(returns, ")") {
 		returns = returns[1 : len(returns)-1]
 	}
@@ -735,22 +742,93 @@ func buildReturnStmt(returns string) string {
 		return "\treturn args.Error(0)\n"
 	}
 
-	var lines []string
+	// First pass: find error index
+	errIdx := -1
 	for i, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "error" {
-			lines = append(lines, fmt.Sprintf("args.Error(%d)", i))
-		} else if p == "int" || p == "int64" || p == "uint64" || p == "int32" {
-			lines = append(lines, fmt.Sprintf("args.Get(%d).(%s)", i, p))
-		} else if strings.HasPrefix(p, "*") || strings.HasPrefix(p, "[]*") || strings.HasPrefix(p, "[]") {
-			// Pointer or slice type: use type assertion with nil check
-			lines = append(lines, fmt.Sprintf("args.Get(%d).(%s)", i, p))
-		} else {
-			lines = append(lines, fmt.Sprintf("args.Get(%d).(%s)", i, p))
+		if strings.TrimSpace(p) == "error" {
+			errIdx = i
+			break
 		}
 	}
 
-	return fmt.Sprintf("\treturn %s\n", strings.Join(lines, ", "))
+	var buf strings.Builder
+	nonErrIdx := 0
+
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "error" {
+			continue
+		}
+		varName := varNameForIndex(nonErrIdx)
+		zero := zeroValForType(p)
+		fmt.Fprintf(&buf, "\t%s, ok := args.Get(%d).(%s)\n", varName, i, p)
+		fmt.Fprintf(&buf, "\tif !ok {\n")
+		// Build zero-value return for all positions
+		var retVals []string
+		for j := range parts {
+			if j == errIdx {
+				retVals = append(retVals, fmt.Sprintf("args.Error(%d)", j))
+			} else if j == i {
+				retVals = append(retVals, zero)
+			} else {
+				retVals = append(retVals, zeroValForType(strings.TrimSpace(parts[j])))
+			}
+		}
+		fmt.Fprintf(&buf, "\t\treturn %s\n", strings.Join(retVals, ", "))
+		fmt.Fprintf(&buf, "\t}\n")
+		nonErrIdx++
+	}
+
+	// Final return with all values
+	var finalVals []string
+	nonErrIdx = 0
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "error" {
+			finalVals = append(finalVals, fmt.Sprintf("args.Error(%d)", errIdx))
+		} else {
+			finalVals = append(finalVals, varNameForIndex(nonErrIdx))
+			nonErrIdx++
+		}
+	}
+	fmt.Fprintf(&buf, "\treturn %s\n", strings.Join(finalVals, ", "))
+
+	return buf.String()
+}
+
+func varNameForIndex(i int) string {
+	switch i {
+	case 0:
+		return "v"
+	case 1:
+		return "n"
+	case 2:
+		return "n2"
+	case 3:
+		return "n3"
+	default:
+		return fmt.Sprintf("v%d", i)
+	}
+}
+
+func zeroValForType(t string) string {
+	t = strings.TrimSpace(t)
+	switch {
+	case strings.HasPrefix(t, "*") || strings.HasPrefix(t, "[]"):
+		return "nil"
+	case t == "int" || t == "int8" || t == "int16" || t == "int32" || t == "int64":
+		return "0"
+	case t == "uint" || t == "uint8" || t == "uint16" || t == "uint32" || t == "uint64":
+		return "0"
+	case t == "float32" || t == "float64":
+		return "0"
+	case t == "string":
+		return `""`
+	case t == "bool":
+		return "false"
+	default:
+		return "nil"
+	}
 }
 
 // splitReturnTypes splits return type list respecting generics/brackets.
@@ -1870,6 +1948,7 @@ func entFieldName(fieldMap map[string]string, snakeName string) string {
 //   - PageInfo is reused from base.proto for list pagination
 //   - Empty is reused from base.proto for empty responses
 //   - Proto methods are generated from DAO interface methods (not hardcoded CRUD)
+//
 // genDescProto 是兼容入口（generateForSchema 单 schema 路径仍在用）。
 // 内部走与主流程一致的 plan 模式：算差集 → 空剪枝 → 落盘。
 // 这样维护单一渲染逻辑（renderProtoFile），不再保留独立的字符串拼接代码。
@@ -1887,7 +1966,6 @@ func genDescProto(g *GenContext, outputDir string, schema *load.Schema) error {
 	plan.addSchema(g, schema, g.GroupName, false)
 	return plan.commit(nil)
 }
-
 
 // goTypeToProtoType converts Go type to proto type
 func goTypeToProtoType(goType string) string {
@@ -2083,7 +2161,7 @@ type protoFieldSig struct {
 }
 
 type dirPlan struct {
-	absDir string                     // desc/<group>
+	absDir string                    // desc/<group>
 	files  map[string]*protoFilePlan // 文件名 → 文件计划
 }
 
@@ -2531,8 +2609,9 @@ func renderProtoFile(g *GenContext, fp *protoFilePlan) string {
 //   - 所有 top-level message 的字段签名（首遇优先）→ messages 入参
 //
 // 解析采用纯字符串扫描，足以覆盖本工程内 desc proto 的标准写法：
-//   service Foo { rpc Bar (BarReq) returns (BarResp); ... }
-//   message Foo { [optional|repeated] <type> <name> = <tag>; ... }
+//
+//	service Foo { rpc Bar (BarReq) returns (BarResp); ... }
+//	message Foo { [optional|repeated] <type> <name> = <tag>; ... }
 //
 // 为简单可靠：忽略嵌套 message（本工程不会写嵌套）；忽略 enum；遇到不可解析行直接跳过。
 // desc/ 不存在时静默返回 nil，让首次跑也能过。

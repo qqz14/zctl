@@ -23,6 +23,22 @@ type IssueTab struct {
 	Note       string        // optional explanatory note for empty tabs
 	InlineHTML template.HTML // optional: render custom HTML instead of issue list
 	Count      int           // override badge count (used when InlineHTML is set)
+	FixHint    *FixHint      // optional: collapsible fix-suggestion box rendered above issue list
+}
+
+// FixHint describes a one-click / scripted fix suggestion for a specific tab.
+// Rendered as a collapsible <details> box above the issue list.
+type FixHint struct {
+	Title   string    // 例如 "💡 一键修复建议：fieldalignment"
+	Summary string    // 一行简介，描述该工具能修什么
+	Steps   []FixStep // 多步操作（安装/执行/验证…）
+	Notes   []string  // 提醒事项，例如 "执行前请先 commit / 不可逆"
+}
+
+// FixStep is a single executable step in a FixHint.
+type FixStep struct {
+	Desc    string // 步骤说明，例如 "安装 fieldalignment 工具"
+	Command string // 可一键复制执行的命令；空表示纯说明步骤
 }
 
 // NavItem is one clickable item in the left nav (maps to one right-pane panel).
@@ -780,6 +796,23 @@ func buildGroups(
 				// Re-compute item level so nav badge reflects the injected warn
 				if changed {
 					all[gi].Items[ii].Level = worstTabLevel(all[gi].Items[ii].Tabs)
+				}
+			}
+		}
+	}
+
+	// ── Inject FixHints for static-check tabs ─────────────────────────────
+	// Only attach hints when the tab actually has issues — avoid distracting
+	// the user with fix instructions on clean tabs.
+	for gi := range all {
+		for ii := range all[gi].Items {
+			for ti := range all[gi].Items[ii].Tabs {
+				tab := &all[gi].Items[ii].Tabs[ti]
+				if tab.InlineHTML != "" || len(tab.Issues) == 0 {
+					continue
+				}
+				if h := fixHintFor(tab.ID); h != nil {
+					tab.FixHint = h
 				}
 			}
 		}
@@ -1748,6 +1781,27 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .tab-panel.on{display:block}
 .tab-note{font-size:.8rem;color:#888;font-style:italic;padding:6px 0 10px;border-bottom:1px solid #f0f0f0;margin-bottom:10px}
 
+/* ── Fix-suggestion collapsible box (above issue list) ── */
+.fix-box{background:#f4f8ff;border:1px solid #c7d8f3;border-radius:6px;margin-bottom:12px;overflow:hidden}
+.fix-box>summary{cursor:pointer;padding:8px 14px;font-size:.85rem;font-weight:600;color:#0a4ea0;list-style:none;display:flex;align-items:center;justify-content:space-between;user-select:none}
+.fix-box>summary::-webkit-details-marker{display:none}
+.fix-box>summary::after{content:"▸";font-size:.7rem;color:#0a4ea0;transition:transform .15s}
+.fix-box[open]>summary::after{transform:rotate(90deg)}
+.fix-box>summary:hover{background:#e8f0ff}
+.fix-body{padding:4px 14px 14px;border-top:1px solid #d8e3f5;background:#fafcff}
+.fix-summary{font-size:.82rem;color:#444;line-height:1.55;margin:8px 0 10px}
+.fix-steps{margin:0;padding:0;list-style:none}
+.fix-steps>li{padding:6px 0;border-bottom:1px dashed #e3e9f3;font-size:.81rem;color:#333}
+.fix-steps>li:last-child{border-bottom:none}
+.fix-step-desc{margin-bottom:4px;line-height:1.5}
+.fix-cmd{display:flex;align-items:center;gap:8px;background:#1e1e1e;border-radius:4px;padding:6px 10px;font-family:'SF Mono',Menlo,Consolas,monospace;font-size:.78rem;color:#d4d4d4;overflow-x:auto}
+.fix-cmd code{flex:1;white-space:pre;color:#d4d4d4;background:transparent;padding:0}
+.fix-cmd-copy{flex-shrink:0;background:#3a3a3a;color:#fff;border:none;border-radius:3px;padding:2px 8px;font-size:.7rem;cursor:pointer;font-family:inherit;transition:background .12s}
+.fix-cmd-copy:hover{background:#555}
+.fix-cmd-copy.ok{background:#0a7a2a}
+.fix-notes{margin-top:10px;padding:8px 10px;background:#fff7e0;border-left:3px solid #e6a700;border-radius:0 4px 4px 0;font-size:.78rem;color:#6a4a00;line-height:1.55}
+.fix-notes>div{margin:2px 0}
+
 /* ── Overview ── */
 h1{font-size:1.2rem;margin-bottom:4px}
 .meta{font-size:.78rem;color:#888;margin-bottom:16px}
@@ -1867,6 +1921,7 @@ h1{font-size:1.2rem;margin-bottom:4px}
     {{range $i, $tab := .Tabs}}
     <div id="tp-{{$item.ID}}-{{$tab.ID}}" class="tab-panel {{if eq $i 0}}on{{end}}">
       {{if $tab.Note}}<div class="tab-note">{{$tab.Note}}</div>{{end}}
+      {{if $tab.FixHint}}{{template "fixHint" $tab.FixHint}}{{end}}
       {{if $tab.InlineHTML}}{{$tab.InlineHTML}}{{else}}{{template "issueList" $tab.Issues}}{{end}}
     </div>
     {{end}}
@@ -1886,6 +1941,30 @@ h1{font-size:1.2rem;margin-bottom:4px}
 
   {{end}}{{end}}
 </div>
+
+{{define "fixHint"}}
+<details class="fix-box">
+  <summary>{{.Title}}</summary>
+  <div class="fix-body">
+    {{if .Summary}}<div class="fix-summary">{{.Summary}}</div>{{end}}
+    {{if .Steps}}
+    <ol class="fix-steps">
+      {{range .Steps}}
+      <li>
+        {{if .Desc}}<div class="fix-step-desc">{{.Desc}}</div>{{end}}
+        {{if .Command}}<div class="fix-cmd"><code>{{.Command}}</code><button class="fix-cmd-copy" onclick="fixCopy(this)">复制</button></div>{{end}}
+      </li>
+      {{end}}
+    </ol>
+    {{end}}
+    {{if .Notes}}
+    <div class="fix-notes">
+      {{range .Notes}}<div>⚠️ {{.}}</div>{{end}}
+    </div>
+    {{end}}
+  </div>
+</details>
+{{end}}
 
 {{define "issueList"}}
 {{if eq (len .) 0}}
@@ -1928,6 +2007,31 @@ function switchTab(panelId, tabId, btn, onCls) {
   var tp = document.getElementById('tp-' + panelId + '-' + tabId);
   if (tp) tp.classList.add('on');
   if (btn) btn.classList.add(onCls || 'on');
+}
+function fixCopy(btn) {
+  var box = btn.parentElement;
+  var code = box && box.querySelector('code');
+  if (!code) return;
+  var text = code.textContent || '';
+  var done = function () {
+    var orig = btn.textContent;
+    btn.textContent = '已复制';
+    btn.classList.add('ok');
+    setTimeout(function () { btn.textContent = orig; btn.classList.remove('ok'); }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(function () {
+      var ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      document.body.removeChild(ta);
+    });
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); done(); } catch (e) {}
+    document.body.removeChild(ta);
+  }
 }
 </script>
 </body>

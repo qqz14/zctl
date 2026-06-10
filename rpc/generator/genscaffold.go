@@ -1288,15 +1288,17 @@ func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) erro
 	if zctx != nil && zctx.Port > 0 {
 		port = zctx.Port
 	}
-	// Three derived forms — the canonical naming scheme for everything Makefile
+	// Four derived forms — the canonical naming scheme for everything Makefile
 	// downstream needs to talk about this service. See doc: naming-spec.md.
-	//   - SERVICE      = PascalCase Go ident   (no initialism expansion)   "CsAgentRpc"
-	//   - SERVICE_STYLE= raw user input        (preserved verbatim)        "cs-agent-rpc" / "cs_agent_rpc" / "CsAgentRpc"
-	//   - SERVICE_DIR  = lower no-separator    (proto pkg / dir name)      "csagentrpc"
-	//   - SERVICE_DASH = dash form             (Docker tag etc.)           "cs-agent-rpc"
+	//   - SERVICE       = PascalCase Go ident   (no initialism expansion)   "CsAgentRpc"
+	//   - SERVICE_STYLE = raw user input         (preserved verbatim)        "cs-agent-rpc" / "cs_agent_rpc" / "CsAgentRpc"
+	//   - SERVICE_LOWER = lower no-separator     (used as directory/file stub)
+	//   - SERVICE_CLIENT= go-zero client pkg name
+	//   - SERVICE_DASH  = dash form              (Docker tag etc.)           "cs-agent-rpc"
 	svcCamel := name.ServiceGoIdent(serviceName)
 	svcStyle := serviceName
-	svcDir := name.ProtoPkg(serviceName)
+	svcLower := name.ProtoPkg(serviceName)
+	svcClient := svcLower + "_client"
 	svcDash := name.DashName(serviceName)
 
 	content := fmt.Sprintf(`# Custom configuration | 独立配置
@@ -1304,8 +1306,10 @@ func (g *Generator) genMakefile(abs, serviceName string, zctx *ZRpcContext) erro
 SERVICE=%s
 # Service name in specific style | 用户原样输入的服务名 (用于文件名)
 SERVICE_STYLE=%s
-# Service directory name | 服务的目录形式 (全小写、无分隔符)
-SERVICE_DIR=%s
+# Service name in lowercase | 项目名称全小写格式
+SERVICE_LOWER=%s
+# go-zero 生成的 client 目录名：SERVICE 转全小写去掉非字母字符后加 _client
+SERVICE_CLIENT=%s
 # Service name in dash format | 项目名称短杠格式 (Docker 镜像 tag)
 SERVICE_DASH=%s
 
@@ -1342,6 +1346,16 @@ GOFMT ?= gofmt "-s"
 GOFILES := $(shell find . -name "*.go")
 LDFLAGS := -s -w
 
+# Project-local proto toolchain | 项目级 proto 工具链（避免不同 Go 项目互相污染）
+TOOLS_DIR := $(CURDIR)/.tools
+TOOLS_BIN := $(TOOLS_DIR)/bin
+TOOLS_INCLUDE := $(TOOLS_DIR)/include
+PROTOC_VERSION := 34.1
+PROTOC_ZIP_VERSION := 34.1
+PROTOC_GEN_GO_VERSION := v1.36.4
+PROTOC_GEN_GO_GRPC_VERSION := v1.3.0
+export PATH := $(TOOLS_BIN):$(PATH)
+
 # Default model (for single module generation)
 model ?= all
 
@@ -1350,27 +1364,160 @@ model ?= all
 .PHONY: pull-proto
 pull-proto: # Pull proto from remote repo | 从远程仓库拉取 proto (需配置 proto.yaml)
 	@if [ ! -f proto.yaml ]; then echo "proto.yaml not found, using local desc/ directly"; exit 0; fi
-	@REPO=$$(grep 'repo:' proto.yaml | head -1 | awk '{print $$2}'); \
-	REF=$$(grep 'ref:' proto.yaml | head -1 | awk '{print $$2}'); \
-	REMOTE_PATH=$$(grep 'path:' proto.yaml | head -1 | awk '{print $$2}'); \
-	TARGET=$$(grep 'target:' proto.yaml | head -1 | awk '{print $$2}'); \
-	TARGET=$${TARGET:-desc/}; \
+	@REPO=$$(grep 'repo:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	PROTOCOL=$$(grep 'protocol:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	PROTOCOL=$${PROTOCOL:-ssh}; \
+	REF=$$(grep 'ref:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	REMOTE_PATH=$$(grep 'path:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//' | sed 's|^/||'); \
 	if [ -z "$$REPO" ]; then echo "ERROR: repo not configured in proto.yaml"; exit 1; fi; \
+	if [ "$$PROTOCOL" = "https" ]; then \
+		CLONE_URL="https://$$REPO.git"; \
+	else \
+		CLONE_URL="git@$$REPO.git"; \
+	fi; \
 	TMPDIR=$$(mktemp -d); \
-	echo "[pull-proto] Cloning $$REPO @ $$REF ..."; \
-	git clone --depth 1 --branch "$$REF" "$$REPO" "$$TMPDIR" 2>/dev/null || \
-		(echo "ERROR: failed to clone $$REPO @ $$REF"; rm -rf "$$TMPDIR"; exit 1); \
-	mkdir -p "$$TARGET"; \
-	echo "[pull-proto] Copying $$TMPDIR/$$REMOTE_PATH → $$TARGET"; \
-	cp -r "$$TMPDIR/$$REMOTE_PATH"* "$$TARGET/"; \
+	echo "[pull-proto] Cloning $$CLONE_URL @ $$REF ..."; \
+	if [ "$$REF" = "latest" ]; then \
+		git clone --depth 1 "$$CLONE_URL" "$$TMPDIR" 2>/dev/null || \
+			(echo "ERROR: failed to clone $$CLONE_URL"; rm -rf "$$TMPDIR"; exit 1); \
+	else \
+		git clone --depth 1 --branch "$$REF" "$$CLONE_URL" "$$TMPDIR" 2>/dev/null || \
+			(echo "ERROR: failed to clone $$CLONE_URL @ $$REF"; rm -rf "$$TMPDIR"; exit 1); \
+	fi; \
+	mkdir -p desc/; \
+	echo "[pull-proto] Copying $$TMPDIR/$$REMOTE_PATH/desc → desc/"; \
+	cp -r "$$TMPDIR/$$REMOTE_PATH/desc/." "desc/"; \
 	rm -rf "$$TMPDIR"; \
 	echo "[pull-proto] Done. Proto version: $$REF"
 
+.PHONY: push-proto
+push-proto: # Push proto & generated files to proto-repo-main | 将 desc/、pb、client 推送到远端 proto 仓库
+	@if [ ! -f proto.yaml ]; then echo "ERROR: proto.yaml not found"; exit 1; fi
+	@REPO=$$(grep 'repo:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	PROTOCOL=$$(grep 'protocol:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	PROTOCOL=$${PROTOCOL:-ssh}; \
+	REF=$$(grep 'ref:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	REMOTE_PATH=$$(grep 'path:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//' | sed 's|^/||'); \
+	PUSH_BRANCH=$$(grep 'push_branch:' proto.yaml | head -1 | awk '{print $$2}' | sed 's/^"//;s/"$$//'); \
+	if [ -z "$$REPO" ]; then echo "ERROR: repo not configured in proto.yaml"; exit 1; fi; \
+	if [ "$$PROTOCOL" = "https" ]; then \
+		CLONE_URL="https://$$REPO.git"; \
+	else \
+		CLONE_URL="git@$$REPO.git"; \
+	fi; \
+	TMPDIR=$$(mktemp -d); \
+	echo "[push-proto] Cloning $$CLONE_URL ..."; \
+	git clone "$$CLONE_URL" "$$TMPDIR" 2>/dev/null || \
+		(echo "ERROR: failed to clone $$CLONE_URL"; rm -rf "$$TMPDIR"; exit 1); \
+	if [ -n "$$PUSH_BRANCH" ]; then \
+		git -C "$$TMPDIR" checkout "$$PUSH_BRANCH" 2>/dev/null || \
+		git -C "$$TMPDIR" checkout -b "$$PUSH_BRANCH" 2>/dev/null; \
+	fi; \
+	DEST_DESC="$$TMPDIR/$$REMOTE_PATH/desc"; \
+	DEST_ROOT="$$TMPDIR/$$(echo $$REMOTE_PATH | cut -d/ -f1)"; \
+	echo "[push-proto] Syncing desc/ → $$DEST_DESC"; \
+	rm -rf "$$DEST_DESC"; \
+	mkdir -p "$$DEST_DESC"; \
+	cp -r desc/. "$$DEST_DESC/"; \
+	echo "[push-proto] Syncing generated pb & client files → $$DEST_ROOT"; \
+	cp -f $(SERVICE_STYLE).proto "$$DEST_ROOT/" 2>/dev/null || true; \
+	for pkg_dir in types/*/; do \
+		[ -d "$$pkg_dir" ] || continue; \
+		cp -f "$$pkg_dir"*.go "$$DEST_ROOT/" 2>/dev/null || true; \
+	done; \
+	mkdir -p "$$DEST_ROOT/$(SERVICE_CLIENT)"; \
+	cp -f $(SERVICE_CLIENT)/*.go "$$DEST_ROOT/$(SERVICE_CLIENT)/" 2>/dev/null || true; \
+	echo "[push-proto] Rewriting import paths in client files ..."; \
+	GOMOD_NAME=$$(grep '^module ' "$$TMPDIR/go.mod" | awk '{print $$2}'); \
+	LOCAL_MODULE=$$(grep '^module ' go.mod | awk '{print $$2}'); \
+	for f in "$$DEST_ROOT/$(SERVICE_CLIENT)/"*.go; do \
+		[ -f "$$f" ] || continue; \
+		sed -i.bak "s|\"$$LOCAL_MODULE/types/[^\"]*\"|\"$$GOMOD_NAME/$$REMOTE_PATH\"|g" "$$f" && rm -f "$$f.bak"; \
+	done; \
+	cd "$$TMPDIR" && git add -A; \
+	if git diff --cached --quiet; then \
+		echo "[push-proto] Nothing changed, skip push."; \
+	else \
+		COMMIT_MSG="chore($(SERVICE_STYLE)): sync proto @ $$(date '+%%Y-%%m-%%d %%H:%%M:%%S')"; \
+		git -c user.name="proto-bot" -c user.email="proto-bot@local" commit -m "$$COMMIT_MSG"; \
+		git push origin 2>/dev/null || (echo "ERROR: git push failed"; rm -rf "$$TMPDIR"; exit 1); \
+		echo "[push-proto] Pushed. Commit: $$COMMIT_MSG"; \
+	fi; \
+	rm -rf "$$TMPDIR"
+
 .PHONY: gen-rpc
-gen-rpc: # Generate RPC files from proto | 合并 desc/ → 根 proto → protoc → types/
+gen-rpc: check-proto-tools # Generate RPC files from proto | 合并 desc/ → 根 proto → protoc → types/
 	@zctl rpc merge-proto
-	zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE) -I=./proto -I=.
+	zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE) -I=$(TOOLS_INCLUDE) -I=./proto -I=.
+	@$(MAKE) gen-rpc-client
 	@echo "Generate RPC files successfully"
+
+.PHONY: gen-rpc-client
+gen-rpc-client: check-proto-tools # Generate RPC client wrapper via zctl | 通过 zctl 生成客户端 SDK
+	@set -e; \
+	ROOT_DIR="$(CURDIR)"; \
+	TMPDIR=$$(mktemp -d); \
+	WORKDIR="$$TMPDIR/$(SERVICE_STYLE)"; \
+	mkdir -p "$$WORKDIR"; \
+	cp ./$(SERVICE_STYLE).proto "$$WORKDIR/"; \
+	cp -r ./proto "$$WORKDIR/"; \
+	cp -r "$(TOOLS_INCLUDE)" "$$WORKDIR/include"; \
+	cd "$$WORKDIR" && zctl rpc protoc ./$(SERVICE_STYLE).proto --go_out=./types --go-grpc_out=./types --zrpc_out=. --style=$(PROJECT_STYLE) --client --multiple -I=./include -I=./proto -I=. || (rm -rf "$$TMPDIR"; exit 1); \
+	SRC="$$WORKDIR/client/passport/passport.go"; \
+	CLIENT_PKG_DIR=$$(echo $(SERVICE_LOWER) | tr -d '[:punct:]'); \
+	SRC="$$WORKDIR/client/$$CLIENT_PKG_DIR/$$CLIENT_PKG_DIR.go"; \
+	test -f "$$SRC" || (echo "ERROR: zctl client file not generated: $$SRC"; rm -rf "$$TMPDIR"; exit 1); \
+	mkdir -p "$$ROOT_DIR/$(SERVICE_CLIENT)"; \
+	sed 's/^package .*$$/package $(SERVICE_CLIENT)/' "$$SRC" > "$$ROOT_DIR/$(SERVICE_CLIENT)/$(SERVICE_STYLE).go"; \
+	gofmt -w "$$ROOT_DIR/$(SERVICE_CLIENT)/$(SERVICE_STYLE).go"; \
+	rm -rf "$$TMPDIR"; \
+	echo "Generate RPC client successfully"
+
+.PHONY: tools-proto
+tools-proto: # Install project-local proto toolchain | 安装本项目固定版本 proto 工具链
+	@set -e; \
+	mkdir -p "$(TOOLS_BIN)" "$(TOOLS_DIR)/tmp"; \
+	echo "[tools-proto] installing protoc-gen-go $(PROTOC_GEN_GO_VERSION)"; \
+	GOBIN="$(TOOLS_BIN)" $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION); \
+	echo "[tools-proto] installing protoc-gen-go-grpc $(PROTOC_GEN_GO_GRPC_VERSION)"; \
+	GOBIN="$(TOOLS_BIN)" $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION); \
+	OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH=$$(uname -m); \
+	case "$$OS" in \
+		mingw*|msys*|cygwin*) OS=win ;; \
+		darwin*) OS=osx ;; \
+		linux*) OS=linux ;; \
+		*) echo "ERROR: unsupported OS: $$OS"; exit 1 ;; \
+	esac; \
+	if [ "$$OS" = "win" ]; then \
+		case "$$ARCH" in x86_64|amd64) PLATFORM=win64 ;; i686|i386|x86) PLATFORM=win32 ;; *) echo "ERROR: unsupported Windows arch: $$ARCH"; exit 1 ;; esac; \
+	else \
+		case "$$ARCH" in x86_64|amd64) ARCH=x86_64 ;; arm64|aarch64) ARCH=aarch_64 ;; *) echo "ERROR: unsupported arch: $$ARCH"; exit 1 ;; esac; \
+		PLATFORM="$$OS-$$ARCH"; \
+	fi; \
+	ZIP="protoc-$(PROTOC_ZIP_VERSION)-$$PLATFORM.zip"; \
+	URL="https://github.com/protocolbuffers/protobuf/releases/download/v$(PROTOC_ZIP_VERSION)/$$ZIP"; \
+	echo "[tools-proto] downloading $$URL"; \
+	rm -rf "$(TOOLS_DIR)/tmp/protoc"; \
+	mkdir -p "$(TOOLS_DIR)/tmp/protoc"; \
+	if command -v curl >/dev/null 2>&1; then curl -L -o "$(TOOLS_DIR)/tmp/$$ZIP" "$$URL"; else powershell -NoProfile -Command "Invoke-WebRequest -Uri '$$URL' -OutFile '$(TOOLS_DIR)/tmp/$$ZIP'"; fi; \
+	if command -v unzip >/dev/null 2>&1; then unzip -q -o "$(TOOLS_DIR)/tmp/$$ZIP" -d "$(TOOLS_DIR)/tmp/protoc"; else powershell -NoProfile -Command "Expand-Archive -Force '$(TOOLS_DIR)/tmp/$$ZIP' '$(TOOLS_DIR)/tmp/protoc'"; fi; \
+	chmod u+w "$(TOOLS_BIN)/protoc" "$(TOOLS_BIN)/protoc.exe" 2>/dev/null || true; \
+	rm -f "$(TOOLS_BIN)/protoc" "$(TOOLS_BIN)/protoc.exe"; \
+	cp "$(TOOLS_DIR)/tmp/protoc/bin/protoc"* "$(TOOLS_BIN)/"; \
+	rm -rf "$(TOOLS_INCLUDE)"; \
+	cp -r "$(TOOLS_DIR)/tmp/protoc/include" "$(TOOLS_INCLUDE)"; \
+	rm -rf "$(TOOLS_DIR)/tmp"; \
+	$(MAKE) check-proto-tools
+
+.PHONY: check-proto-tools
+check-proto-tools: # Check project-local proto toolchain | 检查本项目固定版本 proto 工具链
+	@command -v protoc >/dev/null || (echo "ERROR: protoc not found. Run: make tools-proto"; exit 1)
+	@command -v protoc-gen-go >/dev/null || (echo "ERROR: protoc-gen-go not found. Run: make tools-proto"; exit 1)
+	@command -v protoc-gen-go-grpc >/dev/null || (echo "ERROR: protoc-gen-go-grpc not found. Run: make tools-proto"; exit 1)
+	@protoc --version | grep -q "libprotoc $(PROTOC_VERSION)" || (echo "ERROR: protoc version mismatch. Need libprotoc $(PROTOC_VERSION), got: $$(protoc --version). Run: make tools-proto"; exit 1)
+	@protoc-gen-go --version | grep -q "$(PROTOC_GEN_GO_VERSION)" || (echo "ERROR: protoc-gen-go version mismatch. Need $(PROTOC_GEN_GO_VERSION), got: $$(protoc-gen-go --version). Run: make tools-proto"; exit 1)
+	@protoc-gen-go-grpc --version | grep -q "$(patsubst v%%,%%,$(PROTOC_GEN_GO_GRPC_VERSION))" || (echo "ERROR: protoc-gen-go-grpc version mismatch. Need $(PROTOC_GEN_GO_GRPC_VERSION), got: $$(protoc-gen-go-grpc --version). Run: make tools-proto"; exit 1)
 
 # ==================== Ent ====================
 
@@ -1523,13 +1670,12 @@ perf-dynamic: # Static + dynamic perf scan | 静态+动态扫描（pprof+慢查�
 		$(if $(pprof-window),--pprof-window=$(pprof-window),)
 
 .PHONY: tools
-tools: # Install the necessary tools | 安装必要的工具
+tools: tools-proto # Install the necessary tools | 安装必要的工具
 	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 	$(GO) install github.com/qqz14/zctl@latest
 	$(GO) install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest
 	$(GO) install github.com/fullstorydev/grpcui/cmd/grpcui@latest
 	$(GO) install github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc@latest
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
 
 .PHONY: health
 health: # Check gRPC health status | 检查 gRPC 健康状态
@@ -1542,7 +1688,7 @@ grpc-list: # List all gRPC services | 列出所有 gRPC 服务
 .PHONY: help
 help: # Show help | 显示帮助
 	@grep -E '^[a-zA-Z0-9 -]+:.*#'  Makefile | sort | while read -r l; do printf "\033[1;32m$$(echo $$l | cut -f 1 -d':')\\033[00m:$$(echo $$l | cut -f 2- -d'#')\\n"; done
-`, svcCamel, svcStyle, svcDir, svcDash, port)
+`, svcCamel, svcStyle, svcLower, svcClient, svcDash, port)
 
 	return writeIfNotExist(filepath.Join(abs, "Makefile"), content)
 }
@@ -1753,10 +1899,10 @@ etc/*.yaml
 func (g *Generator) genProjectReadme(abs, serviceName string, zctx *ZRpcContext) error {
 	// Each placeholder in the template below references one of the four
 	// canonical naming forms — see naming-spec.md.
-	svcStyle := serviceName               // raw user input (file names)
-	svcDir := name.ProtoPkg(serviceName)       // proto pkg / dir name
+	svcStyle := serviceName                      // raw user input (file names)
+	svcDir := name.ProtoPkg(serviceName)         // proto pkg / dir name
 	svcCamel := name.ServiceGoIdent(serviceName) // PascalCase Go ident
-	svcDash := name.DashName(serviceName)      // dash form (K8s svc, docker tag)
+	svcDash := name.DashName(serviceName)        // dash form (K8s svc, docker tag)
 	port := 8080
 	if zctx != nil && zctx.Port > 0 {
 		port = zctx.Port
@@ -2018,14 +2164,14 @@ make gen-ddl name=add_role_cid_to_user_role  # 推荐：语义化命名
 └── %s_client/             # RPC 客户端 SDK
 `+"```"+`
 `, serviceName,
-		svcDir, svcDir,                       // remote-repo subdir paths
-		svcStyle, svcDir, svcDir,             // local-path + remote-subdir + commit-scope
-		svcStyle, svcDir,                     // CI: %s.proto + %s_client/
-		svcDir, svcCamel,                     // grpc-test method = {protoPkg}.{ServiceIdent}/Ping
-		svcCamel, svcDash, port,              // K8s discovery cfg
-		svcCamel, port,                       // direct discovery cfg
-		svcStyle, svcStyle, svcStyle,         // project tree: root dir, root .go, root .proto
-		svcDir)                               // {svcDir}_client/
+		svcDir, svcDir, // remote-repo subdir paths
+		svcStyle, svcDir, svcDir, // local-path + remote-subdir + commit-scope
+		svcStyle, svcDir, // CI: %s.proto + %s_client/
+		svcDir, svcCamel, // grpc-test method = {protoPkg}.{ServiceIdent}/Ping
+		svcCamel, svcDash, port, // K8s discovery cfg
+		svcCamel, port, // direct discovery cfg
+		svcStyle, svcStyle, svcStyle, // project tree: root dir, root .go, root .proto
+		svcDir) // {svcDir}_client/
 
 	return writeIfNotExist(filepath.Join(abs, "README.md"), content)
 }
@@ -2741,7 +2887,7 @@ func (g *Generator) genDescDir(abs, serviceName string) error {
 }
 
 func (g *Generator) genMergeProtoScript(abs, serviceName string) error {
-	svcStyle := serviceName          // file name = user input verbatim
+	svcStyle := serviceName                // file name = user input verbatim
 	protoPkg := name.ProtoPkg(serviceName) // valid proto3 ident (no '-'/'_'/space)
 
 	content := fmt.Sprintf(`#!/bin/bash

@@ -1683,18 +1683,91 @@ func mockBuildReturn(returns string) string {
 		return "\treturn args.Error(0)\n"
 	}
 
-	var items []string
+	// First pass: find error index
+	errIdx := -1
+	for i, p := range parts {
+		if strings.TrimSpace(p) == "error" {
+			errIdx = i
+			break
+		}
+	}
+
+	var buf strings.Builder
+	nonErrIdx := 0
+
 	for i, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "error" {
-			items = append(items, fmt.Sprintf("args.Error(%d)", i))
-		} else if p == "int" || p == "int64" || p == "uint64" || p == "int32" {
-			items = append(items, fmt.Sprintf("args.Get(%d).(%s)", i, p))
+			continue
+		}
+		varName := mockVarNameForIndex(nonErrIdx)
+		zero := mockZeroValForType(p)
+		fmt.Fprintf(&buf, "\t%s, ok := args.Get(%d).(%s)\n", varName, i, p)
+		fmt.Fprintf(&buf, "\tif !ok {\n")
+		var retVals []string
+		for j := range parts {
+			if j == errIdx {
+				retVals = append(retVals, fmt.Sprintf("args.Error(%d)", j))
+			} else if j == i {
+				retVals = append(retVals, zero)
+			} else {
+				retVals = append(retVals, mockZeroValForType(strings.TrimSpace(parts[j])))
+			}
+		}
+		fmt.Fprintf(&buf, "\t\treturn %s\n", strings.Join(retVals, ", "))
+		fmt.Fprintf(&buf, "\t}\n")
+		nonErrIdx++
+	}
+
+	var finalVals []string
+	nonErrIdx = 0
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "error" {
+			finalVals = append(finalVals, fmt.Sprintf("args.Error(%d)", errIdx))
 		} else {
-			items = append(items, fmt.Sprintf("args.Get(%d).(%s)", i, p))
+			finalVals = append(finalVals, mockVarNameForIndex(nonErrIdx))
+			nonErrIdx++
 		}
 	}
-	return fmt.Sprintf("\treturn %s\n", strings.Join(items, ", "))
+	fmt.Fprintf(&buf, "\treturn %s\n", strings.Join(finalVals, ", "))
+
+	return buf.String()
+}
+
+func mockVarNameForIndex(i int) string {
+	switch i {
+	case 0:
+		return "v"
+	case 1:
+		return "n"
+	case 2:
+		return "n2"
+	case 3:
+		return "n3"
+	default:
+		return fmt.Sprintf("v%d", i)
+	}
+}
+
+func mockZeroValForType(t string) string {
+	t = strings.TrimSpace(t)
+	switch {
+	case strings.HasPrefix(t, "*") || strings.HasPrefix(t, "[]"):
+		return "nil"
+	case t == "int" || t == "int8" || t == "int16" || t == "int32" || t == "int64":
+		return "0"
+	case t == "uint" || t == "uint8" || t == "uint16" || t == "uint32" || t == "uint64":
+		return "0"
+	case t == "float32" || t == "float64":
+		return "0"
+	case t == "string":
+		return `""`
+	case t == "bool":
+		return "false"
+	default:
+		return "nil"
+	}
 }
 
 func mockSplitTypes(s string) []string {
