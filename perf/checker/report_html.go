@@ -905,9 +905,71 @@ func renderN1Inline(findings []N1Finding, projectDir string) template.HTML {
 	full := buf.String()
 	style := ""
 	if s := extractBetween(full, "<style>", "</style>"); s != "" {
-		style = "<style>" + s + "</style>\n"
+		// Scope all selectors to .n1-wrap to prevent leaking generic class
+		// names (.tab-panel, .tab-btn, .card, ...) into the parent report.
+		style = "<style>" + scopeCSS(s, ".n1-wrap") + "</style>\n"
 	}
 	return template.HTML(style + extractBetween(full, "<body>", "</body>"))
+}
+
+// scopeCSS rewrites every selector in src so that it only matches descendants
+// of `prefix`. It splits on top-level "}" (rule boundaries) and on "," inside
+// the selector list. Selectors targeting the universal selector "*", "html"
+// or "body" are dropped because they would otherwise affect the whole page.
+func scopeCSS(src, prefix string) string {
+	var out strings.Builder
+	depth := 0
+	start := 0
+	rules := []string{}
+	for i := 0; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				rules = append(rules, src[start:i+1])
+				start = i + 1
+			}
+		}
+	}
+	if start < len(src) {
+		// trailing whitespace / comments — preserve as-is
+		out.WriteString(src[start:])
+	}
+	for _, rule := range rules {
+		brace := strings.Index(rule, "{")
+		if brace < 0 {
+			out.WriteString(rule)
+			continue
+		}
+		selectorPart := strings.TrimSpace(rule[:brace])
+		body := rule[brace:]
+		// Keep at-rules (@media, @keyframes, ...) intact — they wrap nested
+		// rules which our N+1 template does not use, so a flat copy is fine.
+		if strings.HasPrefix(selectorPart, "@") {
+			out.WriteString(rule)
+			continue
+		}
+		var newSelectors []string
+		for _, sel := range strings.Split(selectorPart, ",") {
+			s := strings.TrimSpace(sel)
+			if s == "" {
+				continue
+			}
+			// Drop selectors that would leak to the global page.
+			if s == "*" || s == "html" || s == "body" || s == "html,body" {
+				continue
+			}
+			newSelectors = append(newSelectors, prefix+" "+s)
+		}
+		if len(newSelectors) == 0 {
+			continue
+		}
+		out.WriteString(strings.Join(newSelectors, ","))
+		out.WriteString(body)
+	}
+	return out.String()
 }
 
 func extractBetween(s, open, close string) string {
@@ -1657,7 +1719,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 
 /* ── Main pane ── */
 .main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-.panel{display:none;height:100%;flex-direction:column}
+.panel{display:none;flex:1;min-height:0;flex-direction:column;overflow:hidden}
 .panel.active{display:flex}
 .panel-scroll{overflow-y:auto;padding:20px 24px;flex:1}
 .panel-fullscreen{flex:1;display:flex;flex-direction:column;overflow:hidden}
@@ -1665,12 +1727,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .n1-wrap{flex:1;overflow-y:auto;padding-left:4px}
 
 /* ── Panel header + tabs ── */
-.panel-hdr{padding:12px 24px 0;background:#fff;border-bottom:1px solid #e5e8ee;flex-shrink:0}
+.panel-hdr{padding:12px 24px 0;background:#fff;border-bottom:1px solid #e5e8ee;flex-shrink:0;overflow:hidden;min-width:0}
 .panel-title{font-size:1rem;font-weight:700;margin-bottom:4px}
 .panel-title.fail{color:#c00} .panel-title.warn{color:#9a6000}
 .panel-title.pass{color:#060} .panel-title.info{color:#0055aa} .panel-title.panic{color:#a00a}
 .panel-note{font-size:.8rem;color:#888;margin-bottom:8px}
-.tab-bar{display:flex;gap:0;overflow-x:auto}
+.tab-bar{display:flex;gap:0;overflow-x:auto;scrollbar-width:thin;scrollbar-color:#ccc transparent}
+.tab-bar::-webkit-scrollbar{height:3px}.tab-bar::-webkit-scrollbar-track{background:transparent}.tab-bar::-webkit-scrollbar-thumb{background:#ccc;border-radius:2px}
 .tab-btn{padding:7px 16px;font-size:.85rem;font-weight:600;cursor:pointer;border:none;background:none;color:#999;border-bottom:3px solid transparent;transition:all .12s;white-space:nowrap;flex-shrink:0}
 .tab-btn:hover{color:#333}
 .tab-btn.on{color:#141422;border-bottom-color:#141422}
@@ -1681,8 +1744,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:
 .tab-count{font-size:.7rem;padding:1px 5px;border-radius:8px;margin-left:4px;font-weight:700}
 .tc-fail{background:#fde;color:#c00} .tc-warn{background:#fff3cc;color:#9a6000}
 .tc-pass{background:#dfd;color:#060} .tc-info{background:#e0ecff;color:#0055aa} .tc-panic{background:#f0d0f0;color:#800080}
-.tab-panel{display:none;overflow-y:auto;flex:1;padding:14px 24px 18px}
-.tab-panel.on{display:flex;flex-direction:column}
+.tab-panel{display:none;overflow-y:auto;flex:1;min-height:0;padding:14px 24px 18px}
+.tab-panel.on{display:block}
 .tab-note{font-size:.8rem;color:#888;font-style:italic;padding:6px 0 10px;border-bottom:1px solid #f0f0f0;margin-bottom:10px}
 
 /* ── Overview ── */
