@@ -431,7 +431,7 @@ func (g *Generator) genPkgBizcode(abs, modulePath string) error {
 	content := `package bizcode
 
 // ──── Common error codes ────
-// Codes only. Messages come from i18n (pkg/i18n/locale/{lang}.json → key "bizcode.{code}").
+// Codes only. Messages come from i18n (pkg/i18n/locale/{lang}.json → key "errcode.{code}").
 const (
 	OK            = 0
 	InternalError = 95000
@@ -925,7 +925,8 @@ func DomainInterceptor(localDomain string) grpc.UnaryServerInterceptor {
 	}
 
 	// i18n_interceptor.go — translates business error messages, returns *errcode.Err.
-	// 方案 A（极简版）：只处理业务错（bizCode != 0）的 msg 翻译，其他原样透传。
+	// 方案 A：基于 ErrorInfo.Domain 严格区分本域/跨域错误。
+	// 跨域错（来自下游服务）整体透传，本域错查 i18n 表翻译。
 	i18nInterceptor := fmt.Sprintf(`package middleware
 
 import (
@@ -940,12 +941,35 @@ import (
 
 // I18nInterceptor translates business error messages to the client's language.
 //
-// Scope (方案 A，极简版):
-//   - 只处理 *errcode.Err 且业务错误码非 0（即业务错）的 msg 翻译
-//   - 状态错（statusCode != Unknown）/ 非 errcode 错误 / bizCode == 0 一律原样透传，不动
-//   - 找到 i18n key → 用翻译过的 msg 替换 e.msg（origin 由 Newf 自动保留构造时原文）
-//   - 找不到 i18n key → 透传原 msg（兼容下游服务已翻译的场景）
-func I18nInterceptor() grpc.UnaryServerInterceptor {
+// 方案 A：基于 ErrorInfo.Domain 严格区分本域/跨域错误。
+//
+// 参数：
+//   - localDomain：本服务的 domain（如 "cs-agent-rpc"），由调用方显式传入，
+//     避免硬编码魔数。空串会在初始化时 panic。
+//
+// 拦截器顺序约定（错误回流方向：内 → 外）：
+//
+//	handler → ... → I18n → ... → Domain → GRPCStatus
+//
+// I18n 位于 Domain 的**内层**（先于 Domain 处理错误），因此：
+//   - 本服务原生错进入 I18n 时 e.Domain() == ""（DomainInterceptor 还未盖章）
+//   - 下游 wrap 回来的错进入 I18n 时 e.Domain() == 下游 domain（如 passport）
+//
+// 处理规则：
+//
+//  1. err == nil                                      → 透传
+//  2. 不是 *errcode.Err                               → 透传（LogInterceptor 会强校验并 panic）
+//  3. e.Code() == 0                                   → 状态错/框架错，透传（msg、statusCode 都不动）
+//  4. e.Domain() != "" && e.Domain() != localDomain   → 跨域错（来自下游服务）
+//     msg 已被对端 i18n 拦截器翻译过；statusCode 由调用链保留 ——
+//     本拦截器**整体透传**，绝不触碰 msg/statusCode。
+//  5. 否则（domain == "" 或 domain == localDomain）   → 本域错，按 i18n 表翻译
+//     - 命中：e.WithMsg(translated)（不动 statusCode）
+//     - 未命中：透传 origin（保持 best-effort）
+func I18nInterceptor(localDomain string) grpc.UnaryServerInterceptor {
+	if localDomain == "" {
+		panic("[i18n] I18nInterceptor: localDomain must not be empty")
+	}
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
 		if err == nil {
@@ -957,18 +981,25 @@ func I18nInterceptor() grpc.UnaryServerInterceptor {
 			return nil, err
 		}
 
-		// 仅业务错（bizCode != 0）才走翻译；状态错或 bizCode == 0 透传
+		// 状态错/框架错：透传，不翻译，不动 statusCode/msg
 		if e.Code() == 0 {
 			return nil, err
 		}
 
-		lang := extractLang(ctx)
-		translated := i18n.TranslateErrcode(lang, e.Code())
-		if translated == "" {
-			// 找不到翻译 → 透传原 msg（可能下游已翻译）
+		// 跨域错：来自下游服务，msg/statusCode 都不动，整体透传
+		// 判定口径：domain 非空且不等于 localDomain
+		// （domain == "" 视为本域错：本服务原生 Err 在 DomainInterceptor 盖章前就是空的）
+		if d := e.Domain(); d != "" && d != localDomain {
 			return nil, err
 		}
 
+		// 本域错：查 i18n 表翻译
+		lang := extractLang(ctx)
+		translated := i18n.TranslateErrcode(lang, e.Code())
+		if translated == "" {
+			// 表里没有：透传 origin（保持 best-effort）
+			return nil, err
+		}
 		return nil, e.WithMsg(translated)
 	}
 }
@@ -1266,11 +1297,13 @@ func ValidateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if msg, ok := req.(proto.Message); ok {
 			if err := validator.Validate(msg); err != nil {
+				// 详情仅落日志（i18n 拦截器会把对外 msg 覆盖为统一文案，前端永远只看到
+				// bizcode.95005 的翻译，不暴露字段细节；排查时看这条日志）。
 				logx.WithContext(ctx).Errorw("rpc contract_violation",
 					logx.Field("method", info.FullMethod),
 					logx.Field("detail", err.Error()),
 				)
-				return nil, errcode.Newf(bizcode.ContractViolation, err.Error()).
+				return nil, errcode.Newf(bizcode.ContractViolation, "%%s", err.Error()).
 					WithStatus(codes.InvalidArgument)
 			}
 		}
@@ -1324,7 +1357,7 @@ PROJECT_I18N=true
 
 # Ent enabled features | Ent 启用的官方特性
 # - sql/execquery: 暴露底层 ExecContext/QueryContext，便于自定义裸 SQL
-# - intercept:     启用 Interceptor 机制（cachex 等中间件依赖此特性）
+# - intercept:     启用 Interceptor 机制（便于在 ent 层接入埋点 / 审计 / 软删等横切逻辑）
 # - sql/upsert:    启用 Create.OnConflict / CreateBulk.OnConflict（编译为 INSERT ... ON DUPLICATE KEY UPDATE），
 #                  在 MySQL/OceanBase 下针对所有 UNIQUE KEY 冲突生效，提供原子的幂等写入语义，
 #                  适用于配置同步 / 批量导入去重 / 避免"先 Get 再 Create/Update"的竞态
@@ -1507,17 +1540,29 @@ tools-proto: # Install project-local proto toolchain | 安装本项目固定版�
 	cp "$(TOOLS_DIR)/tmp/protoc/bin/protoc"* "$(TOOLS_BIN)/"; \
 	rm -rf "$(TOOLS_INCLUDE)"; \
 	cp -r "$(TOOLS_DIR)/tmp/protoc/include" "$(TOOLS_INCLUDE)"; \
-	rm -rf "$(TOOLS_DIR)/tmp"; \
-	$(MAKE) check-proto-tools
+	rm -rf "$(TOOLS_DIR)/tmp"
+	@echo "[tools-proto] installed (protoc=$(PROTOC_VERSION), protoc-gen-go=$(PROTOC_GEN_GO_VERSION), protoc-gen-go-grpc=$(PROTOC_GEN_GO_GRPC_VERSION))"
 
+# check-proto-tools 设计：
+#   - 缺工具或版本不匹配时不再 exit 1，而是自动调 tools-proto 拉取并安装。
+#   - 为避免 tools-proto 末尾再回调 check-proto-tools 形成递归，tools-proto 已不再调用 check-proto-tools。
 .PHONY: check-proto-tools
-check-proto-tools: # Check project-local proto toolchain | 检查本项目固定版本 proto 工具链
-	@command -v protoc >/dev/null || (echo "ERROR: protoc not found. Run: make tools-proto"; exit 1)
-	@command -v protoc-gen-go >/dev/null || (echo "ERROR: protoc-gen-go not found. Run: make tools-proto"; exit 1)
-	@command -v protoc-gen-go-grpc >/dev/null || (echo "ERROR: protoc-gen-go-grpc not found. Run: make tools-proto"; exit 1)
-	@protoc --version | grep -q "libprotoc $(PROTOC_VERSION)" || (echo "ERROR: protoc version mismatch. Need libprotoc $(PROTOC_VERSION), got: $$(protoc --version). Run: make tools-proto"; exit 1)
-	@protoc-gen-go --version | grep -q "$(PROTOC_GEN_GO_VERSION)" || (echo "ERROR: protoc-gen-go version mismatch. Need $(PROTOC_GEN_GO_VERSION), got: $$(protoc-gen-go --version). Run: make tools-proto"; exit 1)
-	@protoc-gen-go-grpc --version | grep -q "$(patsubst v%%,%%,$(PROTOC_GEN_GO_GRPC_VERSION))" || (echo "ERROR: protoc-gen-go-grpc version mismatch. Need $(PROTOC_GEN_GO_GRPC_VERSION), got: $$(protoc-gen-go-grpc --version). Run: make tools-proto"; exit 1)
+check-proto-tools: # Check project-local proto toolchain (auto-install if missing/mismatch) | 检查本项目固定版本 proto 工具链（缺失/不匹配会自动安装）
+	@MISMATCH=0; \
+	command -v protoc >/dev/null 2>&1 || MISMATCH=1; \
+	command -v protoc-gen-go >/dev/null 2>&1 || MISMATCH=1; \
+	command -v protoc-gen-go-grpc >/dev/null 2>&1 || MISMATCH=1; \
+	if [ $$MISMATCH -eq 0 ]; then \
+		protoc --version 2>/dev/null | grep -q "libprotoc $(PROTOC_VERSION)" || MISMATCH=1; \
+		protoc-gen-go --version 2>/dev/null | grep -q "$(PROTOC_GEN_GO_VERSION)" || MISMATCH=1; \
+		protoc-gen-go-grpc --version 2>/dev/null | grep -q "$(patsubst v%%,%%,$(PROTOC_GEN_GO_GRPC_VERSION))" || MISMATCH=1; \
+	fi; \
+	if [ $$MISMATCH -ne 0 ]; then \
+		echo "[check-proto-tools] toolchain missing or version mismatch, running 'make tools-proto' ..."; \
+		$(MAKE) --no-print-directory tools-proto; \
+	else \
+		echo "[check-proto-tools] OK (protoc=$(PROTOC_VERSION), protoc-gen-go=$(PROTOC_GEN_GO_VERSION), protoc-gen-go-grpc=$(PROTOC_GEN_GO_GRPC_VERSION))"; \
+	fi
 
 # ==================== Ent ====================
 

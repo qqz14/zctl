@@ -1,6 +1,8 @@
 package generator
 
 import (
+	"fmt"
+	goformat "go/format"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,4 +86,61 @@ func ensureImport(src, importPath string) string {
 	}
 	closeIdx += openIdx
 	return src[:closeIdx] + "\t" + quoted + "\n" + src[closeIdx:]
+}
+
+// ensureNamedImport inserts a named import (alias "path") into the first
+// import block if absent. Idempotent: matches by either the alias-quoted
+// form or the bare path so we never duplicate when the user previously
+// imported the same package without an alias.
+//
+// Used by the REPO sentinel injection where the impl package name
+// `repoimpl` differs from its directory name `impl` and must be made
+// explicit at the import site.
+func ensureNamedImport(src, alias, importPath string) string {
+	quoted := alias + ` "` + importPath + `"`
+	if strings.Contains(src, quoted) {
+		return src
+	}
+	// If the bare import is already present (without alias), upgrade it in-place
+	// so we end up with a single named line — avoids duplicate imports.
+	bare := `"` + importPath + `"`
+	if strings.Contains(src, bare) {
+		return strings.Replace(src, bare, quoted, 1)
+	}
+	openIdx := strings.Index(src, "import (")
+	if openIdx < 0 {
+		return src
+	}
+	closeIdx := strings.Index(src[openIdx:], ")")
+	if closeIdx < 0 {
+		return src
+	}
+	closeIdx += openIdx
+	return src[:closeIdx] + "\t" + quoted + "\n" + src[closeIdx:]
+}
+
+// formatGoSource runs gofmt on a Go source string. On parse failure it
+// returns the raw text plus a stderr warning so the broken output is still
+// inspectable. Used by every generator that emits .go files to guarantee:
+//
+//  1. Output is gofmt-stable: re-running the generator on already-formatted
+//     code is a no-op, which is critical for `git diff` cleanliness when
+//     adding/removing models.
+//  2. Struct-literal field alignment is computed by gofmt itself rather
+//     than by ad-hoc string concatenation. Hand-rolled alignment fights
+//     gofmt the moment the longest identifier in a column changes — that
+//     was the root cause of the unstable DAOS_INIT diffs after adding
+//     IamRolePermissionDao (gofmt's tab-vs-single-space heuristic flipped
+//     when one column outgrew the others).
+//
+// The function intentionally uses the standard library's go/format rather
+// than zero's golang.FormatCode wrapper, to avoid an import cycle from the
+// top-level generator package back into the rpc-specific helper packages.
+func formatGoSource(code, filePath string) string {
+	out, err := goformat.Source([]byte(code))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[zctl] gofmt failed for %s: %v (writing raw)\n", filePath, err)
+		return code
+	}
+	return string(out)
 }

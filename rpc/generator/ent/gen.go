@@ -3,6 +3,11 @@ package ent
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	goformat "go/format"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +16,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/qqz14/zctl/pkg/golang"
 	"github.com/qqz14/zctl/rpc/generator"
+	repogen "github.com/qqz14/zctl/rpc/generator/repo"
 	"github.com/qqz14/zctl/util/ctx"
 	"github.com/qqz14/zctl/util/format"
 	"github.com/qqz14/zctl/util/name"
@@ -332,6 +339,26 @@ func generateSchemaPhaseA(g *GenContext, projectCtx *ctx.ProjectContext, outputD
 	if err = genDaoHook(g, outputDir, modulePath, schema); err != nil {
 		return
 	}
+
+	// 5. Generate repo three-piece set (interface / impl / mock).
+	//
+	// Hard pairing rule: every dao impl that PhaseA emitted gets a paired set
+	// of repo files, even when no method qualifies for caching. The repo
+	// files in that case only contain WithTx; this 1:1 file-level guarantee
+	// makes downstream service_context wiring trivial — we scan dao names
+	// and reuse the same list for repo names without ever drifting.
+	//
+	// Cacheable-method qualification (see repo.GenRepoForSchema doc):
+	//   schema must declare `cid` AND have at least one cid-prefixed
+	//   composite unique index. Otherwise repo files exist but expose only
+	//   WithTx.
+	if err = repogen.GenRepoForSchema(&repogen.GenContext{
+		Output:    outputDir,
+		Module:    modulePath,
+		Overwrite: g.Overwrite,
+	}, schema, fieldMap); err != nil {
+		return
+	}
 	return
 }
 
@@ -609,7 +636,22 @@ var _ dao.%s = (*%s)(nil)
 		methodsCode.String())
 
 	filePath := filepath.Join(dir, modelSnake+"_dao_mock.go")
-	return os.WriteFile(filePath, []byte(content), 0644)
+	return os.WriteFile(filePath, []byte(formatGoOrRaw(content, filePath)), 0644)
+}
+
+// formatGoOrRaw runs gofmt on a Go source string. On parse failure it returns
+// the raw text so the user can still inspect the broken output, plus a stderr
+// warning to aid debugging.
+func formatGoOrRaw(code, filePath string) string {
+	formatted := golang.FormatCode(code)
+	if formatted == code {
+		// FormatCode swallows errors and returns the original — try once more
+		// to surface a useful warning when the source actually fails to parse.
+		if _, err := goformat.Source([]byte(code)); err != nil {
+			fmt.Fprintf(os.Stderr, "[zctl] gofmt failed for %s: %v (writing raw)\n", filePath, err)
+		}
+	}
+	return formatted
 }
 
 // daoMethod holds parsed info about a DAO interface method.
@@ -622,81 +664,116 @@ type daoMethod struct {
 }
 
 // parseDaoMethods reads a DAO interface file and extracts method signatures.
+//
+// Uses go/ast (not line-based scanning) so multi-line method signatures —
+// which gen-dao-sql often produces for methods with many parameters —
+// are handled correctly. The previous implementation mis-parsed lines like
+// ") (*ent.IamAPI, error)" as a separate method named ")".
 func parseDaoMethods(filePath string) ([]daoMethod, error) {
-	content, err := os.ReadFile(filePath)
+	src, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filePath, src, parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
 
 	var methods []daoMethod
-	lines := strings.Split(string(content), "\n")
-	inInterface := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		if strings.Contains(trimmed, "interface {") {
-			inInterface = true
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
 			continue
 		}
-		if inInterface && trimmed == "}" {
-			inInterface = false
-			continue
-		}
-		if !inInterface || trimmed == "" || strings.HasPrefix(trimmed, "//") {
-			continue
-		}
-
-		m, ok := parseMethodLine(trimmed)
-		if ok {
-			methods = append(methods, m)
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			iface, ok := ts.Type.(*ast.InterfaceType)
+			if !ok || iface.Methods == nil {
+				continue
+			}
+			// Only consider Dao interfaces (e.g. IamUserDao). Defensive:
+			// a single .go file usually only declares the one interface.
+			if !strings.HasSuffix(ts.Name.Name, "Dao") {
+				continue
+			}
+			for _, field := range iface.Methods.List {
+				if len(field.Names) == 0 {
+					continue // embedded interface
+				}
+				ftype, ok := field.Type.(*ast.FuncType)
+				if !ok {
+					continue
+				}
+				for _, ident := range field.Names {
+					methods = append(methods, daoMethodFromAST(fset, ident.Name, ftype))
+				}
+			}
 		}
 	}
 
 	return methods, nil
 }
 
-// parseMethodLine parses a single interface method line like:
-//
-//	Create(ctx context.Context, data *ent.User) (*ent.User, error)
-func parseMethodLine(line string) (daoMethod, bool) {
-	// Match: MethodName(params) returnType
-	parenOpen := strings.Index(line, "(")
-	if parenOpen < 0 {
-		return daoMethod{}, false
-	}
-	methodName := strings.TrimSpace(line[:parenOpen])
-
-	// Find matching closing paren for params
-	depth := 0
-	paramEnd := -1
-	for i := parenOpen; i < len(line); i++ {
-		if line[i] == '(' {
-			depth++
-		} else if line[i] == ')' {
-			depth--
-			if depth == 0 {
-				paramEnd = i
-				break
+// daoMethodFromAST builds a daoMethod from a parsed FuncType.
+// Renders parameters and returns through go/printer (preserving complex types
+// like maps, channels, generics) and qualifies dao-local types so the mock
+// file can reference them through the `dao.` package prefix.
+func daoMethodFromAST(fset *token.FileSet, methodName string, ftype *ast.FuncType) daoMethod {
+	var paramParts []string
+	var callArgNames []string
+	autoIdx := 0
+	if ftype.Params != nil {
+		for _, p := range ftype.Params.List {
+			typStr := exprStringEnt(fset, p.Type)
+			typStr = qualifyDaoTypes(typStr)
+			if len(p.Names) == 0 {
+				// Anonymous param: synthesize a name (Foo(string, int) is legal in interfaces).
+				argName := fmt.Sprintf("a%d", autoIdx)
+				autoIdx++
+				paramParts = append(paramParts, fmt.Sprintf("%s %s", argName, typStr))
+				callArgNames = append(callArgNames, argName)
+				continue
 			}
+			var groupNames []string
+			for _, n := range p.Names {
+				groupNames = append(groupNames, n.Name)
+				callArgNames = append(callArgNames, n.Name)
+			}
+			paramParts = append(paramParts,
+				fmt.Sprintf("%s %s", strings.Join(groupNames, ", "), typStr))
 		}
 	}
-	if paramEnd < 0 {
-		return daoMethod{}, false
+	params := strings.Join(paramParts, ", ")
+
+	returns := ""
+	if ftype.Results != nil && len(ftype.Results.List) > 0 {
+		var retTypes []string
+		for _, r := range ftype.Results.List {
+			typStr := exprStringEnt(fset, r.Type)
+			typStr = qualifyDaoTypes(typStr)
+			cnt := len(r.Names)
+			if cnt == 0 {
+				cnt = 1
+			}
+			for i := 0; i < cnt; i++ {
+				retTypes = append(retTypes, typStr)
+			}
+		}
+		switch len(retTypes) {
+		case 0:
+			returns = ""
+		case 1:
+			returns = retTypes[0]
+		default:
+			returns = "(" + strings.Join(retTypes, ", ") + ")"
+		}
 	}
 
-	params := line[parenOpen+1 : paramEnd]
-	returns := strings.TrimSpace(line[paramEnd+1:])
-
-	// Qualify dao-local types (e.g. *IamCIDListFilter → *dao.IamCIDListFilter)
-	// so mock package can reference them correctly.
-	params = qualifyDaoTypes(params)
-	returns = qualifyDaoTypes(returns)
-
-	// Build call args (just the param names, not types)
-	callArgs := extractParamNames(params)
-
-	// Build return statement
+	callArgs := strings.Join(callArgNames, ", ")
 	returnStmt := buildReturnStmt(returns)
 
 	return daoMethod{
@@ -705,27 +782,20 @@ func parseMethodLine(line string) (daoMethod, bool) {
 		Returns:    returns,
 		CallArgs:   callArgs,
 		ReturnStmt: returnStmt,
-	}, true
+	}
 }
 
-// extractParamNames extracts parameter names from a param list.
-// "ctx context.Context, data *ent.User" → "ctx, data"
-func extractParamNames(params string) string {
-	var names []string
-	for _, p := range strings.Split(params, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		// Handle "page, pageSize int" (multiple names sharing a type)
-		parts := strings.Fields(p)
-		if len(parts) >= 1 {
-			// If the first part doesn't contain '.', '[', or '*', it's a name
-			name := parts[0]
-			names = append(names, name)
-		}
+// exprStringEnt prints an ast.Expr as Go source text (uses go/printer).
+// Internal whitespace from multi-line types is collapsed to single spaces.
+func exprStringEnt(fset *token.FileSet, e ast.Expr) string {
+	if e == nil {
+		return ""
 	}
-	return strings.Join(names, ", ")
+	var buf strings.Builder
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(buf.String()), " ")
 }
 
 // buildReturnStmt builds the return statement for a mock method,
@@ -1110,7 +1180,7 @@ func genDaoOceanBaseImpl(g *GenContext, outputDir, modulePath string, schema *lo
 			fmt.Fprintf(&b, "//   - 唯一键冲突且活跃：deleted_at 本就 NULL，ClearDeletedAt 为 no-op，整次操作幂等。\n")
 		}
 		fmt.Fprintf(&b, "//\n")
-		fmt.Fprintf(&b, "// 走 ent OpCreate hook（cachex 据 dirty fields 失效缓存）；ID 由 ent 内部\n")
+		fmt.Fprintf(&b, "// 走 ent OpCreate hook（便于上层挂载 dirty fields 的横切逻辑）；ID 由 ent 内部\n")
 		fmt.Fprintf(&b, "// 通过 LAST_INSERT_ID(id) 技巧回填，无需二次查询。\n")
 		fmt.Fprintf(&b, "func (d *%sOceanBaseDao) Create(ctx context.Context, data *ent.%s) (*ent.%s, error) {\n", entPkg, modelName, modelName)
 		// `now` only when we will explicitly call SetUpdatedAt(now) below.
@@ -1418,7 +1488,7 @@ func genDaoErrcodeAll(outputDir string, schemaNames []string) error {
 	b.WriteString("package bizcode\n\n")
 	b.WriteString("// Code generated by zctl. DO NOT EDIT.\n")
 	b.WriteString("// DAO module error codes — each module gets a 100-code segment.\n")
-	b.WriteString("// Messages come from i18n (pkg/i18n/locale/{lang}.json → key \"bizcode.{code}\").\n\n")
+	b.WriteString("// Messages come from i18n (pkg/i18n/locale/{lang}.json → key \"errcode.{code}\").\n\n")
 
 	// Collect all error code → empty string for i18n
 	var i18nCodes []int

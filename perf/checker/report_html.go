@@ -1491,11 +1491,47 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 .lr-sql-missing{font-size:.78rem;color:#a05000;background:#fff8f0;border:1px dashed #e08000;border-radius:4px;padding:5px 10px;margin-top:3px}
 /* ── Redis block (dark red) ── */
 .lr-redis{background:#1a0a0a;border-radius:5px;padding:7px 12px;font-family:monospace;color:#ffb3b0;font-size:.82rem;white-space:pre;overflow-x:auto;margin-top:3px;border-left:3px solid #c5221f}
+/* ── Top-level summary card ── */
+.lr-summary{display:flex;gap:14px;align-items:stretch;padding:14px 18px;margin-bottom:18px;background:linear-gradient(135deg,#f7f9fc 0%,#eef2f9 100%);border:1px solid #dde3ee;border-radius:10px}
+.lr-sum-cell{flex:1;display:flex;flex-direction:column;gap:4px;padding:8px 14px;background:#fff;border-radius:8px;border:1px solid #e5e9f0}
+.lr-sum-label{font-size:.7rem;font-weight:700;color:#7a8aaa;text-transform:uppercase;letter-spacing:.08em}
+.lr-sum-value{font-size:1.15rem;font-weight:800;font-family:monospace;color:#1a1a3a}
+.lr-sum-db .lr-sum-value{color:#1a56cc}
+.lr-sum-redis .lr-sum-value{color:#c5221f}
+.lr-sum-detail{font-size:.7rem;color:#888;font-family:monospace}
+.lr-sum-note{flex:1.4;font-size:.72rem;color:#5a6a85;line-height:1.55;padding:8px 14px;background:#fff;border-radius:8px;border:1px dashed #d4dae6}
+.lr-sum-note b{color:#1a1a3a}
+.lr-sum-note code{background:#f0f3f8;padding:1px 5px;border-radius:3px;font-family:monospace;font-size:.95em}
+/* ── Loop badge on step ── */
+.lr-loop-badge{font-size:.65rem;font-weight:700;padding:1px 6px;border-radius:3px;background:#fff3e0;color:#b25600;border:1px solid #ffd9a8;flex-shrink:0}
+.lr-loop-badge::before{content:"↻ "}
+.lr-card-loop{background:#fff3e0;color:#b25600;border:1px solid #ffd9a8}
 </style>
 `)
 
 	// Unique prefix to avoid ID collisions when embedded in report.html
 	pfx := "lr"
+
+	// ── Top-level storage summary card ──
+	// Shows aggregate DB / Redis IO trips across all Logic methods.
+	// Format: "static + loop×N + hook" where N denotes loop iteration count.
+	dbDetail := fmt.Sprintf("static %d · loop %d × N · hook %d",
+		r.TotalDBStatic, r.TotalDBLoop, r.TotalDBHook)
+	redisDetail := fmt.Sprintf("static %d · loop %d × N",
+		r.TotalRedisStatic, r.TotalRedisLoop)
+	sb.WriteString(`<div class="lr-summary">`)
+	fmt.Fprintf(&sb,
+		`<div class="lr-sum-cell lr-sum-db"><span class="lr-sum-label">DB 调用总次数</span><span class="lr-sum-value">%s</span><span class="lr-sum-detail">%s</span></div>`,
+		htmlEsc(r.TotalDBSummary), htmlEsc(dbDetail))
+	fmt.Fprintf(&sb,
+		`<div class="lr-sum-cell lr-sum-redis"><span class="lr-sum-label">Redis 调用总次数</span><span class="lr-sum-value">%s</span><span class="lr-sum-detail">%s</span></div>`,
+		htmlEsc(r.TotalRedisSummary), htmlEsc(redisDetail))
+	sb.WriteString(`<div class="lr-sum-note">`)
+	sb.WriteString(`<b>计数规则</b>：每个 ent 终端调用（DAO 方法）= 1 次 DB IO；每个 go-zero Redis 命令 = 1 次 Redis IO。`)
+	sb.WriteString(`<br>循环内调用记为 <code>N×</code>（N 表示该循环每次 Logic 调用的迭代次数，可能因输入而异）。`)
+	sb.WriteString(`<br>ent <b>hook</b> 级联触发的额外 SQL 单独计入 <code>hook</code> 项。`)
+	sb.WriteString(`</div>`)
+	sb.WriteString(`</div>`)
 
 	// Render top-level module tabs (参考 sp-tabs 样式)
 	sb.WriteString(fmt.Sprintf(`<div class="lr-tabs" id="%s-tabs">`, pfx))
@@ -1552,11 +1588,16 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 				}
 
 				sb.WriteString(`<div class="lr-card-badges">`)
-				if m.DBCount > 0 {
-					fmt.Fprintf(&sb, `<span class="lr-badge-db">SQL×%d</span>`, m.DBCount)
+				if m.DBStaticCount > 0 || m.DBLoopCount > 0 || m.DBHookCount > 0 {
+					fmt.Fprintf(&sb, `<span class="lr-badge-db" title="static %d · loop %d×N · hook %d">SQL %s</span>`,
+						m.DBStaticCount, m.DBLoopCount, m.DBHookCount, htmlEsc(m.DBSummary))
 				}
-				if m.RedisCount > 0 {
-					fmt.Fprintf(&sb, `<span class="lr-badge-redis">Redis×%d</span>`, m.RedisCount)
+				if m.RedisStaticCount > 0 || m.RedisLoopCount > 0 {
+					fmt.Fprintf(&sb, `<span class="lr-badge-redis" title="static %d · loop %d×N">Redis %s</span>`,
+						m.RedisStaticCount, m.RedisLoopCount, htmlEsc(m.RedisSummary))
+				}
+				if m.DBLoopCount > 0 || m.RedisLoopCount > 0 {
+					sb.WriteString(`<span class="lr-loop-badge lr-card-loop" title="存在循环内 IO 调用">N+1?</span>`)
 				}
 				sb.WriteString(`</div>`)
 				sb.WriteString(`<span class="lr-card-arrow" id="arr-` + cardID + `">▼</span>`)
@@ -1587,6 +1628,13 @@ func renderLogicReviewInline(r *LogicReviewResult) template.HTML {
 					}
 					if op.Kind == IOKindDB && !op.SQLExact {
 						sb.WriteString(`<span class="lr-inferred">推断</span>`)
+					}
+					if op.InLoop {
+						loopTitle := "在 for/range 循环内 — 每次 Logic 调用执行 N 次"
+						if op.LoopLine > 0 {
+							loopTitle = fmt.Sprintf("循环起始 line:%d — 每次 Logic 调用执行 N 次", op.LoopLine)
+						}
+						fmt.Fprintf(&sb, `<span class="lr-loop-badge" title="%s">×N</span>`, htmlEsc(loopTitle))
 					}
 					// Show call chain (skip first entry = the Logic method itself)
 					if len(op.CallChain) > 1 {

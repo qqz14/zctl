@@ -16,11 +16,19 @@ type ServiceContext struct {
 	// ──── DAOs (auto-registered by zctl rpc ent / rpc dao) ────
 	// <<DAOS_BEGIN>>
 	// <<DAOS_END>>
+
+	// ──── Repos (cache-aware, auto-registered by zctl rpc ent / rpc dao) ────
+	// <<REPOS_BEGIN>>
+	// <<REPOS_END>>
 }
 
 func NewServiceContext(c config.Config) *ServiceContext {
 	// <<ENT_INIT_BEGIN>>
 	// <<ENT_INIT_END>>
+
+	// <<REPO_INFRA_BEGIN>>
+	// <<REPO_INFRA_END>>
+
 	return &ServiceContext{
 		Config: c,
 		// <<ENT_FIELDS_INIT_BEGIN>>
@@ -28,5 +36,11 @@ func NewServiceContext(c config.Config) *ServiceContext {
 
 		// <<DAOS_INIT_BEGIN>>
 		// <<DAOS_INIT_END>>
+
+		// <<REPOS_INIT_BEGIN>>
+		// <<REPOS_INIT_END>>
 	}
 }
+
+// <<REDIS_HELPERS_BEGIN>>
+// <<REDIS_HELPERS_END>>

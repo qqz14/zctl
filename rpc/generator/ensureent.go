@@ -341,6 +341,9 @@ const entxTemplate = `// Package entx provides an ent transaction manager that w
 //	    if _, err := userDao.Create(ctx, ...); err != nil { return err }
 //	    return nil // → commit; non-nil err or panic → rollback
 //	})
+//
+// Also exposes RegisterAfterCommit / InTx so that the repo (cache-aware) layer
+// can defer cache invalidation until after a successful commit.
 package entx
 
 import (
@@ -350,6 +353,14 @@ import (
 	"%[1]s/ent"
 	"%[1]s/pkg/ctxutil"
 )
+
+// afterCommitKey is the ctx key for the after-commit callback queue.
+type afterCommitKey struct{}
+
+// afterCommitBox holds callbacks registered inside a tx; flushed once on commit success.
+type afterCommitBox struct {
+	cbs []func()
+}
 
 // Tx is the transaction manager.
 type Tx struct {
@@ -361,16 +372,43 @@ func New(client *ent.Client) *Tx {
 	return &Tx{client: client}
 }
 
+// InTx reports whether ctx carries an active tx-scope (i.e. inside WithTx).
+// Repo layer uses it to decide between immediate invalidation (no-tx) and
+// deferred invalidation via RegisterAfterCommit (in-tx).
+func InTx(ctx context.Context) bool {
+	_, ok := ctx.Value(afterCommitKey{}).(*afterCommitBox)
+	return ok
+}
+
+// RegisterAfterCommit queues fn to run after the surrounding transaction commits.
+// If ctx is NOT inside a transaction, fn is executed synchronously right away
+// (so callers don't need to branch on InTx for correctness, only for ordering).
+func RegisterAfterCommit(ctx context.Context, fn func()) {
+	if fn == nil {
+		return
+	}
+	if box, ok := ctx.Value(afterCommitKey{}).(*afterCommitBox); ok {
+		box.cbs = append(box.cbs, fn)
+		return
+	}
+	// Not in a tx: run immediately. Panic isolated so caller is never affected.
+	safeRun(ctx, fn)
+}
+
 // WithTx executes fn inside a transaction:
-//   - fn returns nil  ⇒ commit
-//   - fn returns err  ⇒ rollback
-//   - fn panics       ⇒ rollback then re-panic
+//   - fn returns nil  ⇒ commit; after-commit callbacks fire (panic-isolated).
+//   - fn returns err  ⇒ rollback; after-commit callbacks discarded.
+//   - fn panics       ⇒ rollback then re-panic; callbacks discarded.
 func (m *Tx) WithTx(ctx context.Context, fn func(ctx context.Context, tx *ent.Tx) error) (err error) {
 	tx, err := m.client.Tx(ctx)
 	if err != nil {
 		ctxutil.L(ctx).Errorw("entx.Begin failed", ctxutil.ErrField(err))
 		return fmt.Errorf("entx begin: %%w", err)
 	}
+
+	// Inject the after-commit box into ctx so nested calls (repo layer) can register.
+	box := &afterCommitBox{}
+	ctx = context.WithValue(ctx, afterCommitKey{}, box)
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -393,7 +431,24 @@ func (m *Tx) WithTx(ctx context.Context, fn func(ctx context.Context, tx *ent.Tx
 		ctxutil.L(ctx).Errorw("entx.Commit failed", ctxutil.ErrField(err))
 		return fmt.Errorf("entx commit: %%w", err)
 	}
+
+	// Commit succeeded: run after-commit callbacks (each panic-isolated so one
+	// bad invalidation never affects the others or the business response).
+	for _, cb := range box.cbs {
+		safeRun(ctx, cb)
+	}
 	return nil
+}
+
+// safeRun executes fn with panic recovery; failures are logged but never re-thrown.
+func safeRun(ctx context.Context, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			ctxutil.L(ctx).Errorw("entx after-commit callback panic",
+				ctxutil.ErrField(fmt.Errorf("panic: %%v", r)))
+		}
+	}()
+	fn()
 }
 `
 
@@ -404,7 +459,20 @@ func writeEntx(abs, modulePath string) error {
 	}
 	target := filepath.Join(dir, "tx.go")
 	if pathx.FileExists(target) {
-		return nil
+		// Auto-upgrade: older entx templates only ship WithTx. The cache-aware
+		// repo layer needs InTx + RegisterAfterCommit to defer invalidation
+		// until after commit; without them the generated repo code won't compile.
+		// Detect the legacy version (lacks InTx) and overwrite — user customizations
+		// that already added these helpers are left alone.
+		existing, err := os.ReadFile(target)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(existing, []byte("func InTx(")) ||
+			bytes.Contains(existing, []byte("func RegisterAfterCommit(")) {
+			return nil
+		}
+		fmt.Println("[zctl] upgrading internal/dao/entx/tx.go (adds InTx + RegisterAfterCommit for repo cache layer).")
 	}
 	content := fmt.Sprintf(entxTemplate, modulePath)
 	return os.WriteFile(target, []byte(content), 0644)
@@ -412,25 +480,33 @@ func writeEntx(abs, modulePath string) error {
 
 // ─── 3 + 4. service_context.go sentinel patching ───────────────────────────
 
-// patchServiceContext fills six sentinel regions in service_context.go.
-// Each region is filled only if currently empty (i.e. just two adjacent
-// sentinel comments). Already-filled regions are left untouched, so user
-// edits inside the regions are preserved between runs.
+// patchServiceContext fills sentinel regions in service_context.go.
 //
-// Sentinels:
+// Region taxonomy (each is filled exactly once or fully regenerated each run):
 //
-//	// <<ENT_IMPORTS_BEGIN>>      ent/entlog/entx/dialect/driver imports
-//	// <<ENT_IMPORTS_END>>
-//	// <<ENT_FIELDS_BEGIN>>       struct fields: DB *ent.Client, Tx *entx.Tx
-//	// <<ENT_FIELDS_END>>
-//	// <<ENT_INIT_BEGIN>>         dsn + entsql.Open + entlog wrap + migrate
-//	// <<ENT_INIT_END>>
-//	// <<ENT_FIELDS_INIT_BEGIN>>  literal init: DB: entClient, Tx: entx.New(entClient)
-//	// <<ENT_FIELDS_INIT_END>>
-//	// <<DAOS_BEGIN>>             struct fields: UserDao dao.UserDao, ...
-//	// <<DAOS_END>>
-//	// <<DAOS_INIT_BEGIN>>        literal init: UserDao: impl.NewUserOceanBaseDao(entClient), ...
-//	// <<DAOS_INIT_END>>
+//	REGENERATED on each run (mirrors the live dao/_repo file set):
+//	  // <<DAOS_BEGIN>>          struct fields: UserDao dao.UserDao, ...
+//	  // <<DAOS_END>>
+//	  // <<DAOS_INIT_BEGIN>>     literal init: UserDao: impl.NewUserOceanBaseDao(entClient), ...
+//	  // <<DAOS_INIT_END>>
+//	  // <<REPOS_BEGIN>>         struct fields: UserRepo repo.UserRepo, ...
+//	  // <<REPOS_END>>
+//	  // <<REPOS_INIT_BEGIN>>    literal init: UserRepo: repoimpl.NewUserRepo(impl.NewUser…(entClient), repoBase), ...
+//	  // <<REPOS_INIT_END>>
+//
+//	FILLED IF EMPTY (preserves user edits):
+//	  // <<ENT_IMPORTS_BEGIN>>      ent/entlog/entx/dialect/driver imports
+//	  // <<ENT_IMPORTS_END>>
+//	  // <<ENT_FIELDS_BEGIN>>       struct fields: DB *ent.Client, Tx *entx.Tx
+//	  // <<ENT_FIELDS_END>>
+//	  // <<ENT_INIT_BEGIN>>         dsn + entsql.Open + entlog wrap + migrate
+//	  // <<ENT_INIT_END>>
+//	  // <<ENT_FIELDS_INIT_BEGIN>>  literal init: DB: entClient, Tx: entx.New(entClient)
+//	  // <<ENT_FIELDS_INIT_END>>
+//	  // <<REPO_INFRA_BEGIN>>       rds + repoBase (unified; only when repos registered)
+//	  // <<REPO_INFRA_END>>
+//	  // <<REDIS_HELPERS_BEGIN>>    private const node/cluster + newGoZeroRedis(host, hooks...)
+//	  // <<REDIS_HELPERS_END>>
 func patchServiceContext(abs, modulePath string) error {
 	svcFile := filepath.Join(abs, "internal", "svc", "service_context.go")
 	data, err := os.ReadFile(svcFile)
@@ -483,7 +559,135 @@ func patchServiceContext(abs, modulePath string) error {
 		src = ensureImport(src, modulePath+"/internal/dao/impl")
 	}
 
-	return os.WriteFile(svcFile, []byte(src), 0644)
+	// ── 5. REPO regions ──
+	//
+	// Hard 1:1 invariant: the repo name list is derived from daoNames, NOT
+	// scanned independently. Reasons:
+	//   - repogen.GenRepoForSchema guarantees one repo file per dao, so
+	//     scanning would produce the same list twice — using daoNames keeps
+	//     us trivially in sync without an extra read pass.
+	//   - If a repo file ever goes missing (rare; manual deletion), the
+	//     compile error surfaces at the user end rather than silently
+	//     dropping a wire here.
+	var repoFieldBlock, repoInitBlock strings.Builder
+	for _, daoName := range daoNames {
+		modelName := strings.TrimSuffix(daoName, "Dao")
+		repoIface := modelName + "Repo"
+		fmt.Fprintf(&repoFieldBlock, "\t%s repo.%s\n", repoIface, repoIface)
+		// Construct a fresh dao instance per repo. dao impls are stateless
+		// (they hold *ent.Client only), so this duplication is free at
+		// runtime and avoids requiring callers to thread a shared dao var
+		// through both the DAOs literal and the REPOs literal — keeping the
+		// init block textually independent of DAOS_INIT.
+		fmt.Fprintf(&repoInitBlock,
+			"\t\t%s: repoimpl.New%sRepo(impl.New%sOceanBaseDao(entClient), repoBase),\n",
+			repoIface, modelName, modelName)
+	}
+	src = replaceRegion(src, "// <<REPOS_BEGIN>>", "// <<REPOS_END>>", repoFieldBlock.String())
+	src = replaceRegion(src, "// <<REPOS_INIT_BEGIN>>", "// <<REPOS_INIT_END>>", repoInitBlock.String())
+
+	// Inject repo + repoimpl imports and the repo infrastructure only when
+	// at least one dao exists (i.e. the project has gone through PhaseA at
+	// least once). Otherwise we'd be polluting an empty service_context.
+	if len(daoNames) > 0 {
+		src = ensureImport(src, modulePath+"/internal/repo")
+		src = ensureNamedImport(src, "repoimpl", modulePath+"/internal/repo/impl")
+
+		// <<REPO_INFRA>> is the unified sentinel for all repo infrastructure:
+		//   - Redis client (rds)
+		//   - repo.Base (repoBase)
+		//   - newGoZeroRedis helper function
+		//
+		// These were previously 3 separate sentinels (RDB_INIT + REPO_BASE +
+		// REDIS_HELPERS). They are now unified into one: only registered once,
+		// and only when repos exist. For backward compat, we still support
+		// the legacy separate sentinels if they exist in the file.
+		if strings.Contains(src, "<<REPO_INFRA_BEGIN>>") {
+			// New unified sentinel (rds + repoBase in one block).
+			src = fillIfEmpty(src, "// <<REPO_INFRA_BEGIN>>", "// <<REPO_INFRA_END>>",
+				repoInfraBlock())
+		} else {
+			// Legacy: fill old sentinels individually if they still exist.
+			src = fillIfEmpty(src, "// <<RDB_INIT_BEGIN>>", "// <<RDB_INIT_END>>",
+				"\trds := newGoZeroRedis(c.RedisConf.Host, _zctlRedisHooks...)\n")
+			src = fillIfEmpty(src, "// <<REPO_BASE_BEGIN>>", "// <<REPO_BASE_END>>",
+				"\trepoBase := repo.NewBase(rds, 0, 0, 0)\n")
+		}
+		// REDIS_HELPERS is always at file scope — fill regardless of which sentinel style.
+		src = fillIfEmpty(src, "// <<REDIS_HELPERS_BEGIN>>", "// <<REDIS_HELPERS_END>>",
+			redisHelpersBlock())
+
+		// Imports needed by repo infra:
+		src = ensureImport(src, "strings")
+		src = ensureNamedImport(src, "goredis", "github.com/zeromicro/go-zero/core/stores/redis")
+	}
+
+	// gofmt the patched source before writing. Two reasons:
+	//   1. The DAO/REPO sentinel regions are emitted as plain `\t\t Field:
+	//      value,\n` lines. gofmt computes struct-literal field alignment
+	//      (single-space vs tab-padded) by looking at the WHOLE block —
+	//      hand-rolled alignment is unstable across model add/remove.
+	//   2. End-state must be byte-stable when re-run against an already-
+	//      formatted file, otherwise `git diff` after `make gen-rpc-ent-logic`
+	//      shows phantom whitespace churn.
+	formatted := formatGoSource(src, svcFile)
+	if err := os.WriteFile(svcFile, []byte(formatted), 0644); err != nil {
+		return err
+	}
+
+	// 与 svc 一起生成 zctl_hooks.go：
+	//   - service_context.go 中通过 newGoZeroRedis(c.RedisConf.Host, _zctlRedisHooks...)
+	//     注入 zctl-perf 的 Redis hook 列表；
+	//   - 该列表的定义文件（zctl_hooks.go）必须随 svc 同步存在，否则编译报
+	//     undefined: _zctlRedisHooks。
+	//   - 文件幂等：已存在则跳过；不存在则一次性写入，prod 下零开销（默认 nil）。
+	if len(daoNames) > 0 {
+		if err := ensureZctlRedisHooksFile(abs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureZctlRedisHooksFile 在 internal/svc 目录下幂等地生成 zctl_hooks.go。
+//
+// 生成结果（与 zctl perf 工具的 InjectRedisHookFile 输出保持一致）：
+//
+//	package svc
+//
+//	import goredis "github.com/zeromicro/go-zero/core/stores/redis"
+//
+//	// _zctlRedisHooks is the zctl perf injection point. Default nil — zero prod overhead.
+//	var _zctlRedisHooks []goredis.Option
+//
+//	// ZctlInjectRedisHook sets a Redis hook for zctl probe only.
+//	func ZctlInjectRedisHook(hook goredis.Option) {
+//		_zctlRedisHooks = append(_zctlRedisHooks, hook)
+//	}
+//
+// 幂等：文件存在且包含 ZctlInjectRedisHook 则不动；否则原子写入。
+func ensureZctlRedisHooksFile(abs string) error {
+	hooksFile := filepath.Join(abs, "internal", "svc", "zctl_hooks.go")
+	if data, err := os.ReadFile(hooksFile); err == nil {
+		if strings.Contains(string(data), "ZctlInjectRedisHook") {
+			return nil
+		}
+	}
+	content := `package svc
+
+import goredis "github.com/zeromicro/go-zero/core/stores/redis"
+
+// _zctlRedisHooks 是 zctl perf 工具注入 Redis hook 的位置。
+// 生产环境保持 nil（零开销）；只有 zctl perf 探针程序会调用 ZctlInjectRedisHook 注册 hook。
+var _zctlRedisHooks []goredis.Option
+
+// ZctlInjectRedisHook 仅供 zctl perf 探针程序调用，用于注册 Redis 命令捕获 hook。
+// 业务代码不应调用本函数。
+func ZctlInjectRedisHook(hook goredis.Option) {
+	_zctlRedisHooks = append(_zctlRedisHooks, hook)
+}
+`
+	return os.WriteFile(hooksFile, []byte(content), 0644)
 }
 
 func entInitBlock() string {
@@ -525,6 +729,64 @@ func entImportsBlock(modulePath string) string {
 
 	_ "github.com/go-sql-driver/mysql"
 `, modulePath, modulePath, modulePath, modulePath)
+}
+
+// repoInfraBlock renders the unified repo infrastructure block that combines
+// RDB_INIT + REPO_BASE + REDIS_HELPERS into a single region.
+func repoInfraBlock() string {
+	return `	rds := newGoZeroRedis(c.RedisConf.Host, _zctlRedisHooks...)
+	repoBase := repo.NewBase(rds, 0, 0, 0)
+`
+}
+
+// redisHelpersBlock renders the file-scope redis helper plus its node/cluster
+// constants. Two design choices worth pinning down:
+//
+//  1. Why it's a HELPER (not inlined into RDB_INIT)?
+//     The single-vs-cluster decision is one branch on host.Contains(","),
+//     plus three string literals ("node" / "cluster" / RedisConf field).
+//     Inlining duplicates the literals at every site that needs a redis
+//     client (today: rds for repoBase; tomorrow: asynq / locks / others).
+//     Having one helper keeps the magic-strings to a single function body.
+//
+//  2. Why "node" / "cluster" are private consts inside this svc package
+//     rather than imported from go-zero?
+//     go-zero's RedisConf.Type field accepts plain string and the package
+//     does NOT export named constants for the values (verified on go-zero
+//     v1.x). Defining them as package-private consts at the only site that
+//     constructs the conf is the closest-to-source-of-truth solution
+//     without forking go-zero.
+//
+// The hooks varadic threads zctl-perf hooks (project-local
+// _zctlRedisHooks []goredis.Option declared in zctl_hooks.go) through to
+// MustNewRedis. Production builds pass nil (zero overhead).
+func redisHelpersBlock() string {
+	return `// redisType<Node|Cluster> are go-zero RedisConf.Type values. Go-zero does
+// not export named constants for these, so we keep them private here as the
+// single source of truth for this svc package.
+const (
+	redisTypeNode    = "node"
+	redisTypeCluster = "cluster"
+)
+
+// newGoZeroRedis builds a *goredis.Redis whose deployment shape adapts to
+// the host string:
+//
+//   - single-node:  "10.0.0.1:6379"                 → Type=node
+//   - cluster:      "10.0.0.1:6379,10.0.0.2:6379"   → Type=cluster
+//
+// hooks are zctl-perf instrumentation; nil-safe in production.
+func newGoZeroRedis(host string, hooks ...goredis.Option) *goredis.Redis {
+	redisType := redisTypeNode
+	if strings.Contains(host, ",") {
+		redisType = redisTypeCluster
+	}
+	return goredis.MustNewRedis(goredis.RedisConf{
+		Host: host,
+		Type: redisType,
+	}, hooks...)
+}
+`
 }
 
 // ─── sentinel helpers ───────────────────────────────────────────────────────

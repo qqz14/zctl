@@ -57,6 +57,14 @@ type IONode struct {
 
 	// Snippet: source code lines surrounding this call (for HTML display)
 	Snippet []SourceLine
+
+	// InLoop reports whether this call site lies inside a for/range loop body
+	// (anywhere along the call chain's caller file). When true, each invocation
+	// represents N executions per Logic call.
+	InLoop bool
+	// LoopLine is the line number of the enclosing for/range keyword (best effort,
+	// innermost loop wins). 0 when InLoop is false.
+	LoopLine int
 }
 
 // ── Logic Review result types ─────────────────────────────────────────────────
@@ -72,13 +80,39 @@ type LogicReviewMethod struct {
 	LogicLine  int    // line number of the Logic method definition
 	Signature  string // proto-style signature, e.g. "UpdateAPI(in *passport.UpdateAPIReq) (*passport.Empty, error)"
 	Ops        []IONode
-	DBCount    int
-	RedisCount int
+
+	// Counts. Each IO op = one IO trip.
+	// "Static" = call site NOT inside any for/range loop.
+	// "Loop"   = call site inside a for/range loop (each represents N executions).
+	// "Hook"   = additional SQL triggered by ent hooks on a mutation op (one per HookSQL).
+	DBCount        int // total DB ops = static + loop (does not include hook cascades)
+	DBStaticCount  int
+	DBLoopCount    int
+	DBHookCount    int // total hook-cascade SQL statements
+	RedisCount     int
+	RedisStaticCount int
+	RedisLoopCount   int
+
+	// Pretty-formatted strings ready for HTML, e.g. "3", "2 + 1×N", "5 + 2×N + 3 hook"
+	DBSummary    string
+	RedisSummary string
 }
 
 // LogicReviewResult holds all logic methods.
 type LogicReviewResult struct {
 	Methods []LogicReviewMethod
+
+	// Aggregated totals across all Logic methods (for top-level summary card).
+	TotalDB        int
+	TotalDBStatic  int
+	TotalDBLoop    int
+	TotalDBHook    int
+	TotalRedis     int
+	TotalRedisStatic int
+	TotalRedisLoop   int
+
+	TotalDBSummary    string
+	TotalRedisSummary string
 }
 
 var lastLogicReviewResult *LogicReviewResult
@@ -100,7 +134,6 @@ func RunLogicReview(cgCache *CallGraphCache) *Result {
 	}
 
 	result := &LogicReviewResult{}
-	totalDB, totalRedis := 0, 0
 
 	for _, e := range entries {
 		ops := cgCache.IOForLogic(IOKey(e)) // O(1) map lookup
@@ -122,14 +155,37 @@ func RunLogicReview(cgCache *CallGraphCache) *Result {
 		for _, op := range ops {
 			if op.Kind == IOKindDB {
 				lm.DBCount++
-				totalDB++
+				if op.InLoop {
+					lm.DBLoopCount++
+				} else {
+					lm.DBStaticCount++
+				}
+				lm.DBHookCount += len(op.HookSQLs)
 			} else {
 				lm.RedisCount++
-				totalRedis++
+				if op.InLoop {
+					lm.RedisLoopCount++
+				} else {
+					lm.RedisStaticCount++
+				}
 			}
 		}
+		lm.DBSummary = formatIOSummary(lm.DBStaticCount, lm.DBLoopCount, lm.DBHookCount)
+		lm.RedisSummary = formatIOSummary(lm.RedisStaticCount, lm.RedisLoopCount, 0)
+
+		result.TotalDB += lm.DBCount
+		result.TotalDBStatic += lm.DBStaticCount
+		result.TotalDBLoop += lm.DBLoopCount
+		result.TotalDBHook += lm.DBHookCount
+		result.TotalRedis += lm.RedisCount
+		result.TotalRedisStatic += lm.RedisStaticCount
+		result.TotalRedisLoop += lm.RedisLoopCount
+
 		result.Methods = append(result.Methods, lm)
 	}
+
+	result.TotalDBSummary = formatIOSummary(result.TotalDBStatic, result.TotalDBLoop, result.TotalDBHook)
+	result.TotalRedisSummary = formatIOSummary(result.TotalRedisStatic, result.TotalRedisLoop, 0)
 
 	lastLogicReviewResult = result
 
@@ -139,16 +195,48 @@ func RunLogicReview(cgCache *CallGraphCache) *Result {
 
 	var issues []string
 	for _, m := range result.Methods {
-		issues = append(issues, fmt.Sprintf("%s.%s DB×%d Redis×%d",
-			m.TypeName, m.Method, m.DBCount, m.RedisCount))
+		issues = append(issues, fmt.Sprintf("%s.%s DB=%s Redis=%s",
+			m.TypeName, m.Method, m.DBSummary, m.RedisSummary))
 	}
 
 	return &Result{
 		Level: LevelInfo,
-		Summary: fmt.Sprintf("logic review: %d methods, DB×%d Redis×%d",
-			len(result.Methods), totalDB, totalRedis),
+		Summary: fmt.Sprintf("logic review: %d methods, DB=%s Redis=%s",
+			len(result.Methods), result.TotalDBSummary, result.TotalRedisSummary),
 		Issues: issues,
 	}
+}
+
+// formatIOSummary renders counts into a compact human-readable string.
+//
+// Examples:
+//
+//	formatIOSummary(3, 0, 0) → "3"
+//	formatIOSummary(2, 1, 0) → "2 + 1×N"
+//	formatIOSummary(0, 2, 0) → "2×N"
+//	formatIOSummary(3, 1, 2) → "3 + 1×N + 2 hook"
+//	formatIOSummary(0, 0, 0) → "0"
+//
+// N denotes the loop iteration count (one per call site, may differ between sites).
+func formatIOSummary(staticCnt, loopCnt, hookCnt int) string {
+	if staticCnt == 0 && loopCnt == 0 && hookCnt == 0 {
+		return "0"
+	}
+	var parts []string
+	if staticCnt > 0 {
+		parts = append(parts, fmt.Sprintf("%d", staticCnt))
+	}
+	if loopCnt > 0 {
+		if loopCnt == 1 {
+			parts = append(parts, "N")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d×N", loopCnt))
+		}
+	}
+	if hookCnt > 0 {
+		parts = append(parts, fmt.Sprintf("%d hook", hookCnt))
+	}
+	return strings.Join(parts, " + ")
 }
 
 

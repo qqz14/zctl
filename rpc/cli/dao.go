@@ -3,6 +3,11 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	goformat "go/format"
+	"go/parser"
+	"go/printer"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,6 +16,7 @@ import (
 	"entgo.io/ent/entc"
 	"entgo.io/ent/entc/gen"
 
+	"github.com/qqz14/zctl/pkg/golang"
 	"github.com/qqz14/zctl/rpc/generator"
 	entgen "github.com/qqz14/zctl/rpc/generator/ent"
 	"github.com/qqz14/zctl/util/ctx"
@@ -1564,7 +1570,16 @@ var _ dao.%s = (*%s)(nil)
 		methodsCode.String())
 
 	mockFile := filepath.Join(mockDir, modelSnake+"_dao_mock.go")
-	if err := os.WriteFile(mockFile, []byte(content), 0644); err != nil {
+	// gofmt the generated source — keeps multi-line signatures, alignment,
+	// and import blocks tidy. On parse failure we still write the raw text
+	// (with a stderr warning) so the user can inspect the output.
+	formatted := golang.FormatCode(content)
+	if formatted == content {
+		if _, ferr := goformat.Source([]byte(content)); ferr != nil {
+			fmt.Fprintf(os.Stderr, "[zctl] gofmt failed for %s: %v (writing raw)\n", mockFile, ferr)
+		}
+	}
+	if err := os.WriteFile(mockFile, []byte(formatted), 0644); err != nil {
 		fmt.Printf("  ⚠ Failed to write mock: %v\n", err)
 		return
 	}
@@ -1579,96 +1594,140 @@ type mockMethodInfo struct {
 	returnStmt string
 }
 
-// parseMockMethods reads a DAO interface file and extracts method signatures for mock generation.
+// parseMockMethods reads a DAO interface file and extracts method signatures
+// for mock generation. Uses go/ast so that multi-line method signatures
+// (parameters or returns spread across lines) are handled correctly —
+// the previous line-based scanner mis-parsed lines like ") (*ent.IamAPI, error)"
+// as a method named ")".
 func parseMockMethods(filePath string) ([]mockMethodInfo, error) {
-	content, err := os.ReadFile(filePath)
+	src, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filePath, src, parser.ParseComments)
 	if err != nil {
 		return nil, err
 	}
 
 	var methods []mockMethodInfo
-	lines := strings.Split(string(content), "\n")
-	inInterface := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.Contains(trimmed, "interface {") {
-			inInterface = true
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
 			continue
 		}
-		if inInterface && trimmed == "}" {
-			break
-		}
-		if !inInterface || trimmed == "" || strings.HasPrefix(trimmed, "//") {
-			continue
-		}
-
-		m, ok := parseMockMethodLine(trimmed)
-		if ok {
-			methods = append(methods, m)
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			iface, ok := ts.Type.(*ast.InterfaceType)
+			if !ok || iface.Methods == nil {
+				continue
+			}
+			// Only consider Dao interfaces — defensive (file may declare more types).
+			if !strings.HasSuffix(ts.Name.Name, "Dao") {
+				continue
+			}
+			for _, field := range iface.Methods.List {
+				if len(field.Names) == 0 {
+					continue // embedded interface — skip
+				}
+				ftype, ok := field.Type.(*ast.FuncType)
+				if !ok {
+					continue
+				}
+				for _, nameIdent := range field.Names {
+					m := mockMethodFromAST(fset, nameIdent.Name, ftype)
+					methods = append(methods, m)
+				}
+			}
 		}
 	}
 
 	return methods, nil
 }
 
-func parseMockMethodLine(line string) (mockMethodInfo, bool) {
-	parenOpen := strings.Index(line, "(")
-	if parenOpen < 0 {
-		return mockMethodInfo{}, false
-	}
-	methodName := strings.TrimSpace(line[:parenOpen])
-
-	// Find matching closing paren
-	depth := 0
-	paramEnd := -1
-	for i := parenOpen; i < len(line); i++ {
-		if line[i] == '(' {
-			depth++
-		} else if line[i] == ')' {
-			depth--
-			if depth == 0 {
-				paramEnd = i
-				break
+// mockMethodFromAST builds a mockMethodInfo from an ast.FuncType.
+func mockMethodFromAST(fset *token.FileSet, name string, ftype *ast.FuncType) mockMethodInfo {
+	// Render parameter list — keep names so callArgs can be derived.
+	var paramParts []string
+	var callArgNames []string
+	autoIdx := 0
+	if ftype.Params != nil {
+		for _, p := range ftype.Params.List {
+			typStr := exprString(fset, p.Type)
+			// Qualify dao-local types for mock package (e.g. *IamCIDListFilter → *dao.IamCIDListFilter)
+			typStr = entgen.QualifyDaoTypes(typStr)
+			if len(p.Names) == 0 {
+				// Anonymous param — synthesize a name so the mock body is valid Go.
+				argName := fmt.Sprintf("a%d", autoIdx)
+				autoIdx++
+				paramParts = append(paramParts, fmt.Sprintf("%s %s", argName, typStr))
+				callArgNames = append(callArgNames, argName)
+				continue
 			}
+			var groupNames []string
+			for _, n := range p.Names {
+				groupNames = append(groupNames, n.Name)
+				callArgNames = append(callArgNames, n.Name)
+			}
+			paramParts = append(paramParts,
+				fmt.Sprintf("%s %s", strings.Join(groupNames, ", "), typStr))
 		}
 	}
-	if paramEnd < 0 {
-		return mockMethodInfo{}, false
+	params := strings.Join(paramParts, ", ")
+
+	// Render results — preserve original (T) vs (T, error) shape.
+	returns := ""
+	if ftype.Results != nil && len(ftype.Results.List) > 0 {
+		var retTypes []string
+		for _, r := range ftype.Results.List {
+			typStr := exprString(fset, r.Type)
+			typStr = entgen.QualifyDaoTypes(typStr)
+			// Named returns (rare in interfaces) — collapse to type only.
+			count := len(r.Names)
+			if count == 0 {
+				count = 1
+			}
+			for i := 0; i < count; i++ {
+				retTypes = append(retTypes, typStr)
+			}
+		}
+		switch len(retTypes) {
+		case 0:
+			returns = ""
+		case 1:
+			returns = retTypes[0]
+		default:
+			returns = "(" + strings.Join(retTypes, ", ") + ")"
+		}
 	}
 
-	params := line[parenOpen+1 : paramEnd]
-	returns := strings.TrimSpace(line[paramEnd+1:])
-
-	// Qualify dao-local types for mock package (e.g. *IamCIDListFilter → *dao.IamCIDListFilter)
-	params = entgen.QualifyDaoTypes(params)
-	returns = entgen.QualifyDaoTypes(returns)
-
-	callArgs := mockExtractParamNames(params)
+	callArgs := strings.Join(callArgNames, ", ")
 	returnStmt := mockBuildReturn(returns)
 
 	return mockMethodInfo{
-		name:       methodName,
+		name:       name,
 		params:     params,
 		returns:    returns,
 		callArgs:   callArgs,
 		returnStmt: returnStmt,
-	}, true
+	}
 }
 
-func mockExtractParamNames(params string) string {
-	var names []string
-	for _, p := range strings.Split(params, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		parts := strings.Fields(p)
-		if len(parts) >= 1 {
-			names = append(names, parts[0])
-		}
+// exprString renders an ast.Expr back to Go source text using go/printer,
+// which preserves complex types (channels, generics, maps) faithfully.
+func exprString(fset *token.FileSet, e ast.Expr) string {
+	if e == nil {
+		return ""
 	}
-	return strings.Join(names, ", ")
+	var buf strings.Builder
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return ""
+	}
+	// Collapse any internal whitespace/newlines that came from multi-line types.
+	return strings.Join(strings.Fields(buf.String()), " ")
 }
 
 func mockBuildReturn(returns string) string {

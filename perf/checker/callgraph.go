@@ -103,6 +103,10 @@ type CallGraphCache struct {
 	// ttlFuncCache: method/function name → default int value from function body.
 	// e.g. "simulatedLoginTTLSeconds" → "600"  (from positiveOrDefaultInt(config, 600))
 	ttlFuncCache map[string]string
+
+	// loopIdx: project-wide for/range loop body line ranges per file.
+	// Used to mark IONode.InLoop when a DB/Redis call site lies inside a loop body.
+	loopIdx *LoopIndex
 }
 
 // BuildCallGraph loads the project, builds SSA + CHA call graph, and pre-computes
@@ -168,6 +172,9 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 	// Scan pkg/ and internal/ for Redis key functions and TTL constants/methods
 	keyFuncCache, ttlConstCache, ttlFuncCache := buildRedisKeyCache(dir)
 
+	// Build for/range loop index — used to mark IO calls inside loops as N×.
+	loopIdx := buildLoopIndex(dir)
+
 	cache := &CallGraphCache{
 		prog:          prog,
 		cg:            cg,
@@ -180,6 +187,7 @@ func BuildCallGraph(dir string) (*CallGraphCache, error) {
 		keyFuncCache:  keyFuncCache,
 		ttlConstCache: ttlConstCache,
 		ttlFuncCache:  ttlFuncCache,
+		loopIdx:       loopIdx,
 		daoByMethod:   make(map[string][]daoImplFunc),
 		logicIOByKey:  make(map[string][]IONode),
 	}
@@ -396,6 +404,9 @@ func (c *CallGraphCache) classifyCall(
 	lower := strings.ToLower(typeName)
 	short := shortPath(file)
 
+	// Detect whether this call site is inside a for/range loop in the caller file.
+	loopLine, inLoop := c.loopIdx.IsInLoop(file, line)
+
 	// ── Redis ──
 	if strings.Contains(lower, "redis") && isRedisVerb(method) {
 		keyHint, ttlHint := c.extractRedisArgsFromCallSite(file, line, method)
@@ -412,6 +423,8 @@ func (c *CallGraphCache) classifyCall(
 			RedisKeyHint: keyHint,
 			RedisTTLHint: ttlHint,
 			Snippet:      snippet,
+			InLoop:       inLoop,
+			LoopLine:     loopLine,
 		}, true
 	}
 
@@ -433,6 +446,8 @@ func (c *CallGraphCache) classifyCall(
 		SQL: sql, SQLExact: exact,
 		HookSQLs: hookSQLs,
 		Snippet:  snippet,
+		InLoop:   inLoop,
+		LoopLine: loopLine,
 	}, true
 }
 
