@@ -1544,25 +1544,24 @@ func appendI18nEntries(outputDir string, codes []int) error {
 	return nil
 }
 
-// mergeI18nCodes reads a locale JSON file, adds missing bizcode keys with empty
+// mergeI18nCodes reads a locale JSON file, adds missing errcode keys with empty
 // values, and writes it back with stable formatting.
+// Existing keys are never removed, only added. Keys are sorted alphabetically.
 func mergeI18nCodes(filePath string, codes []int) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
 	}
 
-	// Simple JSON parse: we expect {"bizcode": {"key": "val", ...}, ...}
-	// Use encoding/json for safety
 	var root map[string]map[string]string
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil // malformed JSON, skip
 	}
 
-	errSection, ok := root["bizcode"]
+	errSection, ok := root["errcode"]
 	if !ok {
 		errSection = make(map[string]string)
-		root["bizcode"] = errSection
+		root["errcode"] = errSection
 	}
 
 	changed := false
@@ -1574,16 +1573,34 @@ func mergeI18nCodes(filePath string, codes []int) error {
 		}
 	}
 
+	if _, hasBizcode := root["bizcode"]; hasBizcode {
+		changed = true
+	}
+
 	if !changed {
 		return nil
 	}
 
-	// Write back with indentation
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return err
+	keys := make([]string, 0, len(errSection))
+	for k := range errSection {
+		keys = append(keys, k)
 	}
-	return os.WriteFile(filePath, append(out, '\n'), 0644)
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString("{\n")
+	b.WriteString("  \"errcode\": {\n")
+	for i, k := range keys {
+		b.WriteString(fmt.Sprintf("    \"%s\": %q", k, errSection[k]))
+		if i < len(keys)-1 {
+			b.WriteString(",")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("  }\n")
+	b.WriteString("}\n")
+
+	return os.WriteFile(filePath, []byte(b.String()), 0644)
 }
 
 // ==================== Module Model (placeholder) ====================

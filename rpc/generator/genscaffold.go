@@ -418,7 +418,7 @@ func extractBizDetail(st *status.Status) (int, string, bool) {
 // ==================== pkg/bizcode ====================
 //
 // pkg/bizcode 仅放业务错误码常量（int），消息文案统一交给 pkg/i18n
-// （locale/{lang}.json → key "bizcode.{code}"）。
+// （locale/{lang}.json → key "errcode.{code}"）。
 // 业务侧通过 errcode.Newf(bizcode.XXX, "...") 构造业务错误。
 
 func (g *Generator) genPkgBizcode(abs, modulePath string) error {
