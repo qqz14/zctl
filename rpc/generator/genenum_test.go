@@ -1,6 +1,12 @@
 package generator
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
 
 func TestToSnake(t *testing.T) {
 	tests := []struct {
@@ -45,5 +51,68 @@ func TestToScreamingSnake(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("toScreamingSnake(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestParseProtoEnumsIgnoresOptionBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.proto")
+	content := `syntax = "proto3";
+
+enum Status {
+  option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_enum) = {
+    description: "Status description."
+  };
+  STATUS_UNSPECIFIED = 0;
+  STATUS_OPEN = 1;
+}
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parseProtoEnums(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []protoEnum{{
+		Name: "Status",
+		Values: []protoEnumValue{
+			{Name: "unspecified", Number: 0},
+			{Name: "open", Number: 1},
+		},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseProtoEnums() = %#v, want %#v", got, want)
+	}
+}
+
+func TestGenEnumsFromProtoPreservesNumericValues(t *testing.T) {
+	projectDir := t.TempDir()
+	descDir := filepath.Join(projectDir, "desc")
+	if err := os.MkdirAll(descDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	content := `syntax = "proto3";
+
+enum MemberStatus {
+  MEMBER_STATUS_UNSPECIFIED = 0;
+  MEMBER_STATUS_ACTIVE = 1;
+  MEMBER_STATUS_LEFT = 10;
+}
+`
+	if err := os.WriteFile(filepath.Join(descDir, "common.proto"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := GenEnumsFromProto(projectDir); err != nil {
+		t.Fatal(err)
+	}
+	generated, err := os.ReadFile(filepath.Join(projectDir, "pkg", "enums", "member_status.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(generated), "MemberStatusLeft MemberStatus = 10") {
+		t.Fatalf("generated enum did not preserve numeric value 10:\n%s", generated)
 	}
 }

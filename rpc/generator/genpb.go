@@ -95,12 +95,12 @@ func relativeToProtoPath(f string, protoPaths []string, pwd string) string {
 		}
 	}
 	if bestRel != "" {
-		return bestRel
+		return filepath.ToSlash(bestRel)
 	}
 	if rel, err := filepath.Rel(pwd, f); err == nil {
-		return rel
+		return filepath.ToSlash(rel)
 	}
-	return f
+	return filepath.ToSlash(f)
 }
 
 func (g *Generator) setPbDir(ctx DirContext, c *ZRpcContext) error {

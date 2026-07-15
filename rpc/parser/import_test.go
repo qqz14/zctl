@@ -87,6 +87,7 @@ func TestParseImportedProtos_EmptyWhenNoImports(t *testing.T) {
 func TestIsWellKnownProto(t *testing.T) {
 	assert.True(t, isWellKnownProto("google/protobuf/timestamp.proto"))
 	assert.True(t, isWellKnownProto("google/protobuf/empty.proto"))
+	assert.True(t, isWellKnownProto("protoc-gen-openapiv2/options/annotations.proto"))
 	assert.False(t, isWellKnownProto("base.proto"))
 	assert.False(t, isWellKnownProto("common/types.proto"))
 }

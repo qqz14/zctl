@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/qqz14/zctl/util/pathx"
+	"github.com/stretchr/testify/assert"
 )
 
 func Test_findPbFile(t *testing.T) {
@@ -193,4 +193,16 @@ service Greeter {
 		grpcGo := filepath.Join(grpcDir, "greet_grpc.pb.go")
 		assert.True(t, pathx.FileExists(grpcGo))
 	})
+}
+
+func TestRelativeToProtoPathUsesProtoSeparators(t *testing.T) {
+	root := t.TempDir()
+	protoPath := filepath.Join(root, "proto")
+	file := filepath.Join(protoPath, "protoc-gen-openapiv2", "options", "annotations.proto")
+
+	got := relativeToProtoPath(file, []string{protoPath}, root)
+	want := "protoc-gen-openapiv2/options/annotations.proto"
+	if got != want {
+		t.Fatalf("relativeToProtoPath() = %q, want %q", got, want)
+	}
 }
