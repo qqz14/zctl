@@ -58,6 +58,7 @@ func MergeDescProtos(descDir, outputPath, serviceName string) error {
 
 	for _, f := range protoFiles {
 		relPath, _ := filepath.Rel(descDir, f)
+		relPath = filepath.ToSlash(relPath)
 		content, err := os.ReadFile(f)
 		if err != nil {
 			return fmt.Errorf("failed to read %s: %w", f, err)
